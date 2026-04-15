@@ -17,6 +17,7 @@ export class OneloAuth {
   private resolvedConfig: ResolvedSDKConfig | null = null
   private initPromise: Promise<void>
   private authStateListeners: Array<(session: OneloSession | null) => void> = []
+  private modalStateListeners: Array<() => void> = []
   private _modalVisible = false
   private _modalUrl = ''
   private _modalResolve: ((result: ModalResult) => void) | null = null
@@ -79,9 +80,11 @@ export class OneloAuth {
     return new Promise((resolve, reject) => {
       this._modalUrl = hostedUrl
       this._modalVisible = true
+      this.notifyModalListeners()
       this._modalResolve = async (result: ModalResult) => {
         this._modalVisible = false
         this._modalResolve = null
+        this.notifyModalListeners()
         if (result.type === 'cancelled') { resolve(null); return }
         if (result.type === 'error') { reject(OneloError.server(result.message)); return }
         try {
@@ -107,6 +110,14 @@ export class OneloAuth {
       visible: this._modalVisible,
       url: this._modalUrl,
       onResult: this._modalResolve,
+    }
+  }
+
+  /** Subscribe to modal state changes. Returns an unsubscribe function. */
+  onModalStateChange(callback: () => void): () => void {
+    this.modalStateListeners.push(callback)
+    return () => {
+      this.modalStateListeners = this.modalStateListeners.filter(l => l !== callback)
     }
   }
 
@@ -226,5 +237,9 @@ export class OneloAuth {
 
   private notifyListeners(session: OneloSession | null): void {
     for (const cb of this.authStateListeners) cb(session)
+  }
+
+  private notifyModalListeners(): void {
+    for (const cb of this.modalStateListeners) cb()
   }
 }

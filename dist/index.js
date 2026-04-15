@@ -219,7 +219,7 @@ var require_package = __commonJS({
   "package.json"(exports2, module2) {
     module2.exports = {
       name: "@onelo/react-native",
-      version: "0.1.1-staging",
+      version: "0.2.0-staging",
       description: "Onelo React Native SDK",
       main: "./dist/index.js",
       types: "./dist/index.d.ts",
@@ -258,7 +258,8 @@ var index_exports = {};
 __export(index_exports, {
   AuthModal: () => AuthModal,
   Onelo: () => Onelo,
-  OneloError: () => import_core2.OneloError
+  OneloError: () => import_core2.OneloError,
+  useModalState: () => useModalState
 });
 module.exports = __toCommonJS(index_exports);
 
@@ -323,6 +324,7 @@ var OneloAuth = class {
     this.pkceVerifier = null;
     this.resolvedConfig = null;
     this.authStateListeners = [];
+    this.modalStateListeners = [];
     this._modalVisible = false;
     this._modalUrl = "";
     this._modalResolve = null;
@@ -377,9 +379,11 @@ var OneloAuth = class {
     return new Promise((resolve, reject) => {
       this._modalUrl = hostedUrl;
       this._modalVisible = true;
+      this.notifyModalListeners();
       this._modalResolve = async (result) => {
         this._modalVisible = false;
         this._modalResolve = null;
+        this.notifyModalListeners();
         if (result.type === "cancelled") {
           resolve(null);
           return;
@@ -413,6 +417,13 @@ var OneloAuth = class {
       visible: this._modalVisible,
       url: this._modalUrl,
       onResult: this._modalResolve
+    };
+  }
+  /** Subscribe to modal state changes. Returns an unsubscribe function. */
+  onModalStateChange(callback) {
+    this.modalStateListeners.push(callback);
+    return () => {
+      this.modalStateListeners = this.modalStateListeners.filter((l) => l !== callback);
     };
   }
   async getHostedUrl() {
@@ -534,6 +545,9 @@ var OneloAuth = class {
   notifyListeners(session) {
     for (const cb of this.authStateListeners) cb(session);
   }
+  notifyModalListeners() {
+    for (const cb of this.modalStateListeners) cb();
+  }
 };
 
 // src/onelo.ts
@@ -631,11 +645,25 @@ function AuthModal({ visible, hostedUrl, onResult }) {
   );
 }
 
+// src/auth/hooks.ts
+var import_react2 = require("react");
+function useModalState(auth) {
+  const [state, setState] = (0, import_react2.useState)(() => auth.getModalState());
+  (0, import_react2.useEffect)(() => {
+    const unsubscribe = auth.onModalStateChange(() => {
+      setState(auth.getModalState());
+    });
+    return unsubscribe;
+  }, [auth]);
+  return state;
+}
+
 // src/index.ts
 var import_core2 = __toESM(require_dist());
 // Annotate the CommonJS export names for ESM import in node:
 0 && (module.exports = {
   AuthModal,
   Onelo,
-  OneloError
+  OneloError,
+  useModalState
 });

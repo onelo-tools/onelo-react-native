@@ -34,6 +34,7 @@ declare class OneloAuth {
     private resolvedConfig;
     private initPromise;
     private authStateListeners;
+    private modalStateListeners;
     private _modalVisible;
     private _modalUrl;
     private _modalResolve;
@@ -52,6 +53,8 @@ declare class OneloAuth {
         url: string;
         onResult: ((result: ModalResult) => void) | null;
     };
+    /** Subscribe to modal state changes. Returns an unsubscribe function. */
+    onModalStateChange(callback: () => void): () => void;
     private getHostedUrl;
     signIn(email: string, password: string): Promise<OneloSession>;
     signUp(email: string, password: string): Promise<OneloSession>;
@@ -61,6 +64,7 @@ declare class OneloAuth {
     onAuthStateChange(callback: (session: OneloSession | null) => void): () => void;
     private saveSession;
     private notifyListeners;
+    private notifyModalListeners;
 }
 
 declare class Onelo {
@@ -68,4 +72,19 @@ declare class Onelo {
     constructor(config: OneloConfig);
 }
 
-export { AuthModal, Onelo };
+interface ModalState {
+    visible: boolean;
+    url: string;
+    onResult: ((result: ModalResult) => void) | null;
+}
+/**
+ * Reactive hook for rendering <AuthModal>.
+ * Re-renders automatically when loadAuthView() opens or closes the modal.
+ *
+ * @example
+ * const modal = useModalState(onelo.auth)
+ * return <AuthModal visible={modal.visible} hostedUrl={modal.url} onResult={modal.onResult!} />
+ */
+declare function useModalState(auth: OneloAuth): ModalState;
+
+export { AuthModal, type ModalState, Onelo, useModalState };
