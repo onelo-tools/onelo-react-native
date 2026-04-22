@@ -67,9 +67,54 @@ declare class OneloAuth {
     private notifyModalListeners;
 }
 
+type FeatureStatus = 'enabled' | 'disabled' | 'greyed' | 'hidden' | 'upsell' | 'new' | 'beta' | 'coming_soon';
+declare class FeatureState {
+    readonly name: string;
+    readonly status: FeatureStatus;
+    constructor(name: string, status: FeatureStatus);
+    get isEnabled(): boolean;
+    get isDisabled(): boolean;
+    get isVisible(): boolean;
+    get isGreyed(): boolean;
+    get isUpsell(): boolean;
+    get isNew(): boolean;
+    get isBeta(): boolean;
+    get isComingSoon(): boolean;
+    get badgeLabel(): string | null;
+}
+declare class OneloFeatures {
+    private readonly apiUrl;
+    private readonly publishableKey;
+    private cache;
+    private discoveredNames;
+    private configVersion;
+    private pollTimer;
+    private pingDebounce;
+    constructor(apiUrl: string, publishableKey: string);
+    /** Declare feature names upfront — triggers a batch-ping immediately. */
+    declare(names: string[]): void;
+    /** Returns the current state for a feature. Auto-registers on first call. */
+    feature(name: string): FeatureState;
+    /** Load features for a user (or anonymous). Called by Onelo orchestrator. */
+    load(userId: string | null): Promise<void>;
+    /** Stop background polling. Call when SDK is no longer needed. */
+    stopPolling(): void;
+    private _scheduleBatchPing;
+    private _batchPing;
+    private _resolve;
+    private _poll;
+    private _startPolling;
+}
+
 declare class Onelo {
     readonly auth: OneloAuth;
+    readonly features: OneloFeatures;
+    private authUnsubscribe;
     constructor(config: OneloConfig);
+    /** Only needed when NOT using Onelo Auth (own auth system). */
+    identify(userId: string): Promise<void>;
+    /** Release background timers. Call when the SDK instance is no longer needed. */
+    destroy(): void;
 }
 
 interface ModalState {
@@ -87,4 +132,4 @@ interface ModalState {
  */
 declare function useModalState(auth: OneloAuth): ModalState;
 
-export { AuthModal, type ModalState, Onelo, useModalState };
+export { AuthModal, FeatureState, type FeatureStatus, type ModalState, Onelo, OneloFeatures, useModalState };
