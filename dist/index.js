@@ -219,7 +219,7 @@ var require_package = __commonJS({
   "package.json"(exports2, module2) {
     module2.exports = {
       name: "@onelo/react-native",
-      version: "0.3.0-staging",
+      version: "0.4.0-staging",
       description: "Onelo React Native SDK",
       main: "./dist/index.js",
       types: "./dist/index.d.ts",
@@ -261,6 +261,7 @@ __export(index_exports, {
   Onelo: () => Onelo,
   OneloError: () => import_core3.OneloError,
   OneloFeatures: () => OneloFeatures,
+  OneloMonitor: () => OneloMonitor,
   useModalState: () => useModalState
 });
 module.exports = __toCommonJS(index_exports);
@@ -707,12 +708,54 @@ var OneloFeatures = class {
   }
 };
 
+// src/monitor/monitor.ts
+var OneloMonitor = class {
+  constructor(publishableKey, apiUrl) {
+    this.buffer = [];
+    this.flushTimer = null;
+    this.publishableKey = publishableKey;
+    this.apiUrl = apiUrl;
+    this.flushTimer = setInterval(() => {
+      this.flush();
+    }, 5e3);
+  }
+  event(featureName, opts) {
+    this.buffer.push({
+      featureName,
+      ok: opts.ok,
+      durationMs: opts.durationMs,
+      error: opts.error,
+      meta: opts.meta
+    });
+  }
+  async flush() {
+    if (this.buffer.length === 0) return;
+    const events = this.buffer.splice(0);
+    try {
+      await fetch(`${this.apiUrl}/api/sdk/monitor/events/batch`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ publishableKey: this.publishableKey, events })
+      });
+    } catch {
+    }
+  }
+  destroy() {
+    if (this.flushTimer) {
+      clearInterval(this.flushTimer);
+      this.flushTimer = null;
+    }
+    void this.flush();
+  }
+};
+
 // src/onelo.ts
 var Onelo = class {
   constructor(config) {
     this.authUnsubscribe = null;
     this.auth = new OneloAuth(config);
     this.features = new OneloFeatures(config.apiUrl, config.publishableKey);
+    this.monitor = new OneloMonitor(config.publishableKey, config.apiUrl);
     this.authUnsubscribe = this.auth.onAuthStateChange((session) => {
       void this.features.load(session?.user.id ?? null);
     });
@@ -726,6 +769,7 @@ var Onelo = class {
   destroy() {
     this.authUnsubscribe?.();
     this.features.stopPolling();
+    this.monitor.destroy();
   }
 };
 
@@ -839,5 +883,6 @@ var import_core3 = __toESM(require_dist());
   Onelo,
   OneloError,
   OneloFeatures,
+  OneloMonitor,
   useModalState
 });

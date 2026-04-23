@@ -106,9 +106,27 @@ declare class OneloFeatures {
     private _startPolling;
 }
 
+interface MonitorEventOptions {
+    ok: boolean;
+    durationMs?: number;
+    error?: string;
+    meta?: Record<string, unknown>;
+}
+declare class OneloMonitor {
+    private readonly publishableKey;
+    private readonly apiUrl;
+    private buffer;
+    private flushTimer;
+    constructor(publishableKey: string, apiUrl: string);
+    event(featureName: string, opts: MonitorEventOptions): void;
+    flush(): Promise<void>;
+    destroy(): void;
+}
+
 declare class Onelo {
     readonly auth: OneloAuth;
     readonly features: OneloFeatures;
+    readonly monitor: OneloMonitor;
     private authUnsubscribe;
     constructor(config: OneloConfig);
     /** Only needed when NOT using Onelo Auth (own auth system). */
@@ -132,4 +150,4 @@ interface ModalState {
  */
 declare function useModalState(auth: OneloAuth): ModalState;
 
-export { AuthModal, FeatureState, type FeatureStatus, type ModalState, Onelo, OneloFeatures, useModalState };
+export { AuthModal, FeatureState, type FeatureStatus, type ModalState, type MonitorEventOptions, Onelo, OneloFeatures, OneloMonitor, useModalState };
