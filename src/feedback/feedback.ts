@@ -6,7 +6,8 @@ export interface FeedbackOptions {
 
 export class OneloFeedback {
   private _url: string | null = null
-  private _listeners: Array<(url: string | null) => void> = []
+  private _visible = false
+  private _listeners: Array<(url: string | null, visible: boolean) => void> = []
 
   constructor(
     private readonly apiUrl: string,
@@ -14,31 +15,43 @@ export class OneloFeedback {
     private readonly getActiveFeatures: () => string[],
   ) {}
 
-  async open(options: FeedbackOptions = {}): Promise<void> {
-    const params = new URLSearchParams({ key: this.publishableKey })
-    if (options.type) params.set('type', options.type)
-    if (options.area) params.set('area', options.area)
-    if (options.userId) params.set('userId', options.userId)
-    const active = this.getActiveFeatures()
-    if (active.length > 0) params.set('session', JSON.stringify(active))
-
-    const res = await fetch(`${this.apiUrl}/api/sdk/feedback/initiate?${params}`)
-    if (!res.ok) throw new Error(`Feedback initiate failed: ${res.status}`)
-    const { hosted_url } = await res.json() as { hosted_url: string }
-    this._setUrl(hosted_url)
+  open(options: FeedbackOptions = {}): void {
+    // Show modal immediately (with loading state), fetch URL in background
+    this._notify(null, true)
+    void this._fetchAndLoad(options)
   }
 
-  close(): void { this._setUrl(null) }
+  close(): void { this._notify(null, false) }
 
-  private _setUrl(url: string | null) {
+  private async _fetchAndLoad(options: FeedbackOptions): Promise<void> {
+    try {
+      const params = new URLSearchParams({ key: this.publishableKey })
+      if (options.type) params.set('type', options.type)
+      if (options.area) params.set('area', options.area)
+      if (options.userId) params.set('userId', options.userId)
+      const active = this.getActiveFeatures()
+      if (active.length > 0) params.set('session', JSON.stringify(active))
+
+      const res = await fetch(`${this.apiUrl}/api/sdk/feedback/initiate?${params}`)
+      if (!res.ok) { this.close(); return }
+      const { hosted_url } = await res.json() as { hosted_url: string }
+      if (this._visible) this._notify(hosted_url, true)
+    } catch {
+      this.close()
+    }
+  }
+
+  private _notify(url: string | null, visible: boolean) {
     this._url = url
-    this._listeners.forEach(l => l(url))
+    this._visible = visible
+    this._listeners.forEach(l => l(url, visible))
   }
 
-  subscribe(listener: (url: string | null) => void): () => void {
+  subscribe(listener: (url: string | null, visible: boolean) => void): () => void {
     this._listeners.push(listener)
     return () => { this._listeners = this._listeners.filter(l => l !== listener) }
   }
 
   getCurrentUrl(): string | null { return this._url }
+  isVisible(): boolean { return this._visible }
 }

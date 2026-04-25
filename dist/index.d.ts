@@ -135,13 +135,16 @@ declare class OneloFeedback {
     private readonly publishableKey;
     private readonly getActiveFeatures;
     private _url;
+    private _visible;
     private _listeners;
     constructor(apiUrl: string, publishableKey: string, getActiveFeatures: () => string[]);
-    open(options?: FeedbackOptions): Promise<void>;
+    open(options?: FeedbackOptions): void;
     close(): void;
-    private _setUrl;
-    subscribe(listener: (url: string | null) => void): () => void;
+    private _fetchAndLoad;
+    private _notify;
+    subscribe(listener: (url: string | null, visible: boolean) => void): () => void;
     getCurrentUrl(): string | null;
+    isVisible(): boolean;
 }
 
 declare class Onelo {

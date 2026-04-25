@@ -770,26 +770,39 @@ var OneloFeedback = class {
     this.publishableKey = publishableKey;
     this.getActiveFeatures = getActiveFeatures;
     this._url = null;
+    this._visible = false;
     this._listeners = [];
   }
-  async open(options = {}) {
-    const params = new URLSearchParams({ key: this.publishableKey });
-    if (options.type) params.set("type", options.type);
-    if (options.area) params.set("area", options.area);
-    if (options.userId) params.set("userId", options.userId);
-    const active = this.getActiveFeatures();
-    if (active.length > 0) params.set("session", JSON.stringify(active));
-    const res = await fetch(`${this.apiUrl}/api/sdk/feedback/initiate?${params}`);
-    if (!res.ok) throw new Error(`Feedback initiate failed: ${res.status}`);
-    const { hosted_url } = await res.json();
-    this._setUrl(hosted_url);
+  open(options = {}) {
+    this._notify(null, true);
+    void this._fetchAndLoad(options);
   }
   close() {
-    this._setUrl(null);
+    this._notify(null, false);
   }
-  _setUrl(url) {
+  async _fetchAndLoad(options) {
+    try {
+      const params = new URLSearchParams({ key: this.publishableKey });
+      if (options.type) params.set("type", options.type);
+      if (options.area) params.set("area", options.area);
+      if (options.userId) params.set("userId", options.userId);
+      const active = this.getActiveFeatures();
+      if (active.length > 0) params.set("session", JSON.stringify(active));
+      const res = await fetch(`${this.apiUrl}/api/sdk/feedback/initiate?${params}`);
+      if (!res.ok) {
+        this.close();
+        return;
+      }
+      const { hosted_url } = await res.json();
+      if (this._visible) this._notify(hosted_url, true);
+    } catch {
+      this.close();
+    }
+  }
+  _notify(url, visible) {
     this._url = url;
-    this._listeners.forEach((l) => l(url));
+    this._visible = visible;
+    this._listeners.forEach((l) => l(url, visible));
   }
   subscribe(listener) {
     this._listeners.push(listener);
@@ -799,6 +812,9 @@ var OneloFeedback = class {
   }
   getCurrentUrl() {
     return this._url;
+  }
+  isVisible() {
+    return this._visible;
   }
 };
 
@@ -930,62 +946,81 @@ function useModalState(auth) {
 
 // src/feedback/FeedbackModal.tsx
 var import_react3 = __toESM(require("react"));
+var SKELETON_HTML = `<!DOCTYPE html><html><head>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#111;font-family:-apple-system,sans-serif;padding:40px 36px 32px;overflow:hidden}
+@keyframes shimmer{0%{background-position:-600px 0}100%{background-position:600px 0}}
+.sk{border-radius:10px;background:linear-gradient(90deg,#1e1e1e 25%,#2a2a2a 50%,#1e1e1e 75%);background-size:600px 100%;animation:shimmer 1.4s infinite linear}
+.icon{width:64px;height:64px;border-radius:14px;margin:0 auto 16px}
+.title{width:220px;height:22px;margin:0 auto 40px;border-radius:6px}
+.cards{display:flex;gap:12px;margin-bottom:32px}
+.card{flex:1;height:76px;border-radius:12px}
+.label{width:60px;height:13px;border-radius:4px;margin-bottom:8px}
+.input{width:100%;height:44px;border-radius:10px;margin-bottom:24px}
+.textarea{width:100%;height:110px;border-radius:10px;margin-bottom:32px}
+.btn{width:100%;height:48px;border-radius:12px}
+</style></head><body>
+<div class="sk icon"></div><div class="sk title"></div>
+<div class="cards"><div class="sk card"></div><div class="sk card"></div><div class="sk card"></div></div>
+<div class="sk label"></div><div class="sk input"></div>
+<div class="sk label"></div><div class="sk textarea"></div>
+<div class="sk btn"></div>
+</body></html>`;
+var RELAY_JS = `
+(function() {
+  window.addEventListener('message', function(e) {
+    if (window.ReactNativeWebView && e.data && e.data.type === 'onelo:feedback_submitted') {
+      window.ReactNativeWebView.postMessage(JSON.stringify(e.data));
+    }
+  });
+})();
+true;
+`;
 function FeedbackModal({ feedback }) {
   const RN = require("react-native");
   const { WebView } = require("react-native-webview");
-  const { Modal, View, StyleSheet, ActivityIndicator } = RN;
+  const { Modal, View, StyleSheet } = RN;
   const [url, setUrl] = (0, import_react3.useState)(feedback.getCurrentUrl());
-  const [loading, setLoading] = (0, import_react3.useState)(true);
+  const [visible, setVisible] = (0, import_react3.useState)(feedback.isVisible());
   (0, import_react3.useEffect)(() => {
-    const unsub = feedback.subscribe((next) => {
-      setUrl(next);
-      if (next !== null) setLoading(true);
+    const unsub = feedback.subscribe((nextUrl, nextVisible) => {
+      setUrl(nextUrl);
+      setVisible(nextVisible);
     });
     return unsub;
   }, [feedback]);
   const handleMessage = (0, import_react3.useCallback)((event) => {
     try {
       const msg = JSON.parse(event.nativeEvent.data);
-      if (msg["type"] === "onelo:feedback_submitted") {
-        feedback.close();
-      }
+      if (msg["type"] === "onelo:feedback_submitted") feedback.close();
     } catch {
     }
   }, [feedback]);
-  const injectedJavaScript = `
-    (function() {
-      var original = window.postMessage.bind(window);
-      window.addEventListener('message', function(e) {
-        if (window.ReactNativeWebView && e.data && e.data.type === 'onelo:feedback_submitted') {
-          window.ReactNativeWebView.postMessage(JSON.stringify(e.data));
-        }
-      });
-    })();
-    true;
-  `;
   const styles = StyleSheet.create({
-    container: { flex: 1, backgroundColor: "#000000" },
-    webview: { flex: 1 },
-    overlay: { position: "absolute", top: 0, left: 0, right: 0, bottom: 0, backgroundColor: "#000000", justifyContent: "center", alignItems: "center" }
+    container: { flex: 1, backgroundColor: "#111111" },
+    webview: { flex: 1, backgroundColor: "#111111" }
   });
   return import_react3.default.createElement(
     Modal,
-    { visible: url !== null, animationType: "slide", presentationStyle: "pageSheet", onRequestClose: () => feedback.close() },
+    {
+      visible,
+      animationType: "slide",
+      presentationStyle: "pageSheet",
+      onRequestClose: () => feedback.close()
+    },
     import_react3.default.createElement(
       View,
       { style: styles.container },
-      url !== null && import_react3.default.createElement(WebView, {
-        source: { uri: url },
-        onLoadEnd: () => setLoading(false),
+      // Always render WebView: shows skeleton HTML until real URL loads
+      import_react3.default.createElement(WebView, {
+        source: url ? { uri: url } : { html: SKELETON_HTML },
         onMessage: handleMessage,
-        injectedJavaScript,
-        style: styles.webview
-      }),
-      loading && url !== null && import_react3.default.createElement(
-        View,
-        { style: styles.overlay },
-        import_react3.default.createElement(ActivityIndicator, { size: "large", color: "#ffffff" })
-      )
+        injectedJavaScript: RELAY_JS,
+        style: styles.webview,
+        backgroundColor: "#111111"
+      })
     )
   );
 }
