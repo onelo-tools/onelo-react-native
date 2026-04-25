@@ -90,7 +90,10 @@ declare class OneloFeatures {
     private configVersion;
     private pollTimer;
     private pingDebounce;
-    constructor(apiUrl: string, publishableKey: string);
+    private monitor;
+    constructor(apiUrl: string, publishableKey: string, monitor?: {
+        _trackFeatureCall: (name: string) => void;
+    } | null);
     /** Declare feature names upfront — triggers a batch-ping immediately. */
     declare(names: string[]): void;
     /** Returns the current state for a feature. Auto-registers on first call. */
@@ -119,10 +122,16 @@ declare class OneloMonitor {
     private readonly apiUrl;
     private buffer;
     private flushTimer;
+    private currentUserId;
     constructor(publishableKey: string, apiUrl: string);
+    setUserId(userId: string | null): void;
+    _trackFeatureCall(featureName: string): void;
+    track<T>(featureName: string, fn: () => Promise<T> | T): Promise<T>;
     event(featureName: string, opts: MonitorEventOptions): void;
     flush(): Promise<void>;
     destroy(): void;
+    private _push;
+    private _registerGlobalHandlers;
 }
 
 interface FeedbackOptions {

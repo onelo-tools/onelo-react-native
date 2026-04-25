@@ -219,7 +219,7 @@ var require_package = __commonJS({
   "package.json"(exports2, module2) {
     module2.exports = {
       name: "@onelo/react-native",
-      version: "0.4.0-staging",
+      version: "0.5.0-staging",
       description: "Onelo React Native SDK",
       main: "./dist/index.js",
       types: "./dist/index.d.ts",
@@ -597,14 +597,16 @@ var FeatureState = class {
 };
 var POLL_INTERVAL_MS = 6e4;
 var OneloFeatures = class {
-  constructor(apiUrl, publishableKey) {
+  constructor(apiUrl, publishableKey, monitor) {
     this.cache = /* @__PURE__ */ new Map();
     this.discoveredNames = /* @__PURE__ */ new Set();
     this.configVersion = 0;
     this.pollTimer = null;
     this.pingDebounce = null;
+    this.monitor = null;
     this.apiUrl = apiUrl;
     this.publishableKey = publishableKey;
+    this.monitor = monitor ?? null;
   }
   /** Declare feature names upfront — triggers a batch-ping immediately. */
   declare(names) {
@@ -615,6 +617,7 @@ var OneloFeatures = class {
   feature(name) {
     const isNew = !this.discoveredNames.has(name);
     this.discoveredNames.add(name);
+    this.monitor?._trackFeatureCall(name);
     if (isNew) this._scheduleBatchPing();
     const status = this.cache.get(name) ?? "hidden";
     return new FeatureState(name, status);
@@ -723,24 +726,40 @@ var OneloFeatures = class {
 };
 
 // src/monitor/monitor.ts
+var PLATFORM = "reactnative";
+var _globalHandlersRegistered = false;
 var OneloMonitor = class {
   constructor(publishableKey, apiUrl) {
     this.buffer = [];
     this.flushTimer = null;
+    this.currentUserId = null;
     this.publishableKey = publishableKey;
     this.apiUrl = apiUrl;
     this.flushTimer = setInterval(() => {
-      this.flush();
+      void this.flush();
     }, 5e3);
+    this._registerGlobalHandlers();
+  }
+  setUserId(userId) {
+    this.currentUserId = userId;
+  }
+  _trackFeatureCall(featureName) {
+    this._push(featureName, true, void 0, void 0, void 0, "feature_call");
+  }
+  async track(featureName, fn) {
+    const start = Date.now();
+    try {
+      const result = await fn();
+      this._push(featureName, true, Date.now() - start, void 0, void 0, "track");
+      return result;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      this._push(featureName, false, Date.now() - start, message, void 0, "track");
+      throw err;
+    }
   }
   event(featureName, opts) {
-    this.buffer.push({
-      featureName,
-      ok: opts.ok,
-      durationMs: opts.durationMs,
-      error: opts.error,
-      meta: opts.meta
-    });
+    this._push(featureName, opts.ok, opts.durationMs, opts.error, opts.meta, "event");
   }
   async flush() {
     if (this.buffer.length === 0) return;
@@ -760,6 +779,33 @@ var OneloMonitor = class {
       this.flushTimer = null;
     }
     void this.flush();
+  }
+  _push(featureName, ok, durationMs, error, meta, source = "event") {
+    this.buffer.push({
+      featureName,
+      ok,
+      durationMs,
+      error,
+      meta,
+      source,
+      userId: this.currentUserId ?? void 0,
+      platform: PLATFORM
+    });
+  }
+  _registerGlobalHandlers() {
+    if (_globalHandlersRegistered) return;
+    _globalHandlersRegistered = true;
+    const handler = (error) => {
+      this._push("unhandled", false, void 0, error, void 0, "global_error");
+      void this.flush();
+    };
+    try {
+      const ErrorUtils = globalThis?.ErrorUtils;
+      if (ErrorUtils?.setGlobalHandler) {
+        ErrorUtils.setGlobalHandler((err) => handler(err.message));
+      }
+    } catch {
+    }
   }
 };
 
@@ -823,12 +869,15 @@ var Onelo = class {
   constructor(config) {
     this.authUnsubscribe = null;
     this.auth = new OneloAuth(config);
-    this.features = new OneloFeatures(config.apiUrl, config.publishableKey);
     this.monitor = new OneloMonitor(config.publishableKey, config.apiUrl);
+    this.features = new OneloFeatures(config.apiUrl, config.publishableKey, this.monitor);
     this.feedback = new OneloFeedback(config.apiUrl, config.publishableKey, () => this.features.getActiveFeatures());
     this.authUnsubscribe = this.auth.onAuthStateChange((session) => {
-      void this.features.load(session?.user.id ?? null);
+      const userId = session?.user.id ?? null;
+      this.monitor.setUserId(userId);
+      void this.features.load(userId);
     });
+    this.monitor.setUserId(null);
     void this.features.load(null);
   }
   /** Only needed when NOT using Onelo Auth (own auth system). */
