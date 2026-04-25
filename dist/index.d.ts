@@ -104,6 +104,8 @@ declare class OneloFeatures {
     getActiveFeatures(): string[];
     /** Stop background polling. Call when SDK is no longer needed. */
     stopPolling(): void;
+    /** Clears the local feature cache and resets the config version. The next feature() call will re-fetch. */
+    invalidateCache(): void;
     private _scheduleBatchPing;
     private _batchPing;
     private _resolve;
@@ -123,7 +125,9 @@ declare class OneloMonitor {
     private buffer;
     private flushTimer;
     private currentUserId;
+    private readonly sessionId;
     constructor(publishableKey: string, apiUrl: string);
+    /** Sets the current user ID attached to all subsequent monitor events. Call after login/logout if not using Onelo Auth. */
     setUserId(userId: string | null): void;
     _trackFeatureCall(featureName: string): void;
     track<T>(featureName: string, fn: () => Promise<T> | T): Promise<T>;

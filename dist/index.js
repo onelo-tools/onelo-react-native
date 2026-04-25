@@ -219,7 +219,7 @@ var require_package = __commonJS({
   "package.json"(exports2, module2) {
     module2.exports = {
       name: "@onelo/react-native",
-      version: "0.5.0-staging",
+      version: "0.7.0-staging",
       description: "Onelo React Native SDK",
       main: "./dist/index.js",
       types: "./dist/index.d.ts",
@@ -617,7 +617,7 @@ var OneloFeatures = class {
   feature(name) {
     const isNew = !this.discoveredNames.has(name);
     this.discoveredNames.add(name);
-    this.monitor?._trackFeatureCall(name);
+    if (isNew) this.monitor?._trackFeatureCall(name);
     if (isNew) this._scheduleBatchPing();
     const status = this.cache.get(name) ?? "hidden";
     return new FeatureState(name, status);
@@ -648,6 +648,11 @@ var OneloFeatures = class {
       clearTimeout(this.pingDebounce);
       this.pingDebounce = null;
     }
+  }
+  /** Clears the local feature cache and resets the config version. The next feature() call will re-fetch. */
+  invalidateCache() {
+    this.cache.clear();
+    this.configVersion = 0;
   }
   // ── Private ──────────────────────────────────────────────────────────────────
   _scheduleBatchPing() {
@@ -733,6 +738,14 @@ var OneloMonitor = class {
     this.buffer = [];
     this.flushTimer = null;
     this.currentUserId = null;
+    this.sessionId = (() => {
+      const bytes = new Uint8Array(16);
+      crypto.getRandomValues(bytes);
+      bytes[6] = bytes[6] & 15 | 64;
+      bytes[8] = bytes[8] & 63 | 128;
+      const hex = Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+      return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+    })();
     this.publishableKey = publishableKey;
     this.apiUrl = apiUrl;
     this.flushTimer = setInterval(() => {
@@ -740,6 +753,7 @@ var OneloMonitor = class {
     }, 5e3);
     this._registerGlobalHandlers();
   }
+  /** Sets the current user ID attached to all subsequent monitor events. Call after login/logout if not using Onelo Auth. */
   setUserId(userId) {
     this.currentUserId = userId;
   }
@@ -789,7 +803,8 @@ var OneloMonitor = class {
       meta,
       source,
       userId: this.currentUserId ?? void 0,
-      platform: PLATFORM
+      platform: PLATFORM,
+      sessionId: this.sessionId
     });
   }
   _registerGlobalHandlers() {

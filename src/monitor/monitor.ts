@@ -16,6 +16,7 @@ interface BufferedEvent {
   source: EventSource
   userId?: string
   platform: string
+  sessionId: string
 }
 
 const PLATFORM = 'reactnative'
@@ -27,6 +28,14 @@ export class OneloMonitor {
   private buffer: BufferedEvent[] = []
   private flushTimer: ReturnType<typeof setInterval> | null = null
   private currentUserId: string | null = null
+  private readonly sessionId: string = (() => {
+    const bytes = new Uint8Array(16)
+    crypto.getRandomValues(bytes)
+    bytes[6] = (bytes[6] & 0x0f) | 0x40  // version 4
+    bytes[8] = (bytes[8] & 0x3f) | 0x80  // variant
+    const hex = Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('')
+    return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`
+  })()
 
   constructor(publishableKey: string, apiUrl: string) {
     this.publishableKey = publishableKey
@@ -35,6 +44,7 @@ export class OneloMonitor {
     this._registerGlobalHandlers()
   }
 
+  /** Sets the current user ID attached to all subsequent monitor events. Call after login/logout if not using Onelo Auth. */
   setUserId(userId: string | null): void {
     this.currentUserId = userId
   }
@@ -94,6 +104,7 @@ export class OneloMonitor {
       featureName, ok, durationMs, error, meta, source,
       userId: this.currentUserId ?? undefined,
       platform: PLATFORM,
+      sessionId: this.sessionId,
     })
   }
 
