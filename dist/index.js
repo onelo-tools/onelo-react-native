@@ -260,9 +260,11 @@ var index_exports = {};
 __export(index_exports, {
   AuthModal: () => AuthModal,
   FeatureState: () => FeatureState,
+  FeedbackModal: () => FeedbackModal,
   Onelo: () => Onelo,
   OneloError: () => import_core3.OneloError,
   OneloFeatures: () => OneloFeatures,
+  OneloFeedback: () => OneloFeedback,
   OneloMonitor: () => OneloMonitor,
   useModalState: () => useModalState
 });
@@ -623,6 +625,16 @@ var OneloFeatures = class {
     await this._resolve(userId);
     this._startPolling(userId);
   }
+  /** Returns names of all features with an active status (enabled, new, or beta). */
+  getActiveFeatures() {
+    const active = [];
+    for (const [name, status] of this.cache) {
+      if (status === "enabled" || status === "new" || status === "beta") {
+        active.push(name);
+      }
+    }
+    return active;
+  }
   /** Stop background polling. Call when SDK is no longer needed. */
   stopPolling() {
     if (this.pollTimer !== null) {
@@ -751,6 +763,45 @@ var OneloMonitor = class {
   }
 };
 
+// src/feedback/feedback.ts
+var OneloFeedback = class {
+  constructor(apiUrl, publishableKey, getActiveFeatures) {
+    this.apiUrl = apiUrl;
+    this.publishableKey = publishableKey;
+    this.getActiveFeatures = getActiveFeatures;
+    this._url = null;
+    this._listeners = [];
+  }
+  async open(options = {}) {
+    const params = new URLSearchParams({ key: this.publishableKey });
+    if (options.type) params.set("type", options.type);
+    if (options.area) params.set("area", options.area);
+    if (options.userId) params.set("userId", options.userId);
+    const active = this.getActiveFeatures();
+    if (active.length > 0) params.set("session", JSON.stringify(active));
+    const res = await fetch(`${this.apiUrl}/api/sdk/feedback/initiate?${params}`);
+    if (!res.ok) throw new Error(`Feedback initiate failed: ${res.status}`);
+    const { hosted_url } = await res.json();
+    this._setUrl(hosted_url);
+  }
+  close() {
+    this._setUrl(null);
+  }
+  _setUrl(url) {
+    this._url = url;
+    this._listeners.forEach((l) => l(url));
+  }
+  subscribe(listener) {
+    this._listeners.push(listener);
+    return () => {
+      this._listeners = this._listeners.filter((l) => l !== listener);
+    };
+  }
+  getCurrentUrl() {
+    return this._url;
+  }
+};
+
 // src/onelo.ts
 var Onelo = class {
   constructor(config) {
@@ -758,6 +809,7 @@ var Onelo = class {
     this.auth = new OneloAuth(config);
     this.features = new OneloFeatures(config.apiUrl, config.publishableKey);
     this.monitor = new OneloMonitor(config.publishableKey, config.apiUrl);
+    this.feedback = new OneloFeedback(config.apiUrl, config.publishableKey, () => this.features.getActiveFeatures());
     this.authUnsubscribe = this.auth.onAuthStateChange((session) => {
       void this.features.load(session?.user.id ?? null);
     });
@@ -876,15 +928,79 @@ function useModalState(auth) {
   return state;
 }
 
+// src/feedback/FeedbackModal.tsx
+var import_react3 = __toESM(require("react"));
+function FeedbackModal({ feedback }) {
+  const RN = require("react-native");
+  const { WebView } = require("react-native-webview");
+  const { Modal, View, StyleSheet, ActivityIndicator } = RN;
+  const [url, setUrl] = (0, import_react3.useState)(feedback.getCurrentUrl());
+  const [loading, setLoading] = (0, import_react3.useState)(true);
+  (0, import_react3.useEffect)(() => {
+    const unsub = feedback.subscribe((next) => {
+      setUrl(next);
+      if (next !== null) setLoading(true);
+    });
+    return unsub;
+  }, [feedback]);
+  const handleMessage = (0, import_react3.useCallback)((event) => {
+    try {
+      const msg = JSON.parse(event.nativeEvent.data);
+      if (msg["type"] === "onelo:feedback_submitted") {
+        feedback.close();
+      }
+    } catch {
+    }
+  }, [feedback]);
+  const injectedJavaScript = `
+    (function() {
+      var original = window.postMessage.bind(window);
+      window.addEventListener('message', function(e) {
+        if (window.ReactNativeWebView && e.data && e.data.type === 'onelo:feedback_submitted') {
+          window.ReactNativeWebView.postMessage(JSON.stringify(e.data));
+        }
+      });
+    })();
+    true;
+  `;
+  const styles = StyleSheet.create({
+    container: { flex: 1, backgroundColor: "#000000" },
+    webview: { flex: 1 },
+    overlay: { position: "absolute", top: 0, left: 0, right: 0, bottom: 0, backgroundColor: "#000000", justifyContent: "center", alignItems: "center" }
+  });
+  return import_react3.default.createElement(
+    Modal,
+    { visible: url !== null, animationType: "slide", presentationStyle: "pageSheet", onRequestClose: () => feedback.close() },
+    import_react3.default.createElement(
+      View,
+      { style: styles.container },
+      url !== null && import_react3.default.createElement(WebView, {
+        source: { uri: url },
+        onLoadEnd: () => setLoading(false),
+        onMessage: handleMessage,
+        injectedJavaScript,
+        style: styles.webview
+      }),
+      loading && url !== null && import_react3.default.createElement(
+        View,
+        { style: styles.overlay },
+        import_react3.default.createElement(ActivityIndicator, { size: "large", color: "#ffffff" })
+      )
+    )
+  );
+}
+
 // src/index.ts
 var import_core3 = __toESM(require_dist());
 // Annotate the CommonJS export names for ESM import in node:
 0 && (module.exports = {
   AuthModal,
   FeatureState,
+  FeedbackModal,
   Onelo,
   OneloError,
   OneloFeatures,
+  OneloFeedback,
   OneloMonitor,
   useModalState
 });

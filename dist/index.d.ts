@@ -97,6 +97,8 @@ declare class OneloFeatures {
     feature(name: string): FeatureState;
     /** Load features for a user (or anonymous). Called by Onelo orchestrator. */
     load(userId: string | null): Promise<void>;
+    /** Returns names of all features with an active status (enabled, new, or beta). */
+    getActiveFeatures(): string[];
     /** Stop background polling. Call when SDK is no longer needed. */
     stopPolling(): void;
     private _scheduleBatchPing;
@@ -123,10 +125,30 @@ declare class OneloMonitor {
     destroy(): void;
 }
 
+interface FeedbackOptions {
+    type?: 'bug' | 'feature_request' | 'general';
+    area?: string;
+    userId?: string;
+}
+declare class OneloFeedback {
+    private readonly apiUrl;
+    private readonly publishableKey;
+    private readonly getActiveFeatures;
+    private _url;
+    private _listeners;
+    constructor(apiUrl: string, publishableKey: string, getActiveFeatures: () => string[]);
+    open(options?: FeedbackOptions): Promise<void>;
+    close(): void;
+    private _setUrl;
+    subscribe(listener: (url: string | null) => void): () => void;
+    getCurrentUrl(): string | null;
+}
+
 declare class Onelo {
     readonly auth: OneloAuth;
     readonly features: OneloFeatures;
     readonly monitor: OneloMonitor;
+    readonly feedback: OneloFeedback;
     private authUnsubscribe;
     constructor(config: OneloConfig);
     /** Only needed when NOT using Onelo Auth (own auth system). */
@@ -150,4 +172,19 @@ interface ModalState {
  */
 declare function useModalState(auth: OneloAuth): ModalState;
 
-export { AuthModal, FeatureState, type FeatureStatus, type ModalState, type MonitorEventOptions, Onelo, OneloFeatures, OneloMonitor, useModalState };
+interface FeedbackModalProps {
+    feedback: OneloFeedback;
+}
+declare function FeedbackModal({ feedback }: FeedbackModalProps): React.CElement<{
+    visible: boolean;
+    animationType: string;
+    presentationStyle: string;
+    onRequestClose: () => void;
+}, React.Component<{
+    visible: boolean;
+    animationType: string;
+    presentationStyle: string;
+    onRequestClose: () => void;
+}, any, any>>;
+
+export { AuthModal, FeatureState, type FeatureStatus, FeedbackModal, type FeedbackOptions, type ModalState, type MonitorEventOptions, Onelo, OneloFeatures, OneloFeedback, OneloMonitor, useModalState };
