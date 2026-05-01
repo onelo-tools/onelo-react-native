@@ -242,4 +242,26 @@ export class OneloAuth {
   private notifyModalListeners(): void {
     for (const cb of this.modalStateListeners) cb()
   }
+
+  // ── Magic link & password reset ─────────────────────────────────────────────
+
+  async sendMagicLink(email: string): Promise<void> {
+    await this.initPromise
+    const { status } = await httpPost(
+      `${this.apiUrl}/api/sdk/auth/magic-link`,
+      { email, publishableKey: this.publishableKey },
+      { 'X-SDK-Version': SDK_VERSION }
+    )
+    if (status !== 200) throw OneloError.server(`sendMagicLink failed: HTTP ${status}`)
+  }
+
+  async sendPasswordReset(email: string): Promise<void> {
+    await this.initPromise
+    const { status } = await httpPost(
+      `${this.apiUrl}/api/sdk/auth/reset-password/request`,
+      { email, publishableKey: this.publishableKey },
+      { 'X-SDK-Version': SDK_VERSION }
+    )
+    if (status !== 200) throw OneloError.server(`sendPasswordReset failed: HTTP ${status}`)
+  }
 }

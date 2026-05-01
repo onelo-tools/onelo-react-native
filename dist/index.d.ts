@@ -65,6 +65,8 @@ declare class OneloAuth {
     private saveSession;
     private notifyListeners;
     private notifyModalListeners;
+    sendMagicLink(email: string): Promise<void>;
+    sendPasswordReset(email: string): Promise<void>;
 }
 
 type FeatureStatus = 'enabled' | 'disabled' | 'greyed' | 'hidden' | 'upsell' | 'new' | 'beta' | 'coming_soon';
@@ -162,11 +164,39 @@ declare class OneloFeedback {
     isVisible(): boolean;
 }
 
+declare class OneloPaywall {
+    check(requiredPlan: string, userPlan?: string): boolean;
+}
+
+declare class OneloForms {
+    private readonly apiUrl;
+    private readonly publishableKey;
+    constructor(apiUrl: string, publishableKey: string);
+    submit(formSlug: string, data: Record<string, unknown>, submitterEmail?: string): Promise<{
+        success: boolean;
+        message?: string;
+    }>;
+}
+
+declare class OneloWaitlist {
+    private readonly apiUrl;
+    private readonly publishableKey;
+    constructor(apiUrl: string, publishableKey: string);
+    join(slug: string | undefined, email: string): Promise<{
+        success: boolean;
+        position?: number;
+        alreadyJoined: boolean;
+    }>;
+}
+
 declare class Onelo {
     readonly auth: OneloAuth;
     readonly features: OneloFeatures;
     readonly monitor: OneloMonitor;
     readonly feedback: OneloFeedback;
+    readonly paywall: OneloPaywall;
+    readonly forms: OneloForms;
+    readonly waitlist: OneloWaitlist;
     private authUnsubscribe;
     constructor(config: OneloConfig);
     /** Only needed when NOT using Onelo Auth (own auth system). */
@@ -205,4 +235,4 @@ declare function FeedbackModal({ feedback }: FeedbackModalProps): React.CElement
     onRequestClose: () => void;
 }, any, any>>;
 
-export { AuthModal, FeatureState, type FeatureStatus, FeedbackModal, type FeedbackOptions, type ModalState, type MonitorEventOptions, Onelo, OneloFeatures, OneloFeedback, OneloMonitor, useModalState };
+export { AuthModal, FeatureState, type FeatureStatus, FeedbackModal, type FeedbackOptions, type ModalState, type MonitorEventOptions, Onelo, OneloFeatures, OneloFeedback, OneloForms, OneloMonitor, OneloPaywall, OneloWaitlist, useModalState };

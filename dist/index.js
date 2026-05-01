@@ -219,7 +219,7 @@ var require_package = __commonJS({
   "package.json"(exports2, module2) {
     module2.exports = {
       name: "@onelo/react-native",
-      version: "0.8.0-staging",
+      version: "0.9.0-staging",
       description: "Onelo React Native SDK",
       main: "./dist/index.js",
       types: "./dist/index.d.ts",
@@ -265,7 +265,10 @@ __export(index_exports, {
   OneloError: () => import_core3.OneloError,
   OneloFeatures: () => OneloFeatures,
   OneloFeedback: () => OneloFeedback,
+  OneloForms: () => OneloForms,
   OneloMonitor: () => OneloMonitor,
+  OneloPaywall: () => OneloPaywall,
+  OneloWaitlist: () => OneloWaitlist,
   useModalState: () => useModalState
 });
 module.exports = __toCommonJS(index_exports);
@@ -554,6 +557,25 @@ var OneloAuth = class {
   }
   notifyModalListeners() {
     for (const cb of this.modalStateListeners) cb();
+  }
+  // ── Magic link & password reset ─────────────────────────────────────────────
+  async sendMagicLink(email) {
+    await this.initPromise;
+    const { status } = await (0, import_core.httpPost)(
+      `${this.apiUrl}/api/sdk/auth/magic-link`,
+      { email, publishableKey: this.publishableKey },
+      { "X-SDK-Version": SDK_VERSION }
+    );
+    if (status !== 200) throw import_core.OneloError.server(`sendMagicLink failed: HTTP ${status}`);
+  }
+  async sendPasswordReset(email) {
+    await this.initPromise;
+    const { status } = await (0, import_core.httpPost)(
+      `${this.apiUrl}/api/sdk/auth/reset-password/request`,
+      { email, publishableKey: this.publishableKey },
+      { "X-SDK-Version": SDK_VERSION }
+    );
+    if (status !== 200) throw import_core.OneloError.server(`sendPasswordReset failed: HTTP ${status}`);
   }
 };
 
@@ -884,6 +906,63 @@ var OneloFeedback = class {
   }
 };
 
+// src/paywall/paywall.ts
+var TIER = { free: 0, pro: 1, business: 2, enterprise: 3 };
+var OneloPaywall = class {
+  check(requiredPlan, userPlan = "free") {
+    const req = TIER[requiredPlan];
+    const usr = TIER[userPlan];
+    if (req === void 0 || usr === void 0) return false;
+    return usr >= req;
+  }
+};
+
+// src/forms/forms.ts
+var OneloForms = class {
+  constructor(apiUrl, publishableKey) {
+    this.apiUrl = apiUrl;
+    this.publishableKey = publishableKey;
+  }
+  async submit(formSlug, data, submitterEmail) {
+    try {
+      const body = { publishableKey: this.publishableKey, formSlug, data };
+      if (submitterEmail) body.submitterEmail = submitterEmail;
+      const res = await fetch(`${this.apiUrl}/api/sdk/forms/submit`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body)
+      });
+      const json = await res.json();
+      return { success: json.success ?? false, message: json.message };
+    } catch (err) {
+      return { success: false, message: err instanceof Error ? err.message : String(err) };
+    }
+  }
+};
+
+// src/waitlist/waitlist.ts
+var OneloWaitlist = class {
+  constructor(apiUrl, publishableKey) {
+    this.apiUrl = apiUrl;
+    this.publishableKey = publishableKey;
+  }
+  async join(slug, email) {
+    try {
+      const body = { publishableKey: this.publishableKey, email };
+      if (slug !== void 0) body.slug = slug;
+      const res = await fetch(`${this.apiUrl}/api/sdk/waitlist/join`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body)
+      });
+      const json = await res.json();
+      return { success: json.success ?? false, position: json.position, alreadyJoined: json.alreadyJoined ?? false };
+    } catch {
+      return { success: false, alreadyJoined: false };
+    }
+  }
+};
+
 // src/onelo.ts
 var Onelo = class {
   constructor(config) {
@@ -892,6 +971,9 @@ var Onelo = class {
     this.monitor = new OneloMonitor(config.publishableKey, config.apiUrl);
     this.features = new OneloFeatures(config.apiUrl, config.publishableKey, this.monitor);
     this.feedback = new OneloFeedback(config.apiUrl, config.publishableKey, () => this.features.getActiveFeatures());
+    this.paywall = new OneloPaywall();
+    this.forms = new OneloForms(config.apiUrl, config.publishableKey);
+    this.waitlist = new OneloWaitlist(config.apiUrl, config.publishableKey);
     this.authUnsubscribe = this.auth.onAuthStateChange((session) => {
       const userId = session?.user.id ?? null;
       this.monitor.setUserId(userId);
@@ -1105,6 +1187,9 @@ var import_core3 = __toESM(require_dist());
   OneloError,
   OneloFeatures,
   OneloFeedback,
+  OneloForms,
   OneloMonitor,
+  OneloPaywall,
+  OneloWaitlist,
   useModalState
 });
