@@ -2,6 +2,7 @@ export class OneloForms {
   constructor(
     private readonly apiUrl: string,
     private readonly publishableKey: string,
+    private readonly bundleId?: string,
   ) {}
 
   async submit(
@@ -10,11 +11,12 @@ export class OneloForms {
     submitterEmail?: string,
   ): Promise<{ success: boolean; message?: string }> {
     try {
+      const { sdkHeaders } = await import('../sdk-headers')
       const body: Record<string, unknown> = { publishableKey: this.publishableKey, formSlug, data }
       if (submitterEmail) body.submitterEmail = submitterEmail
       const res = await fetch(`${this.apiUrl}/api/sdk/forms/submit`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { ...sdkHeaders(this.bundleId), 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
       })
       const json = await res.json() as { success: boolean; message?: string }

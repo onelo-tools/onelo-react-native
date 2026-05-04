@@ -13,6 +13,7 @@ export class OneloFeedback {
     private readonly apiUrl: string,
     private readonly publishableKey: string,
     private readonly getActiveFeatures: () => string[],
+    private readonly bundleId?: string,
   ) {}
 
   open(options: FeedbackOptions = {}): void {
@@ -32,7 +33,10 @@ export class OneloFeedback {
       const active = this.getActiveFeatures()
       if (active.length > 0) params.set('session', JSON.stringify(active))
 
-      const res = await fetch(`${this.apiUrl}/api/sdk/feedback/initiate?${params}`)
+      const { sdkHeaders } = await import('../sdk-headers')
+      const res = await fetch(`${this.apiUrl}/api/sdk/feedback/initiate?${params}`, {
+        headers: sdkHeaders(this.bundleId),
+      })
       if (!res.ok) { this.close(); return }
       const { hosted_url } = await res.json() as { hosted_url: string }
       if (this._visible) this._notify(hosted_url, true)

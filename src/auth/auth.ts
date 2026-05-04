@@ -15,6 +15,8 @@ export class OneloAuth {
   private publishableKey: string
   private pkceVerifier: string | null = null
   private resolvedConfig: ResolvedSDKConfig | null = null
+  private heartbeatTimer: ReturnType<typeof setInterval> | null = null
+  private static readonly HEARTBEAT_MS = 13 * 60 * 1000
   private initPromise: Promise<void>
   private authStateListeners: Array<(session: OneloSession | null) => void> = []
   private modalStateListeners: Array<() => void> = []
@@ -54,10 +56,16 @@ export class OneloAuth {
         allowCustomBranding: (j['allow_custom_branding'] as boolean) ?? false,
         appName: (j['app_name'] as string | null) ?? null,
         appLogoUrl: (j['app_logo_url'] as string | null) ?? null,
+        paywallEnabled: (j['paywall_enabled'] as boolean) ?? false,
+        waitlistMode: (j['waitlist_mode'] as boolean) ?? false,
+        sdkRedirectUrl: (j['sdk_redirect_url'] as string | null) ?? null,
+        storeUrl: (j['store_url'] as string | null) ?? null,
+        manageUrl: (j['manage_url'] as string | null) ?? null,
       }
-      this.allowCustomBranding = this.resolvedConfig.allowCustomBranding
-      if (this.resolvedConfig.appName) this.appName = this.resolvedConfig.appName
-      this.appLogoUrl = this.resolvedConfig.appLogoUrl
+      const resolved = this.resolvedConfig
+      this.allowCustomBranding = resolved.allowCustomBranding
+      if (resolved.appName) this.appName = resolved.appName
+      this.appLogoUrl = resolved.appLogoUrl
       this.isReady = true
     } catch (e) {
       if (e instanceof OneloError && e.code === 'invalid_publishable_key') {
@@ -181,6 +189,7 @@ export class OneloAuth {
   // ── Session management ──────────────────────────────────────────────────────
 
   async signOut(): Promise<void> {
+    this.stopHeartbeat()
     await this.storage.clear()
     this.notifyListeners(null)
   }
@@ -197,7 +206,12 @@ export class OneloAuth {
     if (Date.now() / 1000 > expiresAt - 60) {
       return this.refreshSession()
     }
-    return { accessToken, refreshToken, expiresAt, user: JSON.parse(userJson) as OneloUser }
+    const user = JSON.parse(userJson) as OneloUser
+    if (!user.id) {
+      await this.storage.clear()
+      return null
+    }
+    return { accessToken, refreshToken, expiresAt, user }
   }
 
   async refreshSession(): Promise<OneloSession | null> {
@@ -225,6 +239,29 @@ export class OneloAuth {
     }
   }
 
+  private startHeartbeat(accessToken: string): void {
+    this.stopHeartbeat()
+    this.heartbeatTimer = setInterval(async () => {
+      const session = await this.getSession()
+      if (!session) { this.stopHeartbeat(); return }
+      try {
+        await fetch(`${this.apiUrl}/api/sdk/presence/heartbeat`, {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${session.accessToken}` },
+        })
+      } catch {
+        // fire-and-forget
+      }
+    }, OneloAuth.HEARTBEAT_MS)
+  }
+
+  private stopHeartbeat(): void {
+    if (this.heartbeatTimer !== null) {
+      clearInterval(this.heartbeatTimer)
+      this.heartbeatTimer = null
+    }
+  }
+
   private async saveSession(session: OneloSession): Promise<void> {
     await Promise.all([
       this.storage.set(TOKEN_KEYS.ACCESS_TOKEN, session.accessToken),
@@ -233,6 +270,7 @@ export class OneloAuth {
       this.storage.set(TOKEN_KEYS.USER_JSON, JSON.stringify(session.user)),
     ])
     this.notifyListeners(session)
+    this.startHeartbeat(session.accessToken)
   }
 
   private notifyListeners(session: OneloSession | null): void {

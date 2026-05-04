@@ -38,20 +38,36 @@ export class FeatureState {
 
 const POLL_INTERVAL_MS = 60_000
 
+export interface OneloFeaturesOptions {
+  /** Suppress the anonymous-mode identify() warning. See OneloConfig.suppressIdentifyWarning. */
+  suppressIdentifyWarning?: boolean
+}
+
 export class OneloFeatures {
   private readonly apiUrl: string
   private readonly publishableKey: string
+  private readonly bundleId?: string
   private cache: Map<string, FeatureStatus> = new Map()
   private discoveredNames: Set<string> = new Set()
   private configVersion = 0
   private pollTimer: ReturnType<typeof setInterval> | null = null
   private pingDebounce: ReturnType<typeof setTimeout> | null = null
   private monitor: { _trackFeatureCall: (name: string) => void } | null = null
+  private suppressIdentifyWarning: boolean
+  private anonymousWarningLogged = false
 
-  constructor(apiUrl: string, publishableKey: string, monitor?: { _trackFeatureCall: (name: string) => void } | null) {
+  constructor(
+    apiUrl: string,
+    publishableKey: string,
+    monitor?: { _trackFeatureCall: (name: string) => void } | null,
+    bundleId?: string,
+    options?: OneloFeaturesOptions,
+  ) {
     this.apiUrl = apiUrl
     this.publishableKey = publishableKey
     this.monitor = monitor ?? null
+    this.bundleId = bundleId
+    this.suppressIdentifyWarning = options?.suppressIdentifyWarning ?? false
   }
 
   /** Declare feature names upfront — triggers a batch-ping immediately. */
@@ -120,10 +136,11 @@ export class OneloFeatures {
     const names = Array.from(this.discoveredNames)
     if (names.length === 0) return
     try {
+      const { sdkHeaders } = await import('../sdk-headers')
       await httpPost(`${this.apiUrl}/api/sdk/features/batch-ping`, {
         publishableKey: this.publishableKey,
         features: names,
-      })
+      }, sdkHeaders(this.bundleId))
     } catch {
       // best-effort
     }
@@ -133,7 +150,8 @@ export class OneloFeatures {
     try {
       const body: Record<string, unknown> = { publishableKey: this.publishableKey }
       if (userId) body['userId'] = userId
-      const { status, json } = await httpPost(`${this.apiUrl}/api/sdk/features/resolve`, body)
+      const { sdkHeaders } = await import('../sdk-headers')
+      const { status, json } = await httpPost(`${this.apiUrl}/api/sdk/features/resolve`, body, sdkHeaders(this.bundleId))
       if (status !== 200) return
       const j = json as Record<string, unknown>
       const features = j['features'] as Record<string, { status: string }> | undefined
@@ -146,9 +164,29 @@ export class OneloFeatures {
       if (typeof j['config_version'] === 'number') {
         this.configVersion = j['config_version'] as number
       }
+      this._maybeWarnAnonymous(j)
     } catch {
       // keep existing cache
     }
+  }
+
+  /**
+   * Logs a one-time warning when the backend reports anonymous mode (no userId)
+   * AND at least one targeted feature was hidden purely because of it. Helps
+   * developers using their own auth system catch missing identify() calls.
+   */
+  private _maybeWarnAnonymous(response: Record<string, unknown>): void {
+    if (this.suppressIdentifyWarning || this.anonymousWarningLogged) return
+    if (response['anonymous'] !== true) return
+    const misses = typeof response['targeting_misses'] === 'number' ? (response['targeting_misses'] as number) : 0
+    if (misses <= 0) return
+    this.anonymousWarningLogged = true
+    // eslint-disable-next-line no-console
+    console.warn(
+      `[Onelo] ${misses} feature(s) hidden because no user is identified.\n` +
+      `If you handle auth yourself, call onelo.identify(userId) after login so per-user/per-plan targeting can apply.\n` +
+      `If your app is intentionally anonymous, pass suppressIdentifyWarning: true in OneloConfig to silence this.`
+    )
   }
 
   private async _poll(userId: string | null): Promise<void> {
@@ -158,8 +196,10 @@ export class OneloFeatures {
         version: String(this.configVersion),
       })
       if (userId) params.set('userId', userId)
+      const { sdkHeaders } = await import('../sdk-headers')
       const { status, json } = await httpGet(
-        `${this.apiUrl}/api/sdk/features/poll?${params.toString()}`
+        `${this.apiUrl}/api/sdk/features/poll?${params.toString()}`,
+        sdkHeaders(this.bundleId)
       )
       if (status !== 200) return
       const j = json as Record<string, unknown>

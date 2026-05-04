@@ -2,6 +2,7 @@ export class OneloWaitlist {
   constructor(
     private readonly apiUrl: string,
     private readonly publishableKey: string,
+    private readonly bundleId?: string,
   ) {}
 
   async join(
@@ -9,11 +10,12 @@ export class OneloWaitlist {
     email: string,
   ): Promise<{ success: boolean; position?: number; alreadyJoined: boolean }> {
     try {
+      const { sdkHeaders } = await import('../sdk-headers')
       const body: Record<string, unknown> = { publishableKey: this.publishableKey, email }
       if (slug !== undefined) body.slug = slug
       const res = await fetch(`${this.apiUrl}/api/sdk/waitlist/join`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { ...sdkHeaders(this.bundleId), 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
       })
       const json = await res.json() as { success: boolean; position?: number; alreadyJoined: boolean }

@@ -19,12 +19,14 @@ export class Onelo {
 
   constructor(config: OneloConfig) {
     this.auth = new OneloAuth(config)
-    this.monitor = new OneloMonitor(config.publishableKey, config.apiUrl)
-    this.features = new OneloFeatures(config.apiUrl, config.publishableKey, this.monitor)
-    this.feedback = new OneloFeedback(config.apiUrl, config.publishableKey, () => this.features.getActiveFeatures())
+    this.monitor = new OneloMonitor(config.publishableKey, config.apiUrl, config.bundleId)
+    this.features = new OneloFeatures(config.apiUrl, config.publishableKey, this.monitor, config.bundleId, {
+      suppressIdentifyWarning: config.suppressIdentifyWarning ?? false,
+    })
+    this.feedback = new OneloFeedback(config.apiUrl, config.publishableKey, () => this.features.getActiveFeatures(), config.bundleId)
     this.paywall = new OneloPaywall()
-    this.forms = new OneloForms(config.apiUrl, config.publishableKey)
-    this.waitlist = new OneloWaitlist(config.apiUrl, config.publishableKey)
+    this.forms = new OneloForms(config.apiUrl, config.publishableKey, config.bundleId)
+    this.waitlist = new OneloWaitlist(config.apiUrl, config.publishableKey, config.bundleId)
 
     // Auth → features identity bridge: reload features when session changes
     this.authUnsubscribe = this.auth.onAuthStateChange((session) => {

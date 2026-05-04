@@ -27,6 +27,7 @@ let _globalHandlersRegistered = false
 export class OneloMonitor {
   private readonly publishableKey: string
   private readonly apiUrl: string
+  private readonly bundleId?: string
   private buffer: BufferedEvent[] = []
   private flushTimer: ReturnType<typeof setInterval> | null = null
   private currentUserId: string | null = null
@@ -39,9 +40,10 @@ export class OneloMonitor {
     return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`
   })()
 
-  constructor(publishableKey: string, apiUrl: string) {
+  constructor(publishableKey: string, apiUrl: string, bundleId?: string) {
     this.publishableKey = publishableKey
     this.apiUrl = apiUrl
+    this.bundleId = bundleId
     this.flushTimer = setInterval(() => { void this.flush() }, 15000)
     this._registerGlobalHandlers()
   }
@@ -76,9 +78,10 @@ export class OneloMonitor {
     if (this.buffer.length === 0) return
     const events = this.buffer.splice(0)
     try {
+      const { sdkHeaders } = await import('../sdk-headers')
       await fetch(`${this.apiUrl}/api/sdk/monitor/events/batch`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { ...sdkHeaders(this.bundleId), 'Content-Type': 'application/json' },
         body: JSON.stringify({ publishableKey: this.publishableKey, events }),
       })
     } catch {

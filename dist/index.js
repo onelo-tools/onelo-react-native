@@ -5,6 +5,9 @@ var __getOwnPropDesc = Object.getOwnPropertyDescriptor;
 var __getOwnPropNames = Object.getOwnPropertyNames;
 var __getProtoOf = Object.getPrototypeOf;
 var __hasOwnProp = Object.prototype.hasOwnProperty;
+var __esm = (fn, res) => function __init() {
+  return fn && (res = (0, fn[__getOwnPropNames(fn)[0]])(fn = 0)), res;
+};
 var __commonJS = (cb, mod) => function __require() {
   return mod || (0, cb[__getOwnPropNames(cb)[0]])((mod = { exports: {} }).exports, mod), mod.exports;
 };
@@ -219,7 +222,7 @@ var require_package = __commonJS({
   "package.json"(exports2, module2) {
     module2.exports = {
       name: "@onelo/react-native",
-      version: "0.9.0-staging",
+      version: "0.10.0-staging",
       description: "Onelo React Native SDK",
       main: "./dist/index.js",
       types: "./dist/index.d.ts",
@@ -252,6 +255,25 @@ var require_package = __commonJS({
         access: "public"
       }
     };
+  }
+});
+
+// src/sdk-headers.ts
+var sdk_headers_exports = {};
+__export(sdk_headers_exports, {
+  sdkHeaders: () => sdkHeaders
+});
+function sdkHeaders(bundleId) {
+  return {
+    "X-SDK-Version": import_package.version,
+    ...bundleId ? { "X-Bundle-Id": bundleId } : {}
+  };
+}
+var import_package;
+var init_sdk_headers = __esm({
+  "src/sdk-headers.ts"() {
+    "use strict";
+    import_package = __toESM(require_package());
   }
 });
 
@@ -329,10 +351,11 @@ var KeychainStorage = class {
 
 // src/auth/auth.ts
 var SDK_VERSION = require_package().version;
-var OneloAuth = class {
+var _OneloAuth = class _OneloAuth {
   constructor(config) {
     this.pkceVerifier = null;
     this.resolvedConfig = null;
+    this.heartbeatTimer = null;
     this.authStateListeners = [];
     this.modalStateListeners = [];
     this._modalVisible = false;
@@ -366,11 +389,17 @@ var OneloAuth = class {
         tenantId: j["tenant_id"],
         allowCustomBranding: j["allow_custom_branding"] ?? false,
         appName: j["app_name"] ?? null,
-        appLogoUrl: j["app_logo_url"] ?? null
+        appLogoUrl: j["app_logo_url"] ?? null,
+        paywallEnabled: j["paywall_enabled"] ?? false,
+        waitlistMode: j["waitlist_mode"] ?? false,
+        sdkRedirectUrl: j["sdk_redirect_url"] ?? null,
+        storeUrl: j["store_url"] ?? null,
+        manageUrl: j["manage_url"] ?? null
       };
-      this.allowCustomBranding = this.resolvedConfig.allowCustomBranding;
-      if (this.resolvedConfig.appName) this.appName = this.resolvedConfig.appName;
-      this.appLogoUrl = this.resolvedConfig.appLogoUrl;
+      const resolved = this.resolvedConfig;
+      this.allowCustomBranding = resolved.allowCustomBranding;
+      if (resolved.appName) this.appName = resolved.appName;
+      this.appLogoUrl = resolved.appLogoUrl;
       this.isReady = true;
     } catch (e) {
       if (e instanceof import_core.OneloError && e.code === "invalid_publishable_key") {
@@ -491,6 +520,7 @@ var OneloAuth = class {
   }
   // ── Session management ──────────────────────────────────────────────────────
   async signOut() {
+    this.stopHeartbeat();
     await this.storage.clear();
     this.notifyListeners(null);
   }
@@ -506,7 +536,12 @@ var OneloAuth = class {
     if (Date.now() / 1e3 > expiresAt - 60) {
       return this.refreshSession();
     }
-    return { accessToken, refreshToken, expiresAt, user: JSON.parse(userJson) };
+    const user = JSON.parse(userJson);
+    if (!user.id) {
+      await this.storage.clear();
+      return null;
+    }
+    return { accessToken, refreshToken, expiresAt, user };
   }
   async refreshSession() {
     const refreshToken = await this.storage.get(import_core.TOKEN_KEYS.REFRESH_TOKEN);
@@ -543,6 +578,29 @@ var OneloAuth = class {
       this.authStateListeners = this.authStateListeners.filter((l) => l !== callback);
     };
   }
+  startHeartbeat(accessToken) {
+    this.stopHeartbeat();
+    this.heartbeatTimer = setInterval(async () => {
+      const session = await this.getSession();
+      if (!session) {
+        this.stopHeartbeat();
+        return;
+      }
+      try {
+        await fetch(`${this.apiUrl}/api/sdk/presence/heartbeat`, {
+          method: "POST",
+          headers: { Authorization: `Bearer ${session.accessToken}` }
+        });
+      } catch {
+      }
+    }, _OneloAuth.HEARTBEAT_MS);
+  }
+  stopHeartbeat() {
+    if (this.heartbeatTimer !== null) {
+      clearInterval(this.heartbeatTimer);
+      this.heartbeatTimer = null;
+    }
+  }
   async saveSession(session) {
     await Promise.all([
       this.storage.set(import_core.TOKEN_KEYS.ACCESS_TOKEN, session.accessToken),
@@ -551,6 +609,7 @@ var OneloAuth = class {
       this.storage.set(import_core.TOKEN_KEYS.USER_JSON, JSON.stringify(session.user))
     ]);
     this.notifyListeners(session);
+    this.startHeartbeat(session.accessToken);
   }
   notifyListeners(session) {
     for (const cb of this.authStateListeners) cb(session);
@@ -578,6 +637,8 @@ var OneloAuth = class {
     if (status !== 200) throw import_core.OneloError.server(`sendPasswordReset failed: HTTP ${status}`);
   }
 };
+_OneloAuth.HEARTBEAT_MS = 13 * 60 * 1e3;
+var OneloAuth = _OneloAuth;
 
 // src/features/features.ts
 var import_core2 = __toESM(require_dist());
@@ -619,16 +680,19 @@ var FeatureState = class {
 };
 var POLL_INTERVAL_MS = 6e4;
 var OneloFeatures = class {
-  constructor(apiUrl, publishableKey, monitor) {
+  constructor(apiUrl, publishableKey, monitor, bundleId, options) {
     this.cache = /* @__PURE__ */ new Map();
     this.discoveredNames = /* @__PURE__ */ new Set();
     this.configVersion = 0;
     this.pollTimer = null;
     this.pingDebounce = null;
     this.monitor = null;
+    this.anonymousWarningLogged = false;
     this.apiUrl = apiUrl;
     this.publishableKey = publishableKey;
     this.monitor = monitor ?? null;
+    this.bundleId = bundleId;
+    this.suppressIdentifyWarning = options?.suppressIdentifyWarning ?? false;
   }
   /** Declare feature names upfront — triggers a batch-ping immediately. */
   declare(names) {
@@ -688,10 +752,11 @@ var OneloFeatures = class {
     const names = Array.from(this.discoveredNames);
     if (names.length === 0) return;
     try {
+      const { sdkHeaders: sdkHeaders2 } = await Promise.resolve().then(() => (init_sdk_headers(), sdk_headers_exports));
       await (0, import_core2.httpPost)(`${this.apiUrl}/api/sdk/features/batch-ping`, {
         publishableKey: this.publishableKey,
         features: names
-      });
+      }, sdkHeaders2(this.bundleId));
     } catch {
     }
   }
@@ -699,7 +764,8 @@ var OneloFeatures = class {
     try {
       const body = { publishableKey: this.publishableKey };
       if (userId) body["userId"] = userId;
-      const { status, json } = await (0, import_core2.httpPost)(`${this.apiUrl}/api/sdk/features/resolve`, body);
+      const { sdkHeaders: sdkHeaders2 } = await Promise.resolve().then(() => (init_sdk_headers(), sdk_headers_exports));
+      const { status, json } = await (0, import_core2.httpPost)(`${this.apiUrl}/api/sdk/features/resolve`, body, sdkHeaders2(this.bundleId));
       if (status !== 200) return;
       const j = json;
       const features = j["features"];
@@ -712,8 +778,26 @@ var OneloFeatures = class {
       if (typeof j["config_version"] === "number") {
         this.configVersion = j["config_version"];
       }
+      this._maybeWarnAnonymous(j);
     } catch {
     }
+  }
+  /**
+   * Logs a one-time warning when the backend reports anonymous mode (no userId)
+   * AND at least one targeted feature was hidden purely because of it. Helps
+   * developers using their own auth system catch missing identify() calls.
+   */
+  _maybeWarnAnonymous(response) {
+    if (this.suppressIdentifyWarning || this.anonymousWarningLogged) return;
+    if (response["anonymous"] !== true) return;
+    const misses = typeof response["targeting_misses"] === "number" ? response["targeting_misses"] : 0;
+    if (misses <= 0) return;
+    this.anonymousWarningLogged = true;
+    console.warn(
+      `[Onelo] ${misses} feature(s) hidden because no user is identified.
+If you handle auth yourself, call onelo.identify(userId) after login so per-user/per-plan targeting can apply.
+If your app is intentionally anonymous, pass suppressIdentifyWarning: true in OneloConfig to silence this.`
+    );
   }
   async _poll(userId) {
     try {
@@ -722,8 +806,10 @@ var OneloFeatures = class {
         version: String(this.configVersion)
       });
       if (userId) params.set("userId", userId);
+      const { sdkHeaders: sdkHeaders2 } = await Promise.resolve().then(() => (init_sdk_headers(), sdk_headers_exports));
       const { status, json } = await (0, import_core2.httpGet)(
-        `${this.apiUrl}/api/sdk/features/poll?${params.toString()}`
+        `${this.apiUrl}/api/sdk/features/poll?${params.toString()}`,
+        sdkHeaders2(this.bundleId)
       );
       if (status !== 200) return;
       const j = json;
@@ -757,7 +843,7 @@ var MAX_BUFFER_SIZE = 200;
 var PLATFORM = "reactnative";
 var _globalHandlersRegistered = false;
 var OneloMonitor = class {
-  constructor(publishableKey, apiUrl) {
+  constructor(publishableKey, apiUrl, bundleId) {
     this.buffer = [];
     this.flushTimer = null;
     this.currentUserId = null;
@@ -771,6 +857,7 @@ var OneloMonitor = class {
     })();
     this.publishableKey = publishableKey;
     this.apiUrl = apiUrl;
+    this.bundleId = bundleId;
     this.flushTimer = setInterval(() => {
       void this.flush();
     }, 15e3);
@@ -802,9 +889,10 @@ var OneloMonitor = class {
     if (this.buffer.length === 0) return;
     const events = this.buffer.splice(0);
     try {
+      const { sdkHeaders: sdkHeaders2 } = await Promise.resolve().then(() => (init_sdk_headers(), sdk_headers_exports));
       await fetch(`${this.apiUrl}/api/sdk/monitor/events/batch`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { ...sdkHeaders2(this.bundleId), "Content-Type": "application/json" },
         body: JSON.stringify({ publishableKey: this.publishableKey, events })
       });
     } catch {
@@ -853,10 +941,11 @@ var OneloMonitor = class {
 
 // src/feedback/feedback.ts
 var OneloFeedback = class {
-  constructor(apiUrl, publishableKey, getActiveFeatures) {
+  constructor(apiUrl, publishableKey, getActiveFeatures, bundleId) {
     this.apiUrl = apiUrl;
     this.publishableKey = publishableKey;
     this.getActiveFeatures = getActiveFeatures;
+    this.bundleId = bundleId;
     this._url = null;
     this._visible = false;
     this._listeners = [];
@@ -876,7 +965,10 @@ var OneloFeedback = class {
       if (options.userId) params.set("userId", options.userId);
       const active = this.getActiveFeatures();
       if (active.length > 0) params.set("session", JSON.stringify(active));
-      const res = await fetch(`${this.apiUrl}/api/sdk/feedback/initiate?${params}`);
+      const { sdkHeaders: sdkHeaders2 } = await Promise.resolve().then(() => (init_sdk_headers(), sdk_headers_exports));
+      const res = await fetch(`${this.apiUrl}/api/sdk/feedback/initiate?${params}`, {
+        headers: sdkHeaders2(this.bundleId)
+      });
       if (!res.ok) {
         this.close();
         return;
@@ -919,17 +1011,19 @@ var OneloPaywall = class {
 
 // src/forms/forms.ts
 var OneloForms = class {
-  constructor(apiUrl, publishableKey) {
+  constructor(apiUrl, publishableKey, bundleId) {
     this.apiUrl = apiUrl;
     this.publishableKey = publishableKey;
+    this.bundleId = bundleId;
   }
   async submit(formSlug, data, submitterEmail) {
     try {
+      const { sdkHeaders: sdkHeaders2 } = await Promise.resolve().then(() => (init_sdk_headers(), sdk_headers_exports));
       const body = { publishableKey: this.publishableKey, formSlug, data };
       if (submitterEmail) body.submitterEmail = submitterEmail;
       const res = await fetch(`${this.apiUrl}/api/sdk/forms/submit`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { ...sdkHeaders2(this.bundleId), "Content-Type": "application/json" },
         body: JSON.stringify(body)
       });
       const json = await res.json();
@@ -942,17 +1036,19 @@ var OneloForms = class {
 
 // src/waitlist/waitlist.ts
 var OneloWaitlist = class {
-  constructor(apiUrl, publishableKey) {
+  constructor(apiUrl, publishableKey, bundleId) {
     this.apiUrl = apiUrl;
     this.publishableKey = publishableKey;
+    this.bundleId = bundleId;
   }
   async join(slug, email) {
     try {
+      const { sdkHeaders: sdkHeaders2 } = await Promise.resolve().then(() => (init_sdk_headers(), sdk_headers_exports));
       const body = { publishableKey: this.publishableKey, email };
       if (slug !== void 0) body.slug = slug;
       const res = await fetch(`${this.apiUrl}/api/sdk/waitlist/join`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { ...sdkHeaders2(this.bundleId), "Content-Type": "application/json" },
         body: JSON.stringify(body)
       });
       const json = await res.json();
@@ -968,12 +1064,14 @@ var Onelo = class {
   constructor(config) {
     this.authUnsubscribe = null;
     this.auth = new OneloAuth(config);
-    this.monitor = new OneloMonitor(config.publishableKey, config.apiUrl);
-    this.features = new OneloFeatures(config.apiUrl, config.publishableKey, this.monitor);
-    this.feedback = new OneloFeedback(config.apiUrl, config.publishableKey, () => this.features.getActiveFeatures());
+    this.monitor = new OneloMonitor(config.publishableKey, config.apiUrl, config.bundleId);
+    this.features = new OneloFeatures(config.apiUrl, config.publishableKey, this.monitor, config.bundleId, {
+      suppressIdentifyWarning: config.suppressIdentifyWarning ?? false
+    });
+    this.feedback = new OneloFeedback(config.apiUrl, config.publishableKey, () => this.features.getActiveFeatures(), config.bundleId);
     this.paywall = new OneloPaywall();
-    this.forms = new OneloForms(config.apiUrl, config.publishableKey);
-    this.waitlist = new OneloWaitlist(config.apiUrl, config.publishableKey);
+    this.forms = new OneloForms(config.apiUrl, config.publishableKey, config.bundleId);
+    this.waitlist = new OneloWaitlist(config.apiUrl, config.publishableKey, config.bundleId);
     this.authUnsubscribe = this.auth.onAuthStateChange((session) => {
       const userId = session?.user.id ?? null;
       this.monitor.setUserId(userId);

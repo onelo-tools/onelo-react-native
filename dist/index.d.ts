@@ -32,6 +32,8 @@ declare class OneloAuth {
     private publishableKey;
     private pkceVerifier;
     private resolvedConfig;
+    private heartbeatTimer;
+    private static readonly HEARTBEAT_MS;
     private initPromise;
     private authStateListeners;
     private modalStateListeners;
@@ -62,6 +64,8 @@ declare class OneloAuth {
     getSession(): Promise<OneloSession | null>;
     refreshSession(): Promise<OneloSession | null>;
     onAuthStateChange(callback: (session: OneloSession | null) => void): () => void;
+    private startHeartbeat;
+    private stopHeartbeat;
     private saveSession;
     private notifyListeners;
     private notifyModalListeners;
@@ -84,18 +88,25 @@ declare class FeatureState {
     get isComingSoon(): boolean;
     get badgeLabel(): string | null;
 }
+interface OneloFeaturesOptions {
+    /** Suppress the anonymous-mode identify() warning. See OneloConfig.suppressIdentifyWarning. */
+    suppressIdentifyWarning?: boolean;
+}
 declare class OneloFeatures {
     private readonly apiUrl;
     private readonly publishableKey;
+    private readonly bundleId?;
     private cache;
     private discoveredNames;
     private configVersion;
     private pollTimer;
     private pingDebounce;
     private monitor;
+    private suppressIdentifyWarning;
+    private anonymousWarningLogged;
     constructor(apiUrl: string, publishableKey: string, monitor?: {
         _trackFeatureCall: (name: string) => void;
-    } | null);
+    } | null, bundleId?: string, options?: OneloFeaturesOptions);
     /** Declare feature names upfront — triggers a batch-ping immediately. */
     declare(names: string[]): void;
     /** Returns the current state for a feature. Auto-registers on first call. */
@@ -111,6 +122,12 @@ declare class OneloFeatures {
     private _scheduleBatchPing;
     private _batchPing;
     private _resolve;
+    /**
+     * Logs a one-time warning when the backend reports anonymous mode (no userId)
+     * AND at least one targeted feature was hidden purely because of it. Helps
+     * developers using their own auth system catch missing identify() calls.
+     */
+    private _maybeWarnAnonymous;
     private _poll;
     private _startPolling;
 }
@@ -124,11 +141,12 @@ interface MonitorEventOptions {
 declare class OneloMonitor {
     private readonly publishableKey;
     private readonly apiUrl;
+    private readonly bundleId?;
     private buffer;
     private flushTimer;
     private currentUserId;
     private readonly sessionId;
-    constructor(publishableKey: string, apiUrl: string);
+    constructor(publishableKey: string, apiUrl: string, bundleId?: string);
     /** Sets the current user ID attached to all subsequent monitor events. Call after login/logout if not using Onelo Auth. */
     setUserId(userId: string | null): void;
     _trackFeatureCall(featureName: string): void;
@@ -151,10 +169,11 @@ declare class OneloFeedback {
     private readonly apiUrl;
     private readonly publishableKey;
     private readonly getActiveFeatures;
+    private readonly bundleId?;
     private _url;
     private _visible;
     private _listeners;
-    constructor(apiUrl: string, publishableKey: string, getActiveFeatures: () => string[]);
+    constructor(apiUrl: string, publishableKey: string, getActiveFeatures: () => string[], bundleId?: string | undefined);
     open(options?: FeedbackOptions): void;
     close(): void;
     private _fetchAndLoad;
@@ -171,7 +190,8 @@ declare class OneloPaywall {
 declare class OneloForms {
     private readonly apiUrl;
     private readonly publishableKey;
-    constructor(apiUrl: string, publishableKey: string);
+    private readonly bundleId?;
+    constructor(apiUrl: string, publishableKey: string, bundleId?: string | undefined);
     submit(formSlug: string, data: Record<string, unknown>, submitterEmail?: string): Promise<{
         success: boolean;
         message?: string;
@@ -181,7 +201,8 @@ declare class OneloForms {
 declare class OneloWaitlist {
     private readonly apiUrl;
     private readonly publishableKey;
-    constructor(apiUrl: string, publishableKey: string);
+    private readonly bundleId?;
+    constructor(apiUrl: string, publishableKey: string, bundleId?: string | undefined);
     join(slug: string | undefined, email: string): Promise<{
         success: boolean;
         position?: number;
