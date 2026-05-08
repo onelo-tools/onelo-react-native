@@ -222,7 +222,7 @@ var require_package = __commonJS({
   "package.json"(exports2, module2) {
     module2.exports = {
       name: "@onelo/react-native",
-      version: "0.10.0-staging",
+      version: "0.10.1-staging",
       description: "Onelo React Native SDK",
       main: "./dist/index.js",
       types: "./dist/index.d.ts",
@@ -434,7 +434,7 @@ var _OneloAuth = class _OneloAuth {
         try {
           const { status, json } = await (0, import_core.httpPost)(
             `${this.apiUrl}/api/sdk/auth/hosted-callback`,
-            { publishableKey: this.publishableKey, code: result.code },
+            { publishableKey: this.publishableKey, code: result.code, code_verifier: this.pkceVerifier },
             { "X-SDK-Version": SDK_VERSION }
           );
           if (status !== 200) {
