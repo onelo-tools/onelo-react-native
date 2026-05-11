@@ -16,7 +16,10 @@ export class OneloAuth {
   private pkceVerifier: string | null = null
   private resolvedConfig: ResolvedSDKConfig | null = null
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null
+  private refreshTimer: ReturnType<typeof setTimeout> | null = null
   private static readonly HEARTBEAT_MS = 13 * 60 * 1000
+  /** Refresh this many seconds before the access token expires. */
+  private static readonly REFRESH_LEAD_SECONDS = 60
   private initPromise: Promise<void>
   private authStateListeners: Array<(session: OneloSession | null) => void> = []
   private modalStateListeners: Array<() => void> = []
@@ -190,6 +193,7 @@ export class OneloAuth {
 
   async signOut(): Promise<void> {
     this.stopHeartbeat()
+    this.clearRefreshTimer()
     await this.storage.clear()
     this.notifyListeners(null)
   }
@@ -211,7 +215,10 @@ export class OneloAuth {
       await this.storage.clear()
       return null
     }
-    return { accessToken, refreshToken, expiresAt, user }
+    const session: OneloSession = { accessToken, refreshToken, expiresAt, user }
+    // Arm background refresh on first read after process start.
+    this.scheduleRefresh(session)
+    return session
   }
 
   async refreshSession(): Promise<OneloSession | null> {
@@ -224,9 +231,9 @@ export class OneloAuth {
     )
     checkHostedFlowRequired(json)
     const j = json as Record<string, unknown>
-    if (j['error'] === 'user_revoked') { await this.storage.clear(); this.notifyListeners(null); throw OneloError.userRevoked() }
-    if (j['error'] === 'app_revoked') { await this.storage.clear(); this.notifyListeners(null); throw OneloError.revoked() }
-    if (status !== 200) { await this.storage.clear(); this.notifyListeners(null); return null }
+    if (j['error'] === 'user_revoked') { this.clearRefreshTimer(); await this.storage.clear(); this.notifyListeners(null); throw OneloError.userRevoked() }
+    if (j['error'] === 'app_revoked') { this.clearRefreshTimer(); await this.storage.clear(); this.notifyListeners(null); throw OneloError.revoked() }
+    if (status !== 200) { this.clearRefreshTimer(); await this.storage.clear(); this.notifyListeners(null); return null }
     const session = mapSession(j)
     await this.saveSession(session)
     return session
@@ -262,6 +269,31 @@ export class OneloAuth {
     }
   }
 
+  /**
+   * Schedule a background refresh of the access token to fire `REFRESH_LEAD_SECONDS`
+   * before it expires. Idempotent — cancels any pending refresh first. Without this,
+   * an idle app would carry a stale token past its TTL and the next request would 401.
+   */
+  private scheduleRefresh(session: OneloSession): void {
+    this.clearRefreshTimer()
+    const nowSec = Date.now() / 1000
+    const delaySec = session.expiresAt - nowSec - OneloAuth.REFRESH_LEAD_SECONDS
+    const delayMs = delaySec > 0 ? delaySec * 1000 : 0
+    this.refreshTimer = setTimeout(() => {
+      this.refreshTimer = null
+      void this.refreshSession().catch(() => {
+        // Errors already handled inside refreshSession.
+      })
+    }, delayMs)
+  }
+
+  private clearRefreshTimer(): void {
+    if (this.refreshTimer !== null) {
+      clearTimeout(this.refreshTimer)
+      this.refreshTimer = null
+    }
+  }
+
   private async saveSession(session: OneloSession): Promise<void> {
     await Promise.all([
       this.storage.set(TOKEN_KEYS.ACCESS_TOKEN, session.accessToken),
@@ -271,6 +303,7 @@ export class OneloAuth {
     ])
     this.notifyListeners(session)
     this.startHeartbeat(session.accessToken)
+    this.scheduleRefresh(session)
   }
 
   private notifyListeners(session: OneloSession | null): void {
