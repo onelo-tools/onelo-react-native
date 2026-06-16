@@ -284,7 +284,7 @@ var require_package = __commonJS({
   "package.json"(exports2, module2) {
     module2.exports = {
       name: "@onelo/react-native",
-      version: "0.12.0-staging",
+      version: "0.13.0-staging",
       description: "Onelo React Native SDK",
       main: "./dist/index.js",
       types: "./dist/index.d.ts",
@@ -787,6 +787,7 @@ var OneloFeatures = class {
     this.monitor = monitor ?? null;
     this.bundleId = bundleId;
     this.suppressIdentifyWarning = options?.suppressIdentifyWarning ?? false;
+    this.featureEnvironment = options?.featureEnvironment;
   }
   /** Declare feature names upfront — triggers a batch-ping immediately. */
   declare(names) {
@@ -849,7 +850,8 @@ var OneloFeatures = class {
       const { sdkHeaders: sdkHeaders2 } = await Promise.resolve().then(() => (init_sdk_headers(), sdk_headers_exports));
       await (0, import_core2.httpPost)(`${this.apiUrl}/api/sdk/features/batch-ping`, {
         publishableKey: this.publishableKey,
-        features: names
+        features: names,
+        ...this.featureEnvironment ? { environment: this.featureEnvironment } : {}
       }, sdkHeaders2(this.bundleId));
     } catch {
     }
@@ -858,6 +860,7 @@ var OneloFeatures = class {
     try {
       const body = { publishableKey: this.publishableKey };
       if (userId) body["userId"] = userId;
+      if (this.featureEnvironment) body["environment"] = this.featureEnvironment;
       const { sdkHeaders: sdkHeaders2 } = await Promise.resolve().then(() => (init_sdk_headers(), sdk_headers_exports));
       const { status, json } = await (0, import_core2.httpPost)(`${this.apiUrl}/api/sdk/features/resolve`, body, sdkHeaders2(this.bundleId));
       if (status !== 200) return;
@@ -899,6 +902,7 @@ If your app is intentionally anonymous, pass suppressIdentifyWarning: true in On
         key: this.publishableKey,
         version: String(this.configVersion)
       });
+      if (this.featureEnvironment) params.set("environment", this.featureEnvironment);
       if (userId) params.set("userId", userId);
       const { sdkHeaders: sdkHeaders2 } = await Promise.resolve().then(() => (init_sdk_headers(), sdk_headers_exports));
       const { status, json } = await (0, import_core2.httpGet)(
@@ -1159,8 +1163,10 @@ var Onelo = class {
     this.authUnsubscribe = null;
     this.auth = new OneloAuth(config);
     this.monitor = new OneloMonitor(config.publishableKey, config.apiUrl, config.bundleId);
+    const featureEnvironment = config.featureEnvironment === "test" || config.featureEnvironment === "live" ? config.featureEnvironment : void 0;
     this.features = new OneloFeatures(config.apiUrl, config.publishableKey, this.monitor, config.bundleId, {
-      suppressIdentifyWarning: config.suppressIdentifyWarning ?? false
+      suppressIdentifyWarning: config.suppressIdentifyWarning ?? false,
+      featureEnvironment
     });
     this.feedback = new OneloFeedback(config.apiUrl, config.publishableKey, () => this.features.getActiveFeatures(), config.bundleId);
     this.paywall = new OneloPaywall();

@@ -101,11 +101,14 @@ declare class FeatureState {
 interface OneloFeaturesOptions {
     /** Suppress the anonymous-mode identify() warning. See OneloConfig.suppressIdentifyWarning. */
     suppressIdentifyWarning?: boolean;
+    /** Explicit feature environment ('test'|'live'), forwarded on resolve/batch-ping/poll. See OneloConfig.featureEnvironment. */
+    featureEnvironment?: string;
 }
 declare class OneloFeatures {
     private readonly apiUrl;
     private readonly publishableKey;
     private readonly bundleId?;
+    private readonly featureEnvironment?;
     private cache;
     private discoveredNames;
     private configVersion;

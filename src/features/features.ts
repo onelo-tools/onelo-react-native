@@ -41,12 +41,15 @@ const POLL_INTERVAL_MS = 60_000
 export interface OneloFeaturesOptions {
   /** Suppress the anonymous-mode identify() warning. See OneloConfig.suppressIdentifyWarning. */
   suppressIdentifyWarning?: boolean
+  /** Explicit feature environment ('test'|'live'), forwarded on resolve/batch-ping/poll. See OneloConfig.featureEnvironment. */
+  featureEnvironment?: string
 }
 
 export class OneloFeatures {
   private readonly apiUrl: string
   private readonly publishableKey: string
   private readonly bundleId?: string
+  private readonly featureEnvironment?: string
   private cache: Map<string, FeatureStatus> = new Map()
   private discoveredNames: Set<string> = new Set()
   private configVersion = 0
@@ -68,6 +71,7 @@ export class OneloFeatures {
     this.monitor = monitor ?? null
     this.bundleId = bundleId
     this.suppressIdentifyWarning = options?.suppressIdentifyWarning ?? false
+    this.featureEnvironment = options?.featureEnvironment
   }
 
   /** Declare feature names upfront — triggers a batch-ping immediately. */
@@ -140,6 +144,7 @@ export class OneloFeatures {
       await httpPost(`${this.apiUrl}/api/sdk/features/batch-ping`, {
         publishableKey: this.publishableKey,
         features: names,
+        ...(this.featureEnvironment ? { environment: this.featureEnvironment } : {}),
       }, sdkHeaders(this.bundleId))
     } catch {
       // best-effort
@@ -150,6 +155,7 @@ export class OneloFeatures {
     try {
       const body: Record<string, unknown> = { publishableKey: this.publishableKey }
       if (userId) body['userId'] = userId
+      if (this.featureEnvironment) body['environment'] = this.featureEnvironment
       const { sdkHeaders } = await import('../sdk-headers')
       const { status, json } = await httpPost(`${this.apiUrl}/api/sdk/features/resolve`, body, sdkHeaders(this.bundleId))
       if (status !== 200) return
@@ -195,6 +201,7 @@ export class OneloFeatures {
         key: this.publishableKey,
         version: String(this.configVersion),
       })
+      if (this.featureEnvironment) params.set('environment', this.featureEnvironment)
       if (userId) params.set('userId', userId)
       const { sdkHeaders } = await import('../sdk-headers')
       const { status, json } = await httpGet(

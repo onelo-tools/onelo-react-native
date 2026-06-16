@@ -20,8 +20,16 @@ export class Onelo {
   constructor(config: OneloConfig) {
     this.auth = new OneloAuth(config)
     this.monitor = new OneloMonitor(config.publishableKey, config.apiUrl, config.bundleId)
+    // Feature environment: explicit config only. React Native has no Node
+    // process.env, so there is no env-var fallback — normalize to 'test'|'live'
+    // or undefined so a stray value never ships as a junk request field.
+    const featureEnvironment =
+      config.featureEnvironment === 'test' || config.featureEnvironment === 'live'
+        ? config.featureEnvironment
+        : undefined
     this.features = new OneloFeatures(config.apiUrl, config.publishableKey, this.monitor, config.bundleId, {
       suppressIdentifyWarning: config.suppressIdentifyWarning ?? false,
+      featureEnvironment,
     })
     this.feedback = new OneloFeedback(config.apiUrl, config.publishableKey, () => this.features.getActiveFeatures(), config.bundleId)
     this.paywall = new OneloPaywall()
