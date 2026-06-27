@@ -15,8 +15,14 @@ export class OneloAuth {
   private publishableKey: string
   private pkceVerifier: string | null = null
   private resolvedConfig: ResolvedSDKConfig | null = null
+  private heartbeatTimer: ReturnType<typeof setInterval> | null = null
+  private refreshTimer: ReturnType<typeof setTimeout> | null = null
+  private static readonly HEARTBEAT_MS = 13 * 60 * 1000
+  /** Refresh this many seconds before the access token expires. */
+  private static readonly REFRESH_LEAD_SECONDS = 60
   private initPromise: Promise<void>
   private authStateListeners: Array<(session: OneloSession | null) => void> = []
+  private modalStateListeners: Array<() => void> = []
   private _modalVisible = false
   private _modalUrl = ''
   private _modalResolve: ((result: ModalResult) => void) | null = null
@@ -53,10 +59,16 @@ export class OneloAuth {
         allowCustomBranding: (j['allow_custom_branding'] as boolean) ?? false,
         appName: (j['app_name'] as string | null) ?? null,
         appLogoUrl: (j['app_logo_url'] as string | null) ?? null,
+        paywallEnabled: (j['paywall_enabled'] as boolean) ?? false,
+        waitlistMode: (j['waitlist_mode'] as boolean) ?? false,
+        sdkRedirectUrl: (j['sdk_redirect_url'] as string | null) ?? null,
+        storeUrl: (j['store_url'] as string | null) ?? null,
+        manageUrl: (j['manage_url'] as string | null) ?? null,
       }
-      this.allowCustomBranding = this.resolvedConfig.allowCustomBranding
-      if (this.resolvedConfig.appName) this.appName = this.resolvedConfig.appName
-      this.appLogoUrl = this.resolvedConfig.appLogoUrl
+      const resolved = this.resolvedConfig
+      this.allowCustomBranding = resolved.allowCustomBranding
+      if (resolved.appName) this.appName = resolved.appName
+      this.appLogoUrl = resolved.appLogoUrl
       this.isReady = true
     } catch (e) {
       if (e instanceof OneloError && e.code === 'invalid_publishable_key') {
@@ -79,15 +91,17 @@ export class OneloAuth {
     return new Promise((resolve, reject) => {
       this._modalUrl = hostedUrl
       this._modalVisible = true
+      this.notifyModalListeners()
       this._modalResolve = async (result: ModalResult) => {
         this._modalVisible = false
         this._modalResolve = null
+        this.notifyModalListeners()
         if (result.type === 'cancelled') { resolve(null); return }
         if (result.type === 'error') { reject(OneloError.server(result.message)); return }
         try {
           const { status, json } = await httpPost(
             `${this.apiUrl}/api/sdk/auth/hosted-callback`,
-            { publishableKey: this.publishableKey, code: result.code },
+            { publishableKey: this.publishableKey, code: result.code, code_verifier: this.pkceVerifier },
             { 'X-SDK-Version': SDK_VERSION }
           )
           if (status !== 200) { reject(OneloError.server('Hosted callback failed')); return }
@@ -107,6 +121,14 @@ export class OneloAuth {
       visible: this._modalVisible,
       url: this._modalUrl,
       onResult: this._modalResolve,
+    }
+  }
+
+  /** Subscribe to modal state changes. Returns an unsubscribe function. */
+  onModalStateChange(callback: () => void): () => void {
+    this.modalStateListeners.push(callback)
+    return () => {
+      this.modalStateListeners = this.modalStateListeners.filter(l => l !== callback)
     }
   }
 
@@ -170,6 +192,8 @@ export class OneloAuth {
   // ── Session management ──────────────────────────────────────────────────────
 
   async signOut(): Promise<void> {
+    this.stopHeartbeat()
+    this.clearRefreshTimer()
     await this.storage.clear()
     this.notifyListeners(null)
   }
@@ -186,7 +210,15 @@ export class OneloAuth {
     if (Date.now() / 1000 > expiresAt - 60) {
       return this.refreshSession()
     }
-    return { accessToken, refreshToken, expiresAt, user: JSON.parse(userJson) as OneloUser }
+    const user = JSON.parse(userJson) as OneloUser
+    if (!user.id) {
+      await this.storage.clear()
+      return null
+    }
+    const session: OneloSession = { accessToken, refreshToken, expiresAt, user }
+    // Arm background refresh on first read after process start.
+    this.scheduleRefresh(session)
+    return session
   }
 
   async refreshSession(): Promise<OneloSession | null> {
@@ -199,9 +231,9 @@ export class OneloAuth {
     )
     checkHostedFlowRequired(json)
     const j = json as Record<string, unknown>
-    if (j['error'] === 'user_revoked') { await this.storage.clear(); this.notifyListeners(null); throw OneloError.userRevoked() }
-    if (j['error'] === 'app_revoked') { await this.storage.clear(); this.notifyListeners(null); throw OneloError.revoked() }
-    if (status !== 200) { await this.storage.clear(); this.notifyListeners(null); return null }
+    if (j['error'] === 'user_revoked') { this.clearRefreshTimer(); await this.storage.clear(); this.notifyListeners(null); throw OneloError.userRevoked() }
+    if (j['error'] === 'app_revoked') { this.clearRefreshTimer(); await this.storage.clear(); this.notifyListeners(null); throw OneloError.revoked() }
+    if (status !== 200) { this.clearRefreshTimer(); await this.storage.clear(); this.notifyListeners(null); return null }
     const session = mapSession(j)
     await this.saveSession(session)
     return session
@@ -214,6 +246,54 @@ export class OneloAuth {
     }
   }
 
+  private startHeartbeat(accessToken: string): void {
+    this.stopHeartbeat()
+    this.heartbeatTimer = setInterval(async () => {
+      const session = await this.getSession()
+      if (!session) { this.stopHeartbeat(); return }
+      try {
+        await fetch(`${this.apiUrl}/api/sdk/presence/heartbeat`, {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${session.accessToken}` },
+        })
+      } catch {
+        // fire-and-forget
+      }
+    }, OneloAuth.HEARTBEAT_MS)
+  }
+
+  private stopHeartbeat(): void {
+    if (this.heartbeatTimer !== null) {
+      clearInterval(this.heartbeatTimer)
+      this.heartbeatTimer = null
+    }
+  }
+
+  /**
+   * Schedule a background refresh of the access token to fire `REFRESH_LEAD_SECONDS`
+   * before it expires. Idempotent — cancels any pending refresh first. Without this,
+   * an idle app would carry a stale token past its TTL and the next request would 401.
+   */
+  private scheduleRefresh(session: OneloSession): void {
+    this.clearRefreshTimer()
+    const nowSec = Date.now() / 1000
+    const delaySec = session.expiresAt - nowSec - OneloAuth.REFRESH_LEAD_SECONDS
+    const delayMs = delaySec > 0 ? delaySec * 1000 : 0
+    this.refreshTimer = setTimeout(() => {
+      this.refreshTimer = null
+      void this.refreshSession().catch(() => {
+        // Errors already handled inside refreshSession.
+      })
+    }, delayMs)
+  }
+
+  private clearRefreshTimer(): void {
+    if (this.refreshTimer !== null) {
+      clearTimeout(this.refreshTimer)
+      this.refreshTimer = null
+    }
+  }
+
   private async saveSession(session: OneloSession): Promise<void> {
     await Promise.all([
       this.storage.set(TOKEN_KEYS.ACCESS_TOKEN, session.accessToken),
@@ -222,9 +302,37 @@ export class OneloAuth {
       this.storage.set(TOKEN_KEYS.USER_JSON, JSON.stringify(session.user)),
     ])
     this.notifyListeners(session)
+    this.startHeartbeat(session.accessToken)
+    this.scheduleRefresh(session)
   }
 
   private notifyListeners(session: OneloSession | null): void {
     for (const cb of this.authStateListeners) cb(session)
+  }
+
+  private notifyModalListeners(): void {
+    for (const cb of this.modalStateListeners) cb()
+  }
+
+  // ── Magic link & password reset ─────────────────────────────────────────────
+
+  async sendMagicLink(email: string): Promise<void> {
+    await this.initPromise
+    const { status } = await httpPost(
+      `${this.apiUrl}/api/sdk/auth/magic-link`,
+      { email, publishableKey: this.publishableKey },
+      { 'X-SDK-Version': SDK_VERSION }
+    )
+    if (status !== 200) throw OneloError.server(`sendMagicLink failed: HTTP ${status}`)
+  }
+
+  async sendPasswordReset(email: string): Promise<void> {
+    await this.initPromise
+    const { status } = await httpPost(
+      `${this.apiUrl}/api/sdk/auth/reset-password/request`,
+      { email, publishableKey: this.publishableKey },
+      { 'X-SDK-Version': SDK_VERSION }
+    )
+    if (status !== 200) throw OneloError.server(`sendPasswordReset failed: HTTP ${status}`)
   }
 }
