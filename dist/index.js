@@ -284,7 +284,7 @@ var require_package = __commonJS({
   "package.json"(exports2, module2) {
     module2.exports = {
       name: "@onelo/react-native",
-      version: "0.13.0-staging",
+      version: "0.13.1-staging",
       description: "Onelo React Native SDK",
       main: "./dist/index.js",
       types: "./dist/index.d.ts",
@@ -1060,13 +1060,11 @@ var OneloFeedback = class {
       const params = new URLSearchParams({ key: this.publishableKey });
       if (options.type) params.set("type", options.type);
       if (options.area) params.set("area", options.area);
-      if (options.userId) params.set("userId", options.userId);
       const active = this.getActiveFeatures();
       if (active.length > 0) params.set("session", JSON.stringify(active));
       const { sdkHeaders: sdkHeaders2 } = await Promise.resolve().then(() => (init_sdk_headers(), sdk_headers_exports));
-      const res = await fetch(`${this.apiUrl}/api/sdk/feedback/initiate?${params}`, {
-        headers: sdkHeaders2(this.bundleId)
-      });
+      const headers = { ...sdkHeaders2(this.bundleId), ...options.userId ? { "X-Onelo-User-Id": options.userId } : {} };
+      const res = await fetch(`${this.apiUrl}/api/sdk/feedback/initiate?${params}`, { headers });
       if (!res.ok) {
         this.close();
         return;

@@ -29,14 +29,13 @@ export class OneloFeedback {
       const params = new URLSearchParams({ key: this.publishableKey })
       if (options.type) params.set('type', options.type)
       if (options.area) params.set('area', options.area)
-      if (options.userId) params.set('userId', options.userId)
       const active = this.getActiveFeatures()
       if (active.length > 0) params.set('session', JSON.stringify(active))
 
       const { sdkHeaders } = await import('../sdk-headers')
-      const res = await fetch(`${this.apiUrl}/api/sdk/feedback/initiate?${params}`, {
-        headers: sdkHeaders(this.bundleId),
-      })
+      // userId as a header (X-Onelo-User-Id), not a query param → stays out of logs.
+      const headers = { ...sdkHeaders(this.bundleId), ...(options.userId ? { 'X-Onelo-User-Id': options.userId } : {}) }
+      const res = await fetch(`${this.apiUrl}/api/sdk/feedback/initiate?${params}`, { headers })
       if (!res.ok) { this.close(); return }
       const { hosted_url } = await res.json() as { hosted_url: string }
       if (this._visible) this._notify(hosted_url, true)
