@@ -31,10 +31,18 @@ body{background:#111;font-family:-apple-system,sans-serif;padding:40px 36px 32px
 <div class="sk btn"></div>
 </body></html>`
 
+// #40 Phase 2 — relay the hosted feedback page's postMessages to the RN bridge:
+//   • onelo:feedback_submitted — submit auto-closed (existing).
+//   • onelo:feedback_close     — user tapped the hosted (canonical) ✕ → dismiss.
+//   • onelo:ready              — hosted page mounted → hide the native fail-safe ✕.
+// Mirrors Swift's OneloFeedback relayScript (3.71.7).
 const RELAY_JS = `
 (function() {
   window.addEventListener('message', function(e) {
-    if (window.ReactNativeWebView && e.data && e.data.type === 'onelo:feedback_submitted') {
+    if (!window.ReactNativeWebView || !e.data || !e.data.type) return;
+    if (e.data.type === 'onelo:feedback_submitted' ||
+        e.data.type === 'onelo:feedback_close' ||
+        e.data.type === 'onelo:ready') {
       window.ReactNativeWebView.postMessage(JSON.stringify(e.data));
     }
   });
@@ -49,6 +57,15 @@ export function FeedbackModal({ feedback }: FeedbackModalProps) {
 
   const [url, setUrl] = useState<string | null>(feedback.getCurrentUrl())
   const [visible, setVisible] = useState(feedback.isVisible())
+  // #40 Phase 2 — true once the hosted page posts `onelo:ready`. While false, the
+  // native ✕ acts as a FAIL-SAFE for the pre-load / error window; once true the
+  // hosted page's canonical ✕ owns the affordance and the native one hides.
+  const [hostedReady, setHostedReady] = useState(false)
+  // #44 — arm the native fail-safe ✕ only after a ~3.5s grace (or on a load error).
+  // A normal fast load posts `onelo:ready` first, so `hostedReady` flips before this
+  // and the native ✕ never flashes.
+  const [failSafeArmed, setFailSafeArmed] = useState(false)
+  const [loadError, setLoadError] = useState(false)
 
   useEffect(() => {
     const unsub = feedback.subscribe((nextUrl, nextVisible) => {
@@ -58,12 +75,31 @@ export function FeedbackModal({ feedback }: FeedbackModalProps) {
     return unsub
   }, [feedback])
 
+  // #44 — reset the ready/fail-safe state on each open (and when the real URL
+  // replaces the skeleton) and arm the grace timer. Cleared on unmount / re-open.
+  useEffect(() => {
+    if (!visible) return
+    setHostedReady(false)
+    setFailSafeArmed(false)
+    setLoadError(false)
+    const t = setTimeout(() => setFailSafeArmed(true), 3500)
+    return () => clearTimeout(t)
+  }, [visible, url])
+
   const handleMessage = useCallback((event: any) => {
     try {
       const msg = JSON.parse(event.nativeEvent.data) as Record<string, unknown>
-      if (msg['type'] === 'onelo:feedback_submitted') feedback.close()
+      const type = msg['type']
+      // Both submit (auto-close) and the canonical hosted ✕ (Phase 2) dismiss.
+      if (type === 'onelo:feedback_submitted' || type === 'onelo:feedback_close') feedback.close()
+      // Hosted page mounted → hide the native fail-safe ✕.
+      else if (type === 'onelo:ready') setHostedReady(true)
     } catch { /* ignore */ }
   }, [feedback])
+
+  // #40 Phase 2 / #44 — the native fail-safe ✕ shows ONLY while the hosted page
+  // hasn't confirmed it's ready AND either the grace elapsed or the load errored.
+  const showNativeClose = !hostedReady && (failSafeArmed || loadError)
 
   // Top inset so the close control clears the status bar. On Android the
   // pageSheet Modal is full-screen and paints UNDER the status bar, so we pad by
@@ -106,23 +142,33 @@ export function FeedbackModal({ feedback }: FeedbackModalProps) {
     onRequestClose: () => feedback.close(),
   },
     React.createElement(View, { style: styles.container },
-      // Header with a visible close (✕), trailing (top-right) — the single unified
-      // close position across every Onelo modal + SDK. Same control on iOS + Android.
+      // Header with a close (✕), trailing (top-right) — the single unified close
+      // position across every Onelo modal + SDK. Same control on iOS + Android.
+      // #40 Phase 2 — the native ✕ is now a FAIL-SAFE: shown only during the
+      // pre-load / error window (see `showNativeClose`). Once the hosted page posts
+      // `onelo:ready`, its canonical ✕ takes over and this hides. The bar itself is
+      // kept (preserves the status-bar top inset + avoids layout shift); an empty
+      // spacer holds its place when the ✕ is hidden.
       React.createElement(View, { style: styles.header },
-        React.createElement(TouchableOpacity, {
-          onPress: () => feedback.close(),
-          style: styles.closeBtn,
-          accessibilityRole: 'button',
-          accessibilityLabel: 'Close feedback',
-          hitSlop: { top: 8, bottom: 8, left: 8, right: 8 },
-        },
-          React.createElement(Text, { style: styles.closeIcon, allowFontScaling: false }, '✕')
-        )
+        showNativeClose
+          ? React.createElement(TouchableOpacity, {
+              onPress: () => feedback.close(),
+              style: styles.closeBtn,
+              accessibilityRole: 'button',
+              accessibilityLabel: 'Close feedback',
+              hitSlop: { top: 8, bottom: 8, left: 8, right: 8 },
+            },
+              React.createElement(Text, { style: styles.closeIcon, allowFontScaling: false }, '✕')
+            )
+          : React.createElement(View, { style: styles.closeBtn })
       ),
       // Always render WebView: shows skeleton HTML until real URL loads
       React.createElement(WebView, {
         source: url ? { uri: url } : { html: SKELETON_HTML },
         onMessage: handleMessage,
+        // #44 — a load error reveals the native fail-safe ✕ immediately (no grace
+        // wait) so the user is never trapped with no way out on a failed hosted page.
+        onError: () => setLoadError(true),
         injectedJavaScript: RELAY_JS,
         style: styles.webview,
         backgroundColor: bg,

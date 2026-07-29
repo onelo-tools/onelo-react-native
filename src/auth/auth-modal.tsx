@@ -9,6 +9,7 @@ import {
   openInSystemBrowser as openBrowser,
   OAUTH_RELAY_SCRIPT,
 } from './webview-oauth'
+import { authSkeletonHtml } from './auth-skeleton'
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 declare const require: (id: string) => any
@@ -63,9 +64,12 @@ interface AuthModalProps {
    *  default 'onelorn'). Used to catch `<scheme>://callback?…` returns in the
    *  WebView + from the system browser. Must match the natively-registered scheme. */
   callbackScheme?: string
+  /** #26 part B — social-pill count for the loading skeleton (from
+   *  `onelo.auth.oauthProviders`), so it matches what the hosted form renders. */
+  socialCount?: number
 }
 
-export function AuthModal({ visible, hostedUrl, onResult, apiUrl, backgroundColor, callbackScheme }: AuthModalProps) {
+export function AuthModal({ visible, hostedUrl, onResult, apiUrl, backgroundColor, callbackScheme, socialCount = 0 }: AuthModalProps) {
   // Config-driven deep-link scheme (default 'onelorn'). Register it natively so a
   // system-browser return (OAuth) can reopen the app; in-WebView returns are caught
   // by handleShouldStartLoad regardless.
@@ -73,9 +77,8 @@ export function AuthModal({ visible, hostedUrl, onResult, apiUrl, backgroundColo
   // React Native imports — peer dependencies, loaded lazily at runtime
   const RN = require('react-native')
   const { WebView } = require('react-native-webview')
-  const { Modal, View, StyleSheet, ActivityIndicator, TouchableOpacity, Text, Linking } = RN
+  const { Modal, View, StyleSheet, TouchableOpacity, Text, Linking, Platform, StatusBar } = RN
 
-  const [loading, setLoading] = useState(true)
   const [error, setError] = useState(false)
   // Bumped on retry so the WebView key changes → guaranteed fresh remount+reload.
   const [retryKey, setRetryKey] = useState(0)
@@ -85,11 +88,27 @@ export function AuthModal({ visible, hostedUrl, onResult, apiUrl, backgroundColo
   // Guard against a code/error being delivered twice (nav interception +
   // onNavigationStateChange + the Linking listener can all observe the callback).
   const resolvedRef = useRef(false)
+  // #27 — WebView handle for goBack() + whether the hosted flow has navigated
+  // DEEPER than the entry page (e.g. sign-up → the "Choose your plan" store). The
+  // close ✕ only appears then, and returns the user to the previous page (the
+  // sign-in form) instead of trapping them or cancelling the whole flow.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const webViewRef = useRef<any>(null)
+  const [canGoBack, setCanGoBack] = useState(false)
+  // Whether the hosted flow is currently on the STORE ("Choose your plan") — the
+  // surface where the user was trapped. The ✕ shows ONLY here (never on the entry
+  // sign-in form). Detected by URL so it works both when the store is reached via
+  // Sign-Up (has back history → ✕ returns to the form) AND when it IS the entry
+  // page (signed-in-but-unentitled → no history → ✕ cancels out).
+  const isStoreUrl = (u: string) => u.toLowerCase().includes('/store/')
+  const [onStore, setOnStore] = useState(isStoreUrl(hostedUrl))
 
   // Reset per-open state whenever a new hosted flow is presented.
   useEffect(() => {
     setCurrentUrl(hostedUrl)
     resolvedRef.current = false
+    setCanGoBack(false)
+    setOnStore(isStoreUrl(hostedUrl))
   }, [hostedUrl, visible])
 
   const resolveOnce = useCallback(
@@ -121,10 +140,19 @@ export function AuthModal({ visible, hostedUrl, onResult, apiUrl, backgroundColo
         resolveOnce({ type: 'code', code })
       } else if (preauth) {
         // Paid-product store flow: OAuth succeeded + account provisioned, but the
-        // buyer still owes payment. Reload the hosted store page with
-        // ?oauth_preauth=… (StoreClient drives Stripe from there). Does NOT
-        // resolve the modal — the flow continues.
-        setCurrentUrl((prev) => withOAuthPreauth(prev || hostedUrl, preauth))
+        // buyer still owes payment. Reload the hosted page with ?oauth_preauth=…
+        // (StoreClient drives Stripe from there). Does NOT resolve the modal — the
+        // flow continues.
+        //
+        // #28 — navigate the WebView IN PLACE (location.replace on the current
+        // page) rather than changing the React `source`: since the source is now
+        // the skeleton-HTML, a source change would re-flash the skeleton mid-
+        // checkout. In-place keeps the current page visible until the new one
+        // paints, and (replace, not push) keeps `goBack` history clean (#27).
+        const preauthUrl = withOAuthPreauth(hostedUrl, preauth)
+        webViewRef.current?.injectJavaScript(
+          `window.location.replace(${JSON.stringify(preauthUrl)}); true;`,
+        )
       } else if (errParam) {
         resolveOnce({ type: 'error', message: errParam })
       } else {
@@ -207,6 +235,10 @@ export function AuthModal({ visible, hostedUrl, onResult, apiUrl, backgroundColo
     (navState: any) => {
       const url: string = navState.url ?? ''
       if (url.toLowerCase().startsWith(`${scheme}://`)) handleCallbackUrl(url)
+      // #27 — track back-history + whether we're on the store, so the ✕ shows on
+      // the store (and returns to the sign-in form when there's history).
+      setCanGoBack(!!navState.canGoBack)
+      setOnStore(isStoreUrl(url))
     },
     [handleCallbackUrl, scheme],
   )
@@ -228,13 +260,11 @@ export function AuthModal({ visible, hostedUrl, onResult, apiUrl, backgroundColo
   }, [visible, Linking, handleCallbackUrl])
 
   const handleError = useCallback(() => {
-    setLoading(false)
     setError(true)
   }, [])
 
   const handleRetry = useCallback(() => {
     setError(false)
-    setLoading(true)
     setCurrentUrl(hostedUrl)
     setRetryKey((k) => k + 1)
   }, [hostedUrl])
@@ -242,6 +272,20 @@ export function AuthModal({ visible, hostedUrl, onResult, apiUrl, backgroundColo
   const handleCancel = useCallback(() => {
     resolveOnce({ type: 'cancelled' })
   }, [resolveOnce])
+
+  // #27 — the ✕ (on the store) and Android hardware back: return to the previous
+  // hosted page (store → sign-in form) when there's back history; otherwise (the
+  // store IS the entry page, or the entry sign-in form on Android) cancel the
+  // flow. Never leaves the user trapped, and prefers "back" over "cancel-to-retry".
+  const handleBackOrCancel = useCallback(() => {
+    // Only step back when we ENTERED on the sign-in form (so there's a form to
+    // return to). If the modal opened directly on the store (store-as-entry,
+    // signed-in-but-unentitled), always cancel/exit — never goBack, even if the
+    // store page later pushes its own in-WebView history (which would otherwise
+    // re-trap the user on iOS). `hostedUrl` is the entry URL for this open.
+    if (!isStoreUrl(hostedUrl) && canGoBack) webViewRef.current?.goBack()
+    else handleCancel()
+  }, [hostedUrl, canGoBack, handleCancel])
 
   // Branding page background — matches what the hosted auth page paints behind its
   // card (--onelo-page-bg), so the native WebView/overlay never flashes white in the
@@ -251,15 +295,40 @@ export function AuthModal({ visible, hostedUrl, onResult, apiUrl, backgroundColo
   const styles = StyleSheet.create({
     container: { flex: 1, backgroundColor: bg },
     webview: { flex: 1, backgroundColor: bg },
-    overlay: { position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: bg, justifyContent: 'center', alignItems: 'center' },
     errorContainer: { flex: 1, justifyContent: 'center', alignItems: 'center', gap: 16 },
     retryButton: { backgroundColor: '#ffffff', paddingHorizontal: 32, paddingVertical: 14, borderRadius: 8 },
     retryText: { color: '#000000', fontSize: 16, fontWeight: '600' },
     cancelButton: { paddingHorizontal: 32, paddingVertical: 14 },
     cancelText: { color: '#ffffff', fontSize: 16 },
+    // #27 — persistent close affordance in the NORMAL flow (the hosted page,
+    // e.g. the store, may not render its own cancel → user was trapped and had
+    // to kill the app). Top-trailing, cleared past the notch/status bar.
+    closeButton: {
+      position: 'absolute',
+      top: Platform.OS === 'ios' ? 52 : (StatusBar.currentHeight ?? 24) + 8,
+      right: 16,
+      width: 36,
+      height: 36,
+      borderRadius: 18,
+      backgroundColor: 'rgba(0,0,0,0.4)',
+      justifyContent: 'center',
+      alignItems: 'center',
+      zIndex: 10,
+    },
+    closeText: { color: '#ffffff', fontSize: 19, fontWeight: '600', lineHeight: 21 },
   })
 
-  return React.createElement(Modal, { visible, animationType: 'slide', presentationStyle: 'fullScreen' },
+  return React.createElement(Modal, {
+      visible,
+      // #28 — 'none' (not 'slide'): the modal's loading skeleton is PIXEL-IDENTICAL
+      // to the gate's skeleton it appears over (same HTML, bg, socialCount), so a
+      // slide-in reads as a jarring "second load / jump". Swapping in place makes
+      // the gate→modal skeleton hand-off seamless (one continuous surface).
+      animationType: 'none',
+      presentationStyle: 'fullScreen',
+      // #27 — Android hardware back: step back in the hosted flow, else cancel.
+      onRequestClose: handleBackOrCancel,
+    },
     React.createElement(View, { style: styles.container },
       !error && React.createElement(WebView, {
         // Route the custom callback scheme THROUGH onShouldStartLoadWithRequest
@@ -275,9 +344,13 @@ export function AuthModal({ visible, hostedUrl, onResult, apiUrl, backgroundColo
         // flow leaves stale state the page reloads into ("session expired" on a
         // supposedly-fresh start, requiring a manual data clear).
         incognito: true,
+        ref: webViewRef,
         key: retryKey,
-        source: { uri: currentUrl },
-        onLoadEnd: () => setLoading(false),
+        // #28 single-WebView: load the skeleton HTML, which `location.replace()`s
+        // to the hosted URL after it paints. ONE WebView shows the skeleton then
+        // the page — no separate overlay instance, no slide, no jump. The skeleton
+        // stays visible during the network load until the hosted page paints.
+        source: { html: authSkeletonHtml(socialCount, bg, currentUrl) },
         onError: handleError,
         onMessage: handleMessage,
         injectedJavaScript: OAUTH_RELAY_SCRIPT,
@@ -289,8 +362,19 @@ export function AuthModal({ visible, hostedUrl, onResult, apiUrl, backgroundColo
         // the flash on both iOS and Android.
         backgroundColor: bg,
       }),
-      loading && !error && React.createElement(View, { style: styles.overlay },
-        React.createElement(ActivityIndicator, { size: 'large', color: '#ffffff' })
+      // #27 — ✕ shown ONLY on the store ("Choose your plan"), never on the entry
+      // sign-in form. Reached via "Sign Up" → it steps BACK to the sign-in form
+      // (has history); reached as the entry page (signed-in-but-unentitled) → it
+      // cancels out (no history). Either way the user is never trapped. Rendered
+      // LAST so it sits on top of the WebView + skeleton overlay (pointerEvents:none).
+      !error && onStore && React.createElement(TouchableOpacity, {
+        style: styles.closeButton,
+        onPress: handleBackOrCancel,
+        accessibilityRole: 'button',
+        accessibilityLabel: canGoBack ? 'Back' : 'Close',
+        hitSlop: { top: 8, bottom: 8, left: 8, right: 8 },
+      },
+        React.createElement(Text, { style: styles.closeText }, '✕')
       ),
       error && React.createElement(View, { style: styles.errorContainer },
         React.createElement(TouchableOpacity, { style: styles.retryButton, onPress: handleRetry },

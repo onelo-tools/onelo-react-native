@@ -556,8 +556,17 @@ export class OneloFeatures {
       if (this.currentUserIdHash) body['userIdHash'] = this.currentUserIdHash
       if (this.featureEnvironment) body['environment'] = this.featureEnvironment
       const { sdkHeaders } = await import('../sdk-headers')
-      const { status, json } = await httpPost(`${this.apiUrl}/api/sdk/features/resolve`, body, await sdkHeaders(this.bundleId))
-      if (status !== 200) return
+      // FAZA 3 — verify-only assertion. httpPost serializes via JSON.stringify(body)
+      // (@onelo/core http.ts), so JSON.stringify(body) is the exact wire preimage.
+      const headers = await sdkHeaders(this.bundleId, undefined, {
+        method: 'POST', path: '/api/sdk/features/resolve', body: JSON.stringify(body),
+      })
+      const { status, json } = await httpPost(`${this.apiUrl}/api/sdk/features/resolve`, body, headers)
+      if (status !== 200) {
+        const { maybeSelfHealFromError } = await import('../attest')
+        maybeSelfHealFromError(json)
+        return
+      }
       const j = json as Record<string, unknown>
       const features = j['features'] as Record<string, FeatureWire> | undefined
       if (features) {

@@ -161,7 +161,11 @@ export const OAUTH_RELAY_SCRIPT = `
         d.type === 'onelo:native_oauth' ||
         d.type === 'onelo:native_oauth_url' ||
         d.type === 'onelo:code' ||
-        d.type === 'onelo:cancelled'
+        d.type === 'onelo:cancelled' ||
+        // #40 Phase 2 — the hosted page signals it has mounted so the host can hide
+        // its native fail-safe ✕ (used by the customer-portal modal; auth/store
+        // ignore it). The canonical ✕ is then owned by the hosted page.
+        d.type === 'onelo:ready'
       )) {
         window.ReactNativeWebView.postMessage(JSON.stringify(d));
       }

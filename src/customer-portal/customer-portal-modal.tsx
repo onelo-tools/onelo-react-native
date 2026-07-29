@@ -137,6 +137,13 @@ export function CustomerPortalModalView({ visible, hostedUrl, callbackScheme, ap
   // Whether the WebView can navigate back within the portal (deeper page open,
   // e.g. cancel confirmation / a receipt). Drives the leading "‹ Back" control.
   const [canGoBack, setCanGoBack] = useState(false)
+  // #40 Phase 2 — true once the hosted portal posts `onelo:ready`. While false the
+  // native ✕ acts as a FAIL-SAFE (pre-load / error window); once true the hosted
+  // page's canonical ✕ owns the affordance and the native one hides.
+  const [hostedReady, setHostedReady] = useState(false)
+  // #44 — arm the fail-safe ✕ only after a ~3.5s grace. A normal fast load posts
+  // `onelo:ready` first, so it flips `hostedReady` before this and the ✕ never flashes.
+  const [failSafeArmed, setFailSafeArmed] = useState(false)
   // Guard against a done/cancel being delivered twice (nav interception +
   // onNavigationStateChange + the Linking listener can all observe the callback).
   const resolvedRef = useRef(false)
@@ -148,6 +155,16 @@ export function CustomerPortalModalView({ visible, hostedUrl, callbackScheme, ap
     resolvedRef.current = false
     setCanGoBack(false)
   }, [hostedUrl, visible])
+
+  // #44 — reset ready/fail-safe state on each open (and retry) and arm the grace
+  // timer. A fast load posts `onelo:ready` well before this fires → no ✕ flash.
+  useEffect(() => {
+    if (!visible) return
+    setHostedReady(false)
+    setFailSafeArmed(false)
+    const t = setTimeout(() => setFailSafeArmed(true), 3500)
+    return () => clearTimeout(t)
+  }, [visible, hostedUrl, retryKey])
 
   const resolveOnce = useCallback(
     (result: PortalResult) => {
@@ -212,6 +229,14 @@ export function CustomerPortalModalView({ visible, hostedUrl, callbackScheme, ap
   const handleMessage = useCallback(
     (event: any) => {
       const data: string = event.nativeEvent.data
+      // #40 Phase 2 — hosted page mounted → hide the native fail-safe ✕.
+      try {
+        const m = JSON.parse(data) as Record<string, unknown>
+        if (m && m['type'] === 'onelo:ready') {
+          setHostedReady(true)
+          return
+        }
+      } catch { /* non-JSON page message — fall through to OAuth parse */ }
       const oauth = parseOAuthMessage(data)
       if (oauth) openOAuth(oauth)
     },
@@ -315,6 +340,13 @@ export function CustomerPortalModalView({ visible, hostedUrl, callbackScheme, ap
   const topInset = Platform.OS === 'android' ? (StatusBar.currentHeight ?? 0) : 8
   const headerHeight = 48 + topInset
 
+  // #40 Phase 2 / #44 — the native fail-safe ✕ shows ONLY while the hosted page
+  // hasn't confirmed it's ready AND either the grace elapsed or the load errored
+  // (the error screen has no hosted ✕, so the native one must stay to allow exit).
+  // Once the hosted page is ready, its canonical ✕ owns the affordance. The header
+  // (and "‹ Back") is unchanged — only the ✕'s visibility changes.
+  const showNativeClose = !hostedReady && (failSafeArmed || error)
+
   const styles = StyleSheet.create({
     container: { flex: 1, backgroundColor: bg },
     // Always-present navigation chrome — a fullScreen Modal has NO swipe-to-dismiss
@@ -368,13 +400,17 @@ export function CustomerPortalModalView({ visible, hostedUrl, callbackScheme, ap
             }, React.createElement(Text, { style: styles.backText, allowFontScaling: false }, '‹ Back'))
           // Empty leading spacer keeps "Done" pinned right when Back is hidden.
           : React.createElement(View, { style: styles.headerBtn }),
-        React.createElement(TouchableOpacity, {
-          onPress: handleCancel,
-          style: styles.headerBtn,
-          accessibilityRole: 'button',
-          accessibilityLabel: 'Close customer portal',
-          hitSlop: { top: 8, bottom: 8, left: 8, right: 8 },
-        }, React.createElement(Text, { style: styles.doneText, allowFontScaling: false }, '✕'))
+        // #40 Phase 2 — native ✕ is a fail-safe: shown only pre-ready (grace/error),
+        // hidden once the hosted page's canonical ✕ takes over. Spacer holds its slot.
+        showNativeClose
+          ? React.createElement(TouchableOpacity, {
+              onPress: handleCancel,
+              style: styles.headerBtn,
+              accessibilityRole: 'button',
+              accessibilityLabel: 'Close customer portal',
+              hitSlop: { top: 8, bottom: 8, left: 8, right: 8 },
+            }, React.createElement(Text, { style: styles.doneText, allowFontScaling: false }, '✕'))
+          : React.createElement(View, { style: styles.headerBtn })
       ),
       !error && React.createElement(WebView, {
         ref: webviewRef,

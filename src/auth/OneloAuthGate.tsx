@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef, useCallback } from 'react'
 import { OneloError } from '@onelo/core'
 import type { Onelo } from '../onelo'
 import { AuthModal } from './auth-modal'
+import { AuthSkeleton } from './auth-skeleton'
 import { useModalState } from './hooks'
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -64,9 +65,17 @@ function errorMessage(e: unknown): string | undefined {
 export function OneloAuthGate({ onelo, children, fallback }: OneloAuthGateProps) {
   // React Native peer deps — loaded lazily at runtime (mirrors the other components).
   const RN = require('react-native')
-  const { View, StyleSheet, ActivityIndicator, TouchableOpacity, Text, AppState } = RN
+  const { View, StyleSheet, TouchableOpacity, Text, AppState } = RN
 
   const [state, setState] = useState<GateState>({ resolved: false, allowedIn: false })
+  // #36 — true while a stored session MIGHT still be restoring on cold start.
+  // Seeded true so the VERY FIRST paint is a neutral branded background, never
+  // the sign-in skeleton. A fast `hasStoredSession()` probe flips it false the
+  // instant we know there is NO stored session (→ genuine cold start shows the
+  // skeleton immediately, parity with Swift's synchronous `hasStoredSessionSync`
+  // 3-state gate); otherwise `recompute()` clears it when the gate resolves. The
+  // net effect: an auto-login shows branded-bg → content with NO skeleton flash.
+  const [restoring, setRestoring] = useState(true)
   // Non-null while the last hosted flow ended without a session (cancel/error):
   // surfaces a retry affordance instead of immediately re-opening the WebView
   // (parity with the Swift retry state). Cleared by the user tapping "Sign In".
@@ -92,6 +101,10 @@ export function OneloAuthGate({ onelo, children, fallback }: OneloAuthGateProps)
     const allowedIn = signedIn && (!paywallEnabled || entitled)
     if (!mountedRef.current) return
     setState({ resolved: true, allowedIn })
+    // #36 — the gate has resolved; the branded restore splash is done in every
+    // case (allowed-in → content; not allowed → the driveFlow effect below opens
+    // the hosted flow behind the skeleton/retry surface).
+    setRestoring(false)
   }, [onelo])
 
   /** Open the centralised hosted flow (sign-in or store). loadAuthView resolves
@@ -118,6 +131,17 @@ export function OneloAuthGate({ onelo, children, fallback }: OneloAuthGateProps)
   // the app — an external-browser upgrade, a web checkout — flips the gate.
   useEffect(() => {
     mountedRef.current = true
+
+    // #36 — probe for a stored session WITHOUT the full recompute cost (config
+    // wait + possible token refresh). A definite "no stored session" flips the
+    // branded restore splash off immediately so a genuine cold start shows the
+    // sign-in skeleton right away; a present (or slow) session stays on the
+    // branded background until recompute resolves → no sign-in skeleton flash on
+    // auto-login. recompute() clears `restoring` on every other path.
+    onelo.auth
+      .hasStoredSession()
+      .then((has) => { if (mountedRef.current && !has) setRestoring(false) })
+      .catch(() => { if (mountedRef.current) setRestoring(false) })
 
     void recompute()
     // A just-completed external purchase may have landed while the app was
@@ -164,9 +188,17 @@ export function OneloAuthGate({ onelo, children, fallback }: OneloAuthGateProps)
     void driveFlow()
   }, [state.resolved, state.allowedIn, retry, driveFlow])
 
+  // #26 — paint the branding page background (checkout_bg_color, default
+  // #111111) so the pre-auth loading/retry surface matches the hosted page + the
+  // AuthModal overlay (which already uses pageBackgroundColor). Was hardcoded
+  // #000000, which flashed a different colour before the branded page.
+  const bg = onelo.auth.pageBackgroundColor()
   const styles = StyleSheet.create({
-    fill: { flex: 1, backgroundColor: '#000000', justifyContent: 'center', alignItems: 'center' },
-    retryContainer: { flex: 1, backgroundColor: '#000000', justifyContent: 'center', alignItems: 'center', gap: 16, padding: 32 },
+    // #36 — the cold-start restore splash: the branding page background ONLY, no
+    // form, no skeleton, no spinner. Reads as "opening…" for an auto-login rather
+    // than flashing the sign-in form. Mirrors Swift's neutral branded background.
+    restoringContainer: { flex: 1, backgroundColor: bg },
+    retryContainer: { flex: 1, backgroundColor: bg, justifyContent: 'center', alignItems: 'center', gap: 16, padding: 32 },
     errorText: { color: '#ff6b6b', fontSize: 13, textAlign: 'center' },
     retryButton: { backgroundColor: '#ffffff', paddingHorizontal: 32, paddingVertical: 14, borderRadius: 8 },
     retryText: { color: '#000000', fontSize: 16, fontWeight: '600' },
@@ -174,9 +206,16 @@ export function OneloAuthGate({ onelo, children, fallback }: OneloAuthGateProps)
 
   const handleRetry = useCallback(() => setRetry(null), [])
 
-  // Pre-auth surface: retry prompt after a cancel/error, otherwise the neutral
-  // loading background (custom `fallback` or a plain spinner). Never `children`.
-  const preAuth = retry
+  // Pre-auth surface. #36 — while a stored session may still be restoring on cold
+  // start (before the gate resolves and before a definite no-session is known),
+  // show ONLY the neutral branded background: no sign-in skeleton, no form, no
+  // spinner. This is what stops the auto-login skeleton flash. Once restore
+  // settles (`recompute` resolves) or a definite no-session is probed, we fall
+  // through to the retry prompt / loading skeleton (custom `fallback` or the
+  // auth-shaped skeleton). Never `children`.
+  const preAuth = (restoring && !state.resolved)
+    ? React.createElement(View, { style: styles.restoringContainer })
+    : retry
     ? React.createElement(View, { style: styles.retryContainer },
         retry.message
           ? React.createElement(Text, { style: styles.errorText }, retry.message)
@@ -186,9 +225,12 @@ export function OneloAuthGate({ onelo, children, fallback }: OneloAuthGateProps)
         )
       )
     : (fallback ??
-        React.createElement(View, { style: styles.fill },
-          React.createElement(ActivityIndicator, { size: 'large', color: '#ffffff' })
-        ))
+        // #26 part B — auth-shaped loading skeleton (was a bare spinner), matching
+        // the hosted page's own skeleton so the transition has no jump. social-aware.
+        React.createElement(AuthSkeleton, {
+          socialCount: onelo.auth.oauthProviders.length,
+          backgroundColor: bg,
+        }))
 
   // AuthModal is always mounted so the hosted WebView can appear the instant
   // loadAuthView() opens it; it renders nothing while `modal.visible` is false.
@@ -206,6 +248,9 @@ export function OneloAuthGate({ onelo, children, fallback }: OneloAuthGateProps)
       // so the WebView shows it (not white) while loading. Resolved from config,
       // which is ready before loadAuthView() opens the modal.
       backgroundColor: onelo.auth.pageBackgroundColor(),
+      // #26 part B — social-pill count for the loading skeleton so it matches
+      // what the hosted form will render.
+      socialCount: onelo.auth.oauthProviders.length,
       // Deep-link scheme (config.callbackScheme, default 'onelorn') so OAuth returns
       // from the system browser reopen the app and complete sign-in.
       callbackScheme: onelo.auth.callbackScheme,

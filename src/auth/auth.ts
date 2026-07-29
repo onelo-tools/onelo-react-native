@@ -16,7 +16,7 @@ export type FlowDecision =
   | { action: 'present'; surface: string; url: string; appName?: string; appLogo?: string }
 import { generateCodeVerifier, generateCodeChallenge } from '../core/pkce'
 import { KeychainStorage } from '../core/storage'
-import { sdkHeaders } from '../sdk-headers'
+import { sdkHeaders, getNativeBundleId } from '../sdk-headers'
 import type { OneloEventStream } from '../core/event-stream'
 import type { ModalResult } from './auth-modal'
 
@@ -32,6 +32,11 @@ const SDK_VERSION: string = require('../../package.json').version
  * `store.ts`, `customer-portal.ts`, and `auth-modal.tsx`.
  */
 export const CALLBACK_SCHEME = 'onelorn'
+
+/** Max time a gated entry point waits for background App Attest before proceeding
+ *  tokenless (#25). Covers a slow-but-working handshake (~3-4 round trips) while
+ *  capping a stalled network so the auth UI never hangs. */
+const ATTEST_WAIT_CAP_MS = 5000
 
 export class OneloAuth {
   private storage: KeychainStorage
@@ -68,6 +73,11 @@ export class OneloAuth {
 
   isReady = false
   isRevoked = false
+  /** #29 — non-null when `initialize()` threw (e.g. the `react-native-get-random-values`
+   *  polyfill is missing, so `generateCodeVerifier()` throws). Previously that error
+   *  was swallowed silently, leaving `isReady=false` forever with NO trace. Surfaced
+   *  here (and logged) so the failure is diagnosable instead of a mystery. */
+  initError: string | null = null
   /** True once the CURRENT user's session was revoked server-side (a
    *  `session.revoked` SSE push, or — future — a heartbeat 401 / refresh
    *  user_revoked). Distinct from `isRevoked` (the whole app key was revoked).
@@ -76,15 +86,45 @@ export class OneloAuth {
   allowCustomBranding = false
   appName = 'App'
   appLogoUrl: string | null = null
+  /** True when the backend requires iOS App Attest for this app (at least one
+   *  registered bundle id has `attest_enabled=true`). Read from `/api/sdk/config`
+   *  (`attest_required`); the composition root (`Onelo`) uses it to decide whether
+   *  to kick off attestation. Parity with Swift `OneloAuth.attestRequired`. */
+  attestRequired = false
 
-  constructor(config: OneloConfig) {
+  /** Injected by the composition root (`Onelo`): resolves when background App
+   *  Attest has produced its token (or settled). Gated entry points await it so
+   *  a cold-start request doesn't race ahead of the token → spurious 403 (#25).
+   *  Undefined when the SDK is used without the root (e.g. auth-only tests). */
+  private readonly _attestReady?: () => Promise<void>
+
+  constructor(config: OneloConfig, attestReady?: () => Promise<void>) {
     if (!config.apiUrl) throw new Error('[Onelo] apiUrl is required')
     if (!config.publishableKey) throw new Error('[Onelo] publishableKey is required')
+    this._attestReady = attestReady
     this.apiUrl = config.apiUrl
     this.publishableKey = config.publishableKey
     this.bundleId = config.bundleId
     this._callbackScheme = config.callbackScheme || CALLBACK_SCHEME
     this.storage = new KeychainStorage()
+    // #18 DX: X-Bundle-Id auto-derives from the native module on iOS, but Android
+    // has no native bundle-id source (and iOS needs the module linked). If NEITHER
+    // config nor native can provide it, requests are rejected (bundle_id_mismatch
+    // 403) once enforcement is active — warn LOUDLY at init instead of a silent
+    // 403 much later. Fire-and-forget so it never blocks construction.
+    if (!config.bundleId) {
+      void getNativeBundleId().then((nb) => {
+        if (!nb) {
+          console.warn(
+            '[Onelo] No `bundleId` in config and none could be derived natively ' +
+            '(Android has no native source; on iOS the native module must be linked). ' +
+            'Set `bundleId` to your app id (e.g. "com.company.app") — it is REQUIRED for ' +
+            'bundle attestation. Without it, requests are rejected with bundle_id_mismatch (403) ' +
+            'once enforcement is active.',
+          )
+        }
+      })
+    }
     this.initPromise = this.initialize()
   }
 
@@ -106,6 +146,43 @@ export class OneloAuth {
    */
   private async _secHeaders(extra: Record<string, string> = {}): Promise<Record<string, string>> {
     return { ...(await sdkHeaders(this.bundleId)), ...extra }
+  }
+
+  /**
+   * Block until iOS App Attest has produced its token (or settled as
+   * not-required / failed) BEFORE the first gated request. The composition root
+   * kicks attestation off in the background (fire-and-forget) so it never blocks
+   * construction; without this gate a cold-start `loadAuthView` / `signIn` races
+   * AHEAD of the ~3-4-round-trip attestation and the backend rejects the
+   * tokenless request with 403 — which then "works" a couple seconds later once
+   * the cached token exists (#25). Attestation is best-effort, so the wait only
+   * costs the sub-second–2s it takes and never throws. No-op (resolves after
+   * config) when attestation isn't required, or when used without the root.
+   *
+   * MUST NOT be called from `_secHeaders` / `initialize`: attestation awaits
+   * `whenReady()` (initPromise), so gating header-building on it would deadlock.
+   * Only call it at gated ENTRY points, after config is available.
+   *
+   * The wait is BOUNDED (`ATTEST_WAIT_CAP_MS`): attestation is best-effort and
+   * its `fetch` calls have no timeout, so a stalled network handshake (captive
+   * portal, dead socket) must never hang the auth UI. On the cap we proceed
+   * tokenless — the same outcome as before this gate existed (a possible 403 the
+   * app already handles) — while the background attestation keeps running so its
+   * token rides later requests. `catch` alone is NOT enough: the risk is
+   * non-settlement, not rejection.
+   */
+  private async _awaitAttestReady(): Promise<void> {
+    await this.initPromise            // ensure `attestRequired` is resolved
+    if (!this.attestRequired || !this._attestReady) return
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const cap = new Promise<void>((resolve) => { timer = setTimeout(resolve, ATTEST_WAIT_CAP_MS) })
+    try {
+      await Promise.race([this._attestReady(), cap])
+    } catch {
+      /* best-effort — proceed tokenless */
+    } finally {
+      if (timer) clearTimeout(timer)
+    }
   }
 
   private async initialize(): Promise<void> {
@@ -138,12 +215,27 @@ export class OneloAuth {
         // consumed by the Round 2 OAuth entry point.
         oauthProviders: Array.isArray(j['oauth_providers']) ? (j['oauth_providers'] as string[]) : undefined,
       }
+      // App Attest requirement is not part of the typed ResolvedSDKConfig
+      // (`@onelo/core`), so read it straight off the raw config JSON.
+      this.attestRequired = (j['attest_required'] as boolean) ?? false
       const resolved = this.resolvedConfig
       this.allowCustomBranding = resolved.allowCustomBranding
       if (resolved.appName) this.appName = resolved.appName
       this.appLogoUrl = resolved.appLogoUrl
       this.isReady = true
     } catch (e) {
+      // #29 — NEVER swallow silently (CLAUDE.md "No silent swallows"). A failed
+      // init used to vanish here, so a missing `react-native-get-random-values`
+      // polyfill (generateCodeVerifier throws with a fix-it message) killed
+      // attestation + everything /config-gated (branding, paywall, waitlist,
+      // attestRequired…) with ZERO trace, leaving isReady=false forever. Always
+      // surface it — this is what makes the pkce.ts fix-it message reach the dev.
+      const msg = e instanceof Error ? e.message : String(e)
+      this.initError = msg
+      console.warn(
+        '[Onelo] SDK initialization failed — auth, attestation and config-gated ' +
+        'features are disabled until this is fixed: ' + msg,
+      )
       if (e instanceof OneloError && e.code === 'invalid_publishable_key') {
         this.isRevoked = true
       }
@@ -283,6 +375,10 @@ export class OneloAuth {
    *  "endpoint unavailable" (404/405 → legacy fallback) apart from a real error
    *  (surfaced by `_decisionFromFlow`). */
   private async _flowInit(lang?: string): Promise<{ status: number; json: Record<string, unknown> }> {
+    // #25: don't fire the gated flow request until App Attest has produced its
+    // token — otherwise the tokenless cold-start request 403s (loadAuthView +
+    // resolveFlow both route through here).
+    await this._awaitAttestReady()
     const existing = await this.getSession()
     const headers: Record<string, string> = await this._secHeaders()
     // Same Bearer pattern as GET /api/sdk/auth/user (revalidateEntitlement).
@@ -321,6 +417,7 @@ export class OneloAuth {
 
   async signIn(email: string, password: string): Promise<OneloSession> {
     await this.initPromise
+    await this._awaitAttestReady()  // #25: gated POST — wait for the attest token
     if (!this.allowCustomBranding) throw OneloError.planRequired()
     if (!this.pkceVerifier) this.pkceVerifier = generateCodeVerifier()
     const { status, json } = await httpPost(
@@ -344,6 +441,7 @@ export class OneloAuth {
 
   async signUp(email: string, password: string): Promise<OneloSession> {
     await this.initPromise
+    await this._awaitAttestReady()  // #25: gated POST — wait for the attest token
     if (!this.allowCustomBranding) throw OneloError.planRequired()
     if (!this.pkceVerifier) this.pkceVerifier = generateCodeVerifier()
     const { status, json } = await httpPost(
@@ -430,6 +528,33 @@ export class OneloAuth {
     await this.storage.clear()
     this.isUserRevoked = true
     this.notifyListeners(null)
+  }
+
+  /**
+   * Fast presence probe for a stored session — reads the token keys ONLY, with
+   * NO refresh and NO network. The React Native analogue of Swift's SYNCHRONOUS
+   * `hasStoredSessionSync()` (#36): RN's Keychain storage is async-only, so this
+   * is a Promise, but it is far cheaper than `getSession()` (no near-expiry
+   * refresh) / `whenReady()` (no config wait). `OneloAuthGate` uses it to tell
+   * "restoring an existing session on cold start" (→ show a neutral branded
+   * background, never the sign-in skeleton) apart from a "genuine no-session cold
+   * start" (→ show the sign-in skeleton immediately) — so an auto-login never
+   * flashes the sign-in form before content. Returns true only when access +
+   * refresh tokens AND a decodable user (with an id) are all present; never throws.
+   */
+  async hasStoredSession(): Promise<boolean> {
+    try {
+      const [accessToken, refreshToken, userJson] = await Promise.all([
+        this.storage.get(TOKEN_KEYS.ACCESS_TOKEN),
+        this.storage.get(TOKEN_KEYS.REFRESH_TOKEN),
+        this.storage.get(TOKEN_KEYS.USER_JSON),
+      ])
+      if (!accessToken || !refreshToken || !userJson) return false
+      const user = JSON.parse(userJson) as OneloUser
+      return typeof user?.id === 'string' && user.id.length > 0
+    } catch {
+      return false
+    }
   }
 
   async getSession(): Promise<OneloSession | null> {

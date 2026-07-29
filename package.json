@@ -1,11 +1,13 @@
 {
   "name": "@onelo/react-native",
-  "version": "0.26.0",
+  "version": "0.30.1",
   "description": "Onelo React Native SDK",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "files": [
-    "dist"
+    "dist",
+    "ios",
+    "onelo-react-native.podspec"
   ],
   "scripts": {
     "build": "tsup src/index.ts --format cjs --dts --clean --no-splitting --external react --external react-native --external react-native-keychain --external react-native-webview",

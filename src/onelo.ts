@@ -9,6 +9,7 @@ import { OneloCustomerPortal } from './customer-portal/customer-portal'
 import { OneloConsent } from './consent/consent'
 import { OneloStore } from './store/store'
 import { OneloEventStream } from './core/event-stream'
+import type { OneloAttest } from './attest'
 
 const SDK_VERSION: string = require('../package.json').version
 
@@ -43,9 +44,23 @@ export class Onelo {
   /** RN AppState 'change' subscription, removed in destroy() so a torn-down SDK
    *  can't leak a foreground callback that fires against dead state. */
   private appStateSubscription: AppStateSubscription | null = null
+  /** iOS App Attest lifecycle. Created lazily in `_initAttest` ONLY when the app
+   *  is iOS AND config reports `attest_required`; null otherwise (Android, or
+   *  attest not required). Its token rides every request via `sdkHeaders`. */
+  private attest: OneloAttest | null = null
+  /** Resolves when the background attestation kicked off in the constructor has
+   *  produced its token (or settled as not-required / failed). Gated auth entry
+   *  points await this so a cold-start request never races AHEAD of the token
+   *  and gets a spurious 403 (#25). Defaults to a resolved promise so it's
+   *  always awaitable even before `_initAttest` is assigned below. */
+  private _attestReady: Promise<void> = Promise.resolve()
 
   constructor(config: OneloConfig) {
-    this.auth = new OneloAuth(config)
+    // Pass a LAZY getter for the attest-ready promise: `_attestReady` is
+    // (re)assigned to the real `_initAttest` run later in this constructor, and
+    // auth only reads it at request time (well after construction), so the
+    // thunk always sees the live value.
+    this.auth = new OneloAuth(config, () => this._attestReady)
     this.monitor = new OneloMonitor(
       config.publishableKey, config.apiUrl, config.bundleId,
       config.appVersion, config.appBuild, config.environment,
@@ -129,7 +144,33 @@ export class Onelo {
     // until a token refresh eventually happens. Supersedes the anonymous baseline
     // set just above. Best-effort; never throws.
     void this.auth.restoreSession()
+    // iOS App Attest: gated on config.attest_required (read after auth resolves
+    // config) + Platform.OS === 'ios'. Best-effort, fully in the background — it
+    // must never block SDK construction. Once it completes the token is cached
+    // and rides every subsequent request via sdkHeaders. We KEEP the promise so
+    // gated auth entry points can await it (via the thunk passed to OneloAuth)
+    // and not fire the first request tokenless → spurious 403 (#25).
+    this._attestReady = this._initAttest(config)
     this._wireForeground()
+  }
+
+  /**
+   * Start iOS App Attest when the backend requires it. Awaits config resolution
+   * (`auth.whenReady`) to read `attest_required`, then hands off to the platform-
+   * guarded `OneloAttest` (no-op on Android / Simulator / unlinked native). Never
+   * throws — attestation is best-effort and independent of sign-in.
+   */
+  private async _initAttest(config: OneloConfig): Promise<void> {
+    try {
+      await this.auth.whenReady()
+      if (!this.auth.attestRequired) return
+      const { OneloAttest } = await import('./attest')
+      const attest = new OneloAttest(config.apiUrl, config.publishableKey, config.bundleId)
+      this.attest = attest
+      await attest.start()
+    } catch {
+      // Best-effort — a failed attest must not break SDK init.
+    }
   }
 
   /**
@@ -160,6 +201,10 @@ export class Onelo {
         // keeps the identity + bypasses the 1s debounce, matching Swift/Android/
         // Flutter's forced foreground resync. Gated on autoLifecycleRefresh.
         if (this.autoLifecycleRefresh) void this.features.refresh(true)
+        // Refresh the App Attest token if it's near expiry. Foreground is the
+        // reliable moment to rotate a ~30-day token without a long-lived timer a
+        // backgrounded/killed app would drop. No-op until _initAttest ran.
+        void this.attest?.refreshIfNeeded()
         const session = await this.auth.getSession()
         if (session != null && this.autoPresentConsent) {
           void this.consent.presentGateIfNeeded()
