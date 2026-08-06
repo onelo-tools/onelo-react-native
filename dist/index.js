@@ -321,7 +321,7 @@ var require_package = __commonJS({
   "package.json"(exports2, module2) {
     module2.exports = {
       name: "@onelo/react-native",
-      version: "0.30.1-staging",
+      version: "0.32.0",
       description: "Onelo React Native SDK",
       main: "./dist/index.js",
       types: "./dist/index.d.ts",
@@ -2332,6 +2332,19 @@ var MAX_FLAGS = 100;
 var MAX_BREADCRUMBS = 100;
 var MAX_META_BYTES = 16e3;
 var PLATFORM = "reactnative";
+var MAX_RETRY_AFTER_MS = 36e5;
+var _warn = (...args) => console.warn("[onelo.monitor]", ...args);
+function _parseRetryAfter(res) {
+  let raw = null;
+  try {
+    raw = res.headers?.get?.("Retry-After") ?? null;
+  } catch {
+  }
+  if (!raw) return 0;
+  const seconds = Number(raw.trim());
+  if (!Number.isFinite(seconds)) return 0;
+  return Math.max(0, Math.min(seconds * 1e3, MAX_RETRY_AFTER_MS));
+}
 var _globalHandlersRegistered = false;
 var _previousGlobalHandler;
 var _installedGlobalHandler;
@@ -2401,6 +2414,12 @@ var OneloMonitor = class {
     this.breadcrumbs = [];
     this.flushTimer = null;
     this.currentUserId = null;
+    /** Serialises all drains so a timer flush and an error flush can't overlap. */
+    this.flushChain = Promise.resolve();
+    /** Epoch ms until which we hold off sending (set from a 429 `Retry-After`). */
+    this.retryAfterUntil = 0;
+    /** Set by destroy(); stops any further sends after teardown. */
+    this._destroyed = false;
     // NEVER inline `crypto.getRandomValues` here unguarded — a field initializer
     // that throws takes down `new Onelo(config)` entirely. `_uuidv4` degrades to
     // `Math.random()` when the CSPRNG polyfill is absent.
@@ -2431,6 +2450,7 @@ var OneloMonitor = class {
       void this.flush();
     }, 15e3);
     this._registerGlobalHandlers();
+    this._push("session_opened", true, void 0, void 0, void 0, "event");
   }
   /** Sets the current user ID attached to all subsequent monitor events. Call after login/logout if not using Onelo Auth. */
   setUserId(userId) {
@@ -2482,11 +2502,26 @@ var OneloMonitor = class {
     const { message, stack, errorType } = _extractError(error);
     this._push(opts?.featureName ?? "captured", false, void 0, message, this._withError(opts?.meta, stack, errorType), "event");
   }
+  /**
+   * Drains are SERIALISED through one promise chain: the 15s timer, an error
+   * auto-flush and an explicit `flush()` must never drain concurrently, because
+   * two overlapping drains would interleave batches (and the second would see an
+   * empty buffer and report "sent").
+   */
   async flush() {
-    const events = this.buffer.splice(0);
+    this.flushChain = this.flushChain.then(() => this._drain()).catch(() => {
+    });
+    return this.flushChain;
+  }
+  async _drain() {
+    if (this._destroyed) return;
     for (const [featureName, count] of this.summaryBuffer) {
       if (count > 0) {
-        events.push({
+        this.buffer.push({
+          // Stamped as the summary event is materialised — the close of the
+          // aggregation window it describes. Same reason as _push: without it a
+          // batch delayed by an outage lands under the recovery's timestamp.
+          ts: (/* @__PURE__ */ new Date()).toISOString(),
           featureName,
           ok: true,
           source: "feature_call_summary",
@@ -2498,16 +2533,58 @@ var OneloMonitor = class {
       }
     }
     this.summaryBuffer.clear();
-    if (events.length === 0) return;
+    if (this.buffer.length === 0) return;
+    if (Date.now() < this.retryAfterUntil) return;
+    const events = this.buffer.splice(0);
+    const body = JSON.stringify({ publishableKey: this.publishableKey, events });
+    if (await this._sendOnce(body) === "requeue") this._requeue(events);
+  }
+  /** One POST. Never throws — classifies the result instead. */
+  async _sendOnce(body) {
+    let res;
     try {
       const { sdkHeaders: sdkHeaders2 } = await Promise.resolve().then(() => (init_sdk_headers(), sdk_headers_exports));
-      await fetch(`${this.apiUrl}/api/sdk/monitor/events/batch`, {
+      res = await fetch(`${this.apiUrl}/api/sdk/monitor/events/batch`, {
         method: "POST",
         headers: { ...await sdkHeaders2(this.bundleId), "Content-Type": "application/json" },
-        body: JSON.stringify({ publishableKey: this.publishableKey, events })
+        body
       });
     } catch {
+      return "requeue";
     }
+    const status = res?.status ?? 0;
+    if (status >= 200 && status < 300) return "done";
+    if (status === 429) {
+      const waitMs = _parseRetryAfter(res);
+      if (waitMs > 0) this.retryAfterUntil = Math.max(this.retryAfterUntil, Date.now() + waitMs);
+      return "requeue";
+    }
+    if (status >= 400 && status < 500) {
+      _warn(`batch rejected with HTTP ${status} \u2014 dropping it (retrying would fail identically)`);
+      return "drop";
+    }
+    return "requeue";
+  }
+  /**
+   * Put an undelivered batch back at the FRONT of the buffer so the next flush
+   * retries it, then re-apply the cap.
+   *
+   * Priority policy under a sustained outage: NEWEST EVENTS WIN. The buffer is
+   * trimmed from the front, so the oldest re-queued events go first. This matches
+   * `_push`'s newest-wins eviction, keeps memory bounded at MAX_BUFFER_SIZE no
+   * matter how long the device is offline, and stops a wedged batch from starving
+   * live telemetry. Drops are reported, never silent.
+   */
+  _requeue(events) {
+    this.buffer.unshift(...events);
+    let dropped = 0;
+    while (this.buffer.length > MAX_BUFFER_SIZE) {
+      this.buffer.shift();
+      dropped++;
+    }
+    _warn(
+      `delivery failed \u2014 ${events.length} event(s) re-queued` + (dropped > 0 ? `, ${dropped} oldest dropped (buffer cap ${MAX_BUFFER_SIZE})` : "")
+    );
   }
   destroy() {
     if (this.flushTimer) {
@@ -2515,7 +2592,9 @@ var OneloMonitor = class {
       this.flushTimer = null;
     }
     this._unregisterGlobalHandlers();
-    void this.flush();
+    void this.flush().finally(() => {
+      this._destroyed = true;
+    });
   }
   _addBreadcrumb(category, message, data) {
     this.breadcrumbs.push({
@@ -2586,6 +2665,7 @@ var OneloMonitor = class {
     }
     if (isError && scrubbed) scrubbed = this._capMeta(scrubbed);
     this.buffer.push({
+      ts: (/* @__PURE__ */ new Date()).toISOString(),
       featureName,
       ok,
       durationMs,

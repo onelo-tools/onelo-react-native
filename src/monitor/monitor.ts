@@ -15,6 +15,16 @@ const SDK_NAME = '@onelo/react-native'
 type EventSource = 'feature_call_summary' | 'track' | 'event' | 'global_error'
 
 interface BufferedEvent {
+  /**
+   * ISO-8601 UTC, stamped when the event HAPPENED — not when it is sent.
+   *
+   * The backend clamps this to a 1h staleness window and falls back to ingest
+   * time when it is absent (`_resolve_event_ts` in sdk_monitor.py), so without
+   * it a batch that waited out an outage is recorded as having happened the
+   * moment the outage ended. Parity with onelo-python / node / php, which have
+   * always sent it.
+   */
+  ts: string
   featureName: string
   ok: boolean
   durationMs?: number
@@ -35,6 +45,40 @@ const MAX_BREADCRUMBS = 100  // ring buffer (parity with Swift's MonitorBreadcru
 const MAX_META_BYTES = 16000 // ~16KB soft cap on error meta (parity with Swift's 16KB note)
 
 const PLATFORM = 'reactnative'
+// Delivery policy: ONE attempt per flush. A batch the server did not accept goes
+// back in the buffer and rides the next 15s tick — the timer IS the retry, so a
+// backend outage never multiplies inbound request volume (an in-flight retry
+// loop would have tripled it at the worst possible moment) and a drain always
+// stays milliseconds long. On RN that also removes the whole background-freeze
+// hazard: with no backoff sleep there is no timer to suspend, wake or double-fire.
+const MAX_RETRY_AFTER_MS = 3_600_000
+
+/**
+ * What one delivery attempt means for the batch:
+ * `done`    — the server ACCEPTED it. Settled; never send again.
+ * `requeue` — the server did NOT take it (429, 5xx, network). Put it back and
+ *             let the next flush carry it.
+ * `drop`    — permanently rejected (4xx other than 429: bad key, malformed
+ *             payload). Re-sending would fail identically forever, so we discard
+ *             it — but LOUDLY, never silently.
+ */
+type SendOutcome = 'done' | 'requeue' | 'drop'
+
+// eslint-disable-next-line no-console
+const _warn = (...args: unknown[]): void => console.warn('[onelo.monitor]', ...args)
+
+/** Seconds-form `Retry-After` → ms, clamped. Tolerates a header-less response
+ *  (test doubles) — never throws. */
+function _parseRetryAfter(res: Response): number {
+  let raw: string | null = null
+  try {
+    raw = res.headers?.get?.('Retry-After') ?? null
+  } catch { /* no headers — treat as absent */ }
+  if (!raw) return 0
+  const seconds = Number(raw.trim())
+  if (!Number.isFinite(seconds)) return 0
+  return Math.max(0, Math.min(seconds * 1000, MAX_RETRY_AFTER_MS))
+}
 
 // Global crash-handler registration state. Only ONE monitor instance installs
 // the ErrorUtils handler; `destroy()` on that instance restores the previous
@@ -151,6 +195,12 @@ export class OneloMonitor {
   private readonly breadcrumbs: Breadcrumb[] = []
   private flushTimer: ReturnType<typeof setInterval> | null = null
   private currentUserId: string | null = null
+  /** Serialises all drains so a timer flush and an error flush can't overlap. */
+  private flushChain: Promise<void> = Promise.resolve()
+  /** Epoch ms until which we hold off sending (set from a 429 `Retry-After`). */
+  private retryAfterUntil = 0
+  /** Set by destroy(); stops any further sends after teardown. */
+  private _destroyed = false
   /** Pre-built static meta merged into every event (sdk + app). Computed once. */
   private readonly staticMeta: Record<string, unknown>
   private readonly environment?: string
@@ -206,6 +256,13 @@ export class OneloMonitor {
 
     this.flushTimer = setInterval(() => { void this.flush() }, 15000)
     this._registerGlobalHandlers()
+    // Auto-emit one unconditional event per construction. An app that gates
+    // every instrumented operation behind sign-in/paywall/consent would
+    // otherwise emit NOTHING on a cold start — the dashboard would look
+    // "not integrated" even though every line of the snippet was followed
+    // correctly. This event needs no gate to exist: it fires the moment the
+    // SDK is constructed, so Feature Health always has at least one row.
+    this._push('session_opened', true, undefined, undefined, undefined, 'event')
   }
 
   /** Sets the current user ID attached to all subsequent monitor events. Call after login/logout if not using Onelo Auth. */
@@ -264,14 +321,32 @@ export class OneloMonitor {
     this._push(opts?.featureName ?? 'captured', false, undefined, message, this._withError(opts?.meta, stack, errorType), 'event')
   }
 
+  /**
+   * Drains are SERIALISED through one promise chain: the 15s timer, an error
+   * auto-flush and an explicit `flush()` must never drain concurrently, because
+   * two overlapping drains would interleave batches (and the second would see an
+   * empty buffer and report "sent").
+   */
   async flush(): Promise<void> {
-    const events = this.buffer.splice(0)
+    this.flushChain = this.flushChain.then(() => this._drain()).catch(() => {})
+    return this.flushChain
+  }
+
+  private async _drain(): Promise<void> {
+    // Post-teardown: a stray caller (a fired-late timer, an error pushed by code
+    // still holding a reference) must not put traffic on the wire from a dead
+    // monitor. destroy()'s OWN final flush runs before the flag is set.
+    if (this._destroyed) return
     // Drain the summary counters into one aggregate event per feature. Reset
-    // afterwards — next window starts fresh. If the send fails the counts are
-    // lost (no retry queue today, same fate as the rest of the buffer).
+    // afterwards — next window starts fresh. Counts ride the same re-queue path
+    // as the rest of the batch, so a failed send no longer loses them outright.
     for (const [featureName, count] of this.summaryBuffer) {
       if (count > 0) {
-        events.push({
+        this.buffer.push({
+          // Stamped as the summary event is materialised — the close of the
+          // aggregation window it describes. Same reason as _push: without it a
+          // batch delayed by an outage lands under the recovery's timestamp.
+          ts: new Date().toISOString(),
           featureName, ok: true, source: 'feature_call_summary',
           meta: { calls: count },
           userId: this.currentUserId ?? undefined,
@@ -280,17 +355,70 @@ export class OneloMonitor {
       }
     }
     this.summaryBuffer.clear()
-    if (events.length === 0) return
+    if (this.buffer.length === 0) return
+    // Server told us to back off (429/Retry-After) — leave events buffered.
+    if (Date.now() < this.retryAfterUntil) return
+    const events = this.buffer.splice(0)
+    const body = JSON.stringify({ publishableKey: this.publishableKey, events })
+    // ONE attempt. Anything the server did not accept goes straight back in the
+    // buffer and rides the next 15s tick — the flush timer IS the retry.
+    if (await this._sendOnce(body) === 'requeue') this._requeue(events)
+  }
+
+  /** One POST. Never throws — classifies the result instead. */
+  private async _sendOnce(body: string): Promise<SendOutcome> {
+    let res: Response
     try {
       const { sdkHeaders } = await import('../sdk-headers')
-      await fetch(`${this.apiUrl}/api/sdk/monitor/events/batch`, {
+      res = await fetch(`${this.apiUrl}/api/sdk/monitor/events/batch`, {
         method: 'POST',
         headers: { ...(await sdkHeaders(this.bundleId)), 'Content-Type': 'application/json' },
-        body: JSON.stringify({ publishableKey: this.publishableKey, events }),
+        body,
       })
     } catch {
-      // silently drop — monitoring must never break the app
+      return 'requeue' // network error (very common on mobile) — never landed
     }
+    // `fetch` does NOT reject on an HTTP error status, so this classification is
+    // the only thing standing between a 503 and a silently lost batch.
+    const status = res?.status ?? 0
+    if (status >= 200 && status < 300) return 'done'
+    if (status === 429) {
+      const waitMs = _parseRetryAfter(res)
+      if (waitMs > 0) this.retryAfterUntil = Math.max(this.retryAfterUntil, Date.now() + waitMs)
+      // Rate limited: the server did NOT accept these events. Re-queue them; the
+      // hold-off above stops the next flushes until the window reopens.
+      return 'requeue'
+    }
+    if (status >= 400 && status < 500) {
+      // 401 bad key, 403 forbidden, 422 malformed — identical every time, so
+      // re-queueing would wedge the buffer forever. Drop, but say so.
+      _warn(`batch rejected with HTTP ${status} — dropping it (retrying would fail identically)`)
+      return 'drop'
+    }
+    return 'requeue' // 5xx (and anything unrecognised) — server-side; try next flush
+  }
+
+  /**
+   * Put an undelivered batch back at the FRONT of the buffer so the next flush
+   * retries it, then re-apply the cap.
+   *
+   * Priority policy under a sustained outage: NEWEST EVENTS WIN. The buffer is
+   * trimmed from the front, so the oldest re-queued events go first. This matches
+   * `_push`'s newest-wins eviction, keeps memory bounded at MAX_BUFFER_SIZE no
+   * matter how long the device is offline, and stops a wedged batch from starving
+   * live telemetry. Drops are reported, never silent.
+   */
+  private _requeue(events: BufferedEvent[]): void {
+    this.buffer.unshift(...events)
+    let dropped = 0
+    while (this.buffer.length > MAX_BUFFER_SIZE) {
+      this.buffer.shift()
+      dropped++
+    }
+    _warn(
+      `delivery failed — ${events.length} event(s) re-queued` +
+        (dropped > 0 ? `, ${dropped} oldest dropped (buffer cap ${MAX_BUFFER_SIZE})` : ''),
+    )
   }
 
   destroy(): void {
@@ -299,7 +427,10 @@ export class OneloMonitor {
       this.flushTimer = null
     }
     this._unregisterGlobalHandlers()
-    void this.flush()
+    // One last best-effort delivery (a single request — with no backoff there is
+    // nothing left that could keep teardown pending for seconds), THEN mark the
+    // monitor dead so nothing sends after it.
+    void this.flush().finally(() => { this._destroyed = true })
   }
 
   private _addBreadcrumb(category: string, message: string, data?: Record<string, string>): void {
@@ -383,6 +514,7 @@ export class OneloMonitor {
     // Respect the ~16KB error-meta cap (drop heavy fields if over).
     if (isError && scrubbed) scrubbed = this._capMeta(scrubbed)
     this.buffer.push({
+      ts: new Date().toISOString(),
       featureName,
       ok,
       durationMs,

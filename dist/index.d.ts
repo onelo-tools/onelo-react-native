@@ -696,6 +696,12 @@ declare class OneloMonitor {
     private readonly breadcrumbs;
     private flushTimer;
     private currentUserId;
+    /** Serialises all drains so a timer flush and an error flush can't overlap. */
+    private flushChain;
+    /** Epoch ms until which we hold off sending (set from a 429 `Retry-After`). */
+    private retryAfterUntil;
+    /** Set by destroy(); stops any further sends after teardown. */
+    private _destroyed;
     /** Pre-built static meta merged into every event (sdk + app). Computed once. */
     private readonly staticMeta;
     private readonly environment?;
@@ -746,7 +752,27 @@ declare class OneloMonitor {
         featureName?: string;
         meta?: Record<string, unknown>;
     }): void;
+    /**
+     * Drains are SERIALISED through one promise chain: the 15s timer, an error
+     * auto-flush and an explicit `flush()` must never drain concurrently, because
+     * two overlapping drains would interleave batches (and the second would see an
+     * empty buffer and report "sent").
+     */
     flush(): Promise<void>;
+    private _drain;
+    /** One POST. Never throws — classifies the result instead. */
+    private _sendOnce;
+    /**
+     * Put an undelivered batch back at the FRONT of the buffer so the next flush
+     * retries it, then re-apply the cap.
+     *
+     * Priority policy under a sustained outage: NEWEST EVENTS WIN. The buffer is
+     * trimmed from the front, so the oldest re-queued events go first. This matches
+     * `_push`'s newest-wins eviction, keeps memory bounded at MAX_BUFFER_SIZE no
+     * matter how long the device is offline, and stops a wedged batch from starving
+     * live telemetry. Drops are reported, never silent.
+     */
+    private _requeue;
     destroy(): void;
     private _addBreadcrumb;
     /** Fold stack/errorType into a caller's meta without mutating it. */
