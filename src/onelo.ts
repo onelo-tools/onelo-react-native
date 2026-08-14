@@ -155,21 +155,35 @@ export class Onelo {
   }
 
   /**
-   * Start iOS App Attest when the backend requires it. Awaits config resolution
-   * (`auth.whenReady`) to read `attest_required`, then hands off to the platform-
-   * guarded `OneloAttest` (no-op on Android / Simulator / unlinked native). Never
-   * throws — attestation is best-effort and independent of sign-in.
+   * Start device attestation when the backend requires it — App Attest on iOS,
+   * Play Integrity on Android. Awaits config resolution (`auth.whenReady`) to
+   * read `attest_required` (+ `cloudProjectNumber` for Android), then hands off
+   * to the platform-guarded `OneloAttest` (no-op on Simulator/emulator-without-
+   * Play or unlinked native). Never throws — attestation is best-effort and
+   * independent of sign-in.
+   *
+   * NEVER swallow the catch silently (CLAUDE.md "No silent swallows" /
+   * `feedback_no_silent_swallows`) — everything on the happy path below this
+   * point (the dynamic `import('./attest')`, the constructor, `attest.start()`)
+   * already logs its own failures via `attest.ts`'s `log()`, but anything that
+   * throws BEFORE reaching that internal logging (e.g. the dynamic import
+   * itself failing to resolve under a given Metro/bundler config) used to
+   * vanish here with zero trace — exactly the diagnosability gap flagged for
+   * the Swift SDK (`OneloAuth.swift` `_refreshAttestToken`, `try?`). Attestation
+   * staying best-effort (never breaking SDK init) is preserved; only the
+   * silence is fixed.
    */
   private async _initAttest(config: OneloConfig): Promise<void> {
     try {
       await this.auth.whenReady()
       if (!this.auth.attestRequired) return
       const { OneloAttest } = await import('./attest')
-      const attest = new OneloAttest(config.apiUrl, config.publishableKey, config.bundleId)
+      const attest = new OneloAttest(config.apiUrl, config.publishableKey, config.bundleId, this.auth.cloudProjectNumber)
       this.attest = attest
       await attest.start()
-    } catch {
-      // Best-effort — a failed attest must not break SDK init.
+    } catch (e) {
+      // eslint-disable-next-line no-console
+      console.warn(`[Onelo][attest] _initAttest failed before/outside attest.ts's own error handling: ${String(e)}`)
     }
   }
 

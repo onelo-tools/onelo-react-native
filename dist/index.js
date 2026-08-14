@@ -281,15 +281,25 @@ var storage_exports = {};
 __export(storage_exports, {
   KeychainStorage: () => KeychainStorage
 });
-var Keychain, KeychainStorage;
+function _withTimeout(p, ms) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`Keychain call timed out after ${ms}ms`)), ms);
+  });
+  return Promise.race([p, timeout]).finally(() => {
+    if (timer !== void 0) clearTimeout(timer);
+  });
+}
+var Keychain, KEYCHAIN_TIMEOUT_MS, KeychainStorage;
 var init_storage = __esm({
   "src/core/storage.ts"() {
     "use strict";
     Keychain = __toESM(require("react-native-keychain"));
+    KEYCHAIN_TIMEOUT_MS = 5e3;
     KeychainStorage = class {
       async get(key) {
         try {
-          const result = await Keychain.getInternetCredentials(key);
+          const result = await _withTimeout(Keychain.getInternetCredentials(key), KEYCHAIN_TIMEOUT_MS);
           if (!result) return null;
           return result.password;
         } catch {
@@ -298,13 +308,13 @@ var init_storage = __esm({
       }
       async set(key, value) {
         try {
-          await Keychain.setInternetCredentials(key, key, value);
+          await _withTimeout(Keychain.setInternetCredentials(key, key, value), KEYCHAIN_TIMEOUT_MS);
         } catch {
         }
       }
       async delete(key) {
         try {
-          await Keychain.resetInternetCredentials({ server: key });
+          await _withTimeout(Keychain.resetInternetCredentials({ server: key }), KEYCHAIN_TIMEOUT_MS);
         } catch {
         }
       }
@@ -321,13 +331,14 @@ var require_package = __commonJS({
   "package.json"(exports2, module2) {
     module2.exports = {
       name: "@onelo/react-native",
-      version: "0.32.0",
+      version: "0.34.0",
       description: "Onelo React Native SDK",
       main: "./dist/index.js",
       types: "./dist/index.d.ts",
       files: [
         "dist",
         "ios",
+        "android",
         "onelo-react-native.podspec"
       ],
       scripts: {
@@ -417,11 +428,15 @@ __export(attest_exports, {
   _setActiveAttest: () => _setActiveAttest,
   getAssertionHeaders: () => getAssertionHeaders,
   getCachedAttestToken: () => getCachedAttestToken,
+  getCachedIntegrityToken: () => getCachedIntegrityToken,
   maybeSelfHealFromError: () => maybeSelfHealFromError,
   selfHealAttest: () => selfHealAttest
 });
 function getCachedAttestToken() {
   return _cachedAttestToken;
+}
+function getCachedIntegrityToken() {
+  return _cachedIntegrityToken;
 }
 function _setActiveAttest(a) {
   _activeAttest = a;
@@ -435,7 +450,17 @@ function selfHealAttest() {
 function maybeSelfHealFromError(json) {
   const detail = json?.detail;
   const code = detail && typeof detail === "object" ? detail.error : void 0;
-  if (code && ["attest_key_unknown", "attest_key_revoked", "invalid_assertion"].includes(code)) {
+  const hardRejectCodes = [
+    "attest_key_unknown",
+    "attest_key_revoked",
+    "invalid_assertion",
+    "bundle_id_mismatch",
+    "package_not_registered",
+    "integrity_token_required",
+    "integrity_invalid",
+    "integrity_token_stale"
+  ];
+  if (code && hardRejectCodes.includes(code)) {
     selfHealAttest();
   }
 }
@@ -445,7 +470,7 @@ function log(message) {
 function _truncate(s, max) {
   return s.length > max ? s.slice(0, max) : s;
 }
-function _withTimeout(p, ms, label) {
+function _withTimeout2(p, ms, label) {
   let timer;
   const timeout = new Promise((_, reject) => {
     timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
@@ -483,28 +508,37 @@ function _base64Decode(b64) {
   }
   return out;
 }
-var import_core, TOKEN_KEY, EXPIRY_KEY, KEY_ID_KEY, REFRESH_SKEW_MS, ATTEST_HTTP_TIMEOUT_MS, _cachedAttestToken, _activeAttest, _OneloAttest, OneloAttest;
+var import_js_sha2562, import_core, TOKEN_KEY, EXPIRY_KEY, KEY_ID_KEY, INTEGRITY_TOKEN_KEY, INTEGRITY_EXPIRY_KEY, REFRESH_SKEW_MS, ATTEST_HTTP_TIMEOUT_MS, _cachedAttestToken, _cachedIntegrityToken, _activeAttest, _OneloAttest, OneloAttest;
 var init_attest = __esm({
   "src/attest.ts"() {
     "use strict";
+    import_js_sha2562 = require("js-sha256");
     import_core = __toESM(require_dist());
     init_instance_id();
     TOKEN_KEY = "onelo.attest_token";
     EXPIRY_KEY = "onelo.attest_token_expiry";
     KEY_ID_KEY = "onelo.attest_key_id";
+    INTEGRITY_TOKEN_KEY = "onelo.integrity_token";
+    INTEGRITY_EXPIRY_KEY = "onelo.integrity_token_expiry";
     REFRESH_SKEW_MS = 5 * 60 * 1e3;
     ATTEST_HTTP_TIMEOUT_MS = 1e4;
     _cachedAttestToken = null;
+    _cachedIntegrityToken = null;
     _activeAttest = null;
     _OneloAttest = class _OneloAttest {
-      constructor(apiUrl, publishableKey, bundleId) {
+      constructor(apiUrl, publishableKey, bundleId, cloudProjectNumber) {
         this.apiUrl = apiUrl;
         this.publishableKey = publishableKey;
         this.bundleId = bundleId;
+        this.cloudProjectNumber = cloudProjectNumber;
         this.started = false;
         /** Single-flight guard so a foreground refresh can't race the initial attest
          *  (or two foregrounds) into two concurrent fresh-key attestations. */
         this._inflight = null;
+        // ── Android (Play Integrity) ────────────────────────────────────────────────
+        /** Single-flight guard for the Android exchange — same rationale as
+         *  `_inflight` above (a foreground refresh must not race the initial call). */
+        this._integrityInflight = null;
         // 4 min < 5-min server TTL
         this._statelessChallenge = null;
         /** Windowed self-heal loop guard (#34, parity with Swift): the single-flight
@@ -517,11 +551,15 @@ var init_attest = __esm({
       }
       /**
        * Warm the cache from Keychain and attest if needed. Call once after config
-       * resolves and `attest_required` is true. No-op on non-iOS / unsupported
-       * devices. Never throws.
+       * resolves and `attest_required` is true. No-op on non-iOS/Android or
+       * unsupported devices. Never throws.
        */
       async start() {
         if (this.started) return;
+        if (this._isAndroid()) {
+          await this._startAndroid();
+          return;
+        }
         if (!this._isIOS()) return;
         const native = this._native();
         if (!native) {
@@ -554,11 +592,118 @@ var init_attest = __esm({
        */
       async refreshIfNeeded() {
         if (!this.started) return;
+        if (this._isAndroid()) {
+          await this._refreshIntegrityIfNeeded();
+          return;
+        }
         const native = this._native();
         if (!native) return;
         const current = _cachedAttestToken ? await this._loadCached() : null;
         if (current && !this._isNearExpiry(current.expiresAt)) return;
         await this._attestSingleFlight(native);
+      }
+      async _startAndroid() {
+        const native = this._native();
+        if (!native?.prepareIntegrityToken || !native?.requestIntegrityToken) {
+          log("native module OneloAttest (Android) is not linked \u2014 did you rebuild the app after upgrading the SDK? Skipping Play Integrity.");
+          return;
+        }
+        if (!this.cloudProjectNumber) {
+          log("no cloudProjectNumber in config \u2014 upload a Play Integrity service account for this app in the Onelo dashboard. Skipping Play Integrity.");
+          return;
+        }
+        this.started = true;
+        const cached = await this._loadCachedIntegrity();
+        if (cached && !this._isNearExpiry(cached.expiresAt)) {
+          _cachedIntegrityToken = cached.token;
+          return;
+        }
+        await this._integritySingleFlight(native);
+      }
+      async _refreshIntegrityIfNeeded() {
+        const native = this._native();
+        if (!native?.prepareIntegrityToken || !native?.requestIntegrityToken) return;
+        const current = _cachedIntegrityToken ? await this._loadCachedIntegrity() : null;
+        if (current && !this._isNearExpiry(current.expiresAt)) return;
+        await this._integritySingleFlight(native);
+      }
+      _integritySingleFlight(native) {
+        if (this._integrityInflight) return this._integrityInflight;
+        this._integrityInflight = (async () => {
+          try {
+            await this._performIntegrityExchange(native);
+          } catch (e) {
+            log(`Play Integrity exchange failed: ${String(e)}`);
+          } finally {
+            this._integrityInflight = null;
+          }
+        })();
+        return this._integrityInflight;
+      }
+      /**
+       * `requestHash` binds the Google-signed verdict to this app's identity
+       * (publishable key + package), mirroring `onelo-android`'s
+       * `OneloPlayIntegrity.fetchAndVerify` exactly (`sha256Hex("$publishableKey|$packageName")`)
+       * so the backend can validate it identically regardless of which SDK sent it.
+       */
+      async _performIntegrityExchange(native) {
+        await native.prepareIntegrityToken(this.cloudProjectNumber);
+        const packageName = this.bundleId || await native.getBundleId();
+        const requestHash = (0, import_js_sha2562.sha256)(`${this.publishableKey}|${packageName}`);
+        const googleToken = await native.requestIntegrityToken(requestHash);
+        const { token, expiresAt } = await this._sendIntegrityToken({ googleToken, packageName });
+        _cachedIntegrityToken = token;
+        await this._saveCachedIntegrity(token, expiresAt);
+      }
+      /** `POST /api/sdk/auth/play-integrity` — the SAME endpoint the native
+       *  `onelo-android` SDK calls, so backend verification (package binding, cert
+       *  digest, freshness) is identical regardless of which SDK sent the token. */
+      async _sendIntegrityToken(args) {
+        const { status, json } = await _withTimeout2(
+          (0, import_core.httpPost)(
+            `${this.apiUrl}/api/sdk/auth/play-integrity`,
+            {
+              integrity_token: args.googleToken,
+              package_name: args.packageName,
+              publishable_key: this.publishableKey
+            },
+            { "X-Onelo-Instance-Id": await getInstanceId() }
+          ),
+          ATTEST_HTTP_TIMEOUT_MS,
+          "play-integrity"
+        );
+        if (status !== 200) {
+          const detail = _truncate(JSON.stringify(json ?? ""), 300);
+          throw new Error(`play-integrity endpoint rejected (HTTP ${status}): ${detail}`);
+        }
+        const obj = json ?? {};
+        const token = obj["integrity_token"];
+        if (typeof token !== "string" || !token) throw new Error("play-integrity endpoint returned 200 but no integrity_token");
+        const expiresAt = this._parseExpiry(obj["expires_at"], token);
+        return { token, expiresAt };
+      }
+      async _loadCachedIntegrity() {
+        try {
+          const { KeychainStorage: KeychainStorage2 } = await Promise.resolve().then(() => (init_storage(), storage_exports));
+          const storage = new KeychainStorage2();
+          const token = await storage.get(INTEGRITY_TOKEN_KEY);
+          const expiryStr = await storage.get(INTEGRITY_EXPIRY_KEY);
+          if (!token || !expiryStr) return null;
+          const expiresAt = new Date(expiryStr);
+          if (Number.isNaN(expiresAt.getTime())) return null;
+          return { token, expiresAt };
+        } catch {
+          return null;
+        }
+      }
+      async _saveCachedIntegrity(token, expiresAt) {
+        try {
+          const { KeychainStorage: KeychainStorage2 } = await Promise.resolve().then(() => (init_storage(), storage_exports));
+          const storage = new KeychainStorage2();
+          await storage.set(INTEGRITY_TOKEN_KEY, token);
+          await storage.set(INTEGRITY_EXPIRY_KEY, expiresAt.toISOString());
+        } catch {
+        }
       }
       // ── Attestation ───────────────────────────────────────────────────────────
       _attestSingleFlight(native) {
@@ -631,6 +776,18 @@ ${body}`;
           return;
         }
         this._selfHealCount++;
+        if (this._isAndroid()) {
+          _cachedIntegrityToken = null;
+          try {
+            const { KeychainStorage: KeychainStorage2 } = await Promise.resolve().then(() => (init_storage(), storage_exports));
+            const storage = new KeychainStorage2();
+            await storage.delete(INTEGRITY_TOKEN_KEY);
+            await storage.delete(INTEGRITY_EXPIRY_KEY);
+          } catch {
+          }
+          await this._integritySingleFlight(native);
+          return;
+        }
         _cachedAttestToken = null;
         this._statelessChallenge = null;
         try {
@@ -653,7 +810,7 @@ ${body}`;
       }
       async _fetchSingleUseChallenge() {
         const url = `${this.apiUrl}/api/sdk/auth/assert-challenge?key=${encodeURIComponent(this.publishableKey)}`;
-        const { status, json } = await _withTimeout(
+        const { status, json } = await _withTimeout2(
           (0, import_core.httpGet)(url, { "X-Onelo-Instance-Id": await getInstanceId() }),
           ATTEST_HTTP_TIMEOUT_MS,
           "assert-challenge"
@@ -683,7 +840,7 @@ ${body}`;
       /** `GET /api/sdk/auth/attest-challenge` with `X-Onelo-Instance-Id` (parity with
        *  Swift `fetchChallenge`). */
       async _fetchChallenge() {
-        const { status, json } = await _withTimeout(
+        const { status, json } = await _withTimeout2(
           (0, import_core.httpGet)(
             `${this.apiUrl}/api/sdk/auth/attest-challenge`,
             { "X-Onelo-Instance-Id": await getInstanceId() }
@@ -703,7 +860,7 @@ ${body}`;
        * JWT to know when to refresh).
        */
       async _sendAttestation(args) {
-        const { status, json } = await _withTimeout(
+        const { status, json } = await _withTimeout2(
           (0, import_core.httpPost)(
             `${this.apiUrl}/api/sdk/auth/attest`,
             {
@@ -781,6 +938,14 @@ ${body}`;
           return false;
         }
       }
+      _isAndroid() {
+        try {
+          const Platform = require("react-native").Platform;
+          return Platform?.OS === "android";
+        } catch {
+          return false;
+        }
+      }
       _native() {
         try {
           const NativeModules = require("react-native").NativeModules;
@@ -830,18 +995,29 @@ async function getNativeBundleId() {
   }
   return _nativeBundleId;
 }
+function currentOS() {
+  try {
+    const rn = require("react-native");
+    return rn.Platform?.OS ?? "unknown";
+  } catch {
+    return "unknown";
+  }
+}
 async function sdkHeaders(bundleId, publishableKey, assertion) {
   const instanceId = await getInstanceId();
   const attestToken = getCachedAttestToken();
+  const integrityToken = getCachedIntegrityToken();
   const resolvedBundleId = bundleId ?? await getNativeBundleId();
   const assertionHeaders = assertion ? await getAssertionHeaders(assertion.method, assertion.path, assertion.query ?? "", assertion.body ?? "") : null;
   return {
     "X-SDK-Version": import_package.version,
     "X-Onelo-Instance-Id": instanceId,
     "X-Onelo-Sdk-Platform": "react-native",
+    "X-Onelo-OS": currentOS(),
     ...resolvedBundleId ? { "X-Bundle-Id": resolvedBundleId } : {},
     ...publishableKey ? { "X-Publishable-Key": publishableKey } : {},
     ...attestToken ? { "X-Attest-Token": attestToken } : {},
+    ...integrityToken ? { "X-Integrity-Token": integrityToken } : {},
     ...assertionHeaders ?? {}
   };
 }
@@ -921,6 +1097,7 @@ function base64urlEncode(bytes) {
 // src/auth/auth.ts
 init_storage();
 init_sdk_headers();
+init_attest();
 var SDK_VERSION2 = require_package().version;
 var CALLBACK_SCHEME = "onelorn";
 var ATTEST_WAIT_CAP_MS = 5e3;
@@ -961,11 +1138,18 @@ var _OneloAuth = class _OneloAuth {
     this.allowCustomBranding = false;
     this.appName = "App";
     this.appLogoUrl = null;
-    /** True when the backend requires iOS App Attest for this app (at least one
-     *  registered bundle id has `attest_enabled=true`). Read from `/api/sdk/config`
-     *  (`attest_required`); the composition root (`Onelo`) uses it to decide whether
-     *  to kick off attestation. Parity with Swift `OneloAuth.attestRequired`. */
+    /** True when the backend requires device attestation for this app (at least
+     *  one registered bundle id has `attest_enabled=true`) — App Attest on iOS,
+     *  Play Integrity on Android. Read from `/api/sdk/config` (`attest_required`);
+     *  the composition root (`Onelo`) uses it to decide whether to kick off
+     *  attestation. Parity with Swift `OneloAuth.attestRequired`. */
     this.attestRequired = false;
+    /** Android Play Integrity: the developer's Google Cloud project NUMBER
+     *  (`/api/sdk/config`'s `cloud_project_number`), sourced from the Play
+     *  Integrity credential uploaded in the Onelo dashboard. Required by the
+     *  Standard Integrity API's `setCloudProjectNumber`; `null` when unconfigured
+     *  (the composition root then skips Play Integrity). Ignored on iOS. */
+    this.cloudProjectNumber = null;
     if (!config.apiUrl) throw new Error("[Onelo] apiUrl is required");
     if (!config.publishableKey) throw new Error("[Onelo] publishableKey is required");
     this._attestReady = attestReady;
@@ -978,7 +1162,7 @@ var _OneloAuth = class _OneloAuth {
       void getNativeBundleId().then((nb) => {
         if (!nb) {
           console.warn(
-            '[Onelo] No `bundleId` in config and none could be derived natively (Android has no native source; on iOS the native module must be linked). Set `bundleId` to your app id (e.g. "com.company.app") \u2014 it is REQUIRED for bundle attestation. Without it, requests are rejected with bundle_id_mismatch (403) once enforcement is active.'
+            '[Onelo] No `bundleId` in config and none could be derived natively (the OneloAttest native module is not linked \u2014 rebuild after pod install / Gradle sync). Set `bundleId` to your app id (e.g. "com.company.app") \u2014 it is REQUIRED for bundle attestation. Without it, requests are rejected with bundle_id_mismatch (403) once enforcement is active.'
           );
         }
       });
@@ -1071,6 +1255,8 @@ var _OneloAuth = class _OneloAuth {
         oauthProviders: Array.isArray(j["oauth_providers"]) ? j["oauth_providers"] : void 0
       };
       this.attestRequired = j["attest_required"] ?? false;
+      const cpn = j["cloud_project_number"];
+      this.cloudProjectNumber = typeof cpn === "number" && cpn > 0 ? cpn : null;
       const resolved = this.resolvedConfig;
       this.allowCustomBranding = resolved.allowCustomBranding;
       if (resolved.appName) this.appName = resolved.appName;
@@ -1201,6 +1387,7 @@ var _OneloAuth = class _OneloAuth {
       `${this.apiUrl}/api/sdk/flow/init?key=${encodeURIComponent(this.publishableKey)}&callback_scheme=${this._callbackScheme}${langParam}`,
       headers
     );
+    if (status !== 200) maybeSelfHealFromError(json);
     return { status, json: json ?? {} };
   }
   /** Map a `/flow/init` response to a FlowDecision, throwing on any non-200. */
@@ -3306,6 +3493,7 @@ var OneloStore = class {
 // src/core/event-stream.ts
 init_sdk_headers();
 init_instance_id();
+init_attest();
 var RECONNECT_DELAYS_MS = [1e3, 2e3, 5e3, 1e4, 3e4];
 var RECONNECT_FLOOR_MS = 500;
 var HEADERS_RECEIVED = 2;
@@ -3482,6 +3670,11 @@ var OneloEventStream = class {
       statusChecked = true;
       statusOk = xhr.status === 200;
       if (!statusOk) {
+        try {
+          const body = xhr.responseText;
+          if (body) maybeSelfHealFromError(JSON.parse(body));
+        } catch {
+        }
         try {
           xhr.abort();
         } catch {
@@ -3751,20 +3944,34 @@ var Onelo = class {
     this._wireForeground();
   }
   /**
-   * Start iOS App Attest when the backend requires it. Awaits config resolution
-   * (`auth.whenReady`) to read `attest_required`, then hands off to the platform-
-   * guarded `OneloAttest` (no-op on Android / Simulator / unlinked native). Never
-   * throws — attestation is best-effort and independent of sign-in.
+   * Start device attestation when the backend requires it — App Attest on iOS,
+   * Play Integrity on Android. Awaits config resolution (`auth.whenReady`) to
+   * read `attest_required` (+ `cloudProjectNumber` for Android), then hands off
+   * to the platform-guarded `OneloAttest` (no-op on Simulator/emulator-without-
+   * Play or unlinked native). Never throws — attestation is best-effort and
+   * independent of sign-in.
+   *
+   * NEVER swallow the catch silently (CLAUDE.md "No silent swallows" /
+   * `feedback_no_silent_swallows`) — everything on the happy path below this
+   * point (the dynamic `import('./attest')`, the constructor, `attest.start()`)
+   * already logs its own failures via `attest.ts`'s `log()`, but anything that
+   * throws BEFORE reaching that internal logging (e.g. the dynamic import
+   * itself failing to resolve under a given Metro/bundler config) used to
+   * vanish here with zero trace — exactly the diagnosability gap flagged for
+   * the Swift SDK (`OneloAuth.swift` `_refreshAttestToken`, `try?`). Attestation
+   * staying best-effort (never breaking SDK init) is preserved; only the
+   * silence is fixed.
    */
   async _initAttest(config) {
     try {
       await this.auth.whenReady();
       if (!this.auth.attestRequired) return;
       const { OneloAttest: OneloAttest2 } = await Promise.resolve().then(() => (init_attest(), attest_exports));
-      const attest = new OneloAttest2(config.apiUrl, config.publishableKey, config.bundleId);
+      const attest = new OneloAttest2(config.apiUrl, config.publishableKey, config.bundleId, this.auth.cloudProjectNumber);
       this.attest = attest;
       await attest.start();
-    } catch {
+    } catch (e) {
+      console.warn(`[Onelo][attest] _initAttest failed before/outside attest.ts's own error handling: ${String(e)}`);
     }
   }
   /**

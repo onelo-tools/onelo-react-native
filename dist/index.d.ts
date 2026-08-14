@@ -273,11 +273,18 @@ declare class OneloAuth {
     allowCustomBranding: boolean;
     appName: string;
     appLogoUrl: string | null;
-    /** True when the backend requires iOS App Attest for this app (at least one
-     *  registered bundle id has `attest_enabled=true`). Read from `/api/sdk/config`
-     *  (`attest_required`); the composition root (`Onelo`) uses it to decide whether
-     *  to kick off attestation. Parity with Swift `OneloAuth.attestRequired`. */
+    /** True when the backend requires device attestation for this app (at least
+     *  one registered bundle id has `attest_enabled=true`) — App Attest on iOS,
+     *  Play Integrity on Android. Read from `/api/sdk/config` (`attest_required`);
+     *  the composition root (`Onelo`) uses it to decide whether to kick off
+     *  attestation. Parity with Swift `OneloAuth.attestRequired`. */
     attestRequired: boolean;
+    /** Android Play Integrity: the developer's Google Cloud project NUMBER
+     *  (`/api/sdk/config`'s `cloud_project_number`), sourced from the Play
+     *  Integrity credential uploaded in the Onelo dashboard. Required by the
+     *  Standard Integrity API's `setCloudProjectNumber`; `null` when unconfigured
+     *  (the composition root then skips Play Integrity). Ignored on iOS. */
+    cloudProjectNumber: number | null;
     /** Injected by the composition root (`Onelo`): resolves when background App
      *  Attest has produced its token (or settled). Gated entry points await it so
      *  a cold-start request doesn't race ahead of the token → spurious 403 (#25).
@@ -1313,10 +1320,23 @@ declare class Onelo {
     private _attestReady;
     constructor(config: OneloConfig);
     /**
-     * Start iOS App Attest when the backend requires it. Awaits config resolution
-     * (`auth.whenReady`) to read `attest_required`, then hands off to the platform-
-     * guarded `OneloAttest` (no-op on Android / Simulator / unlinked native). Never
-     * throws — attestation is best-effort and independent of sign-in.
+     * Start device attestation when the backend requires it — App Attest on iOS,
+     * Play Integrity on Android. Awaits config resolution (`auth.whenReady`) to
+     * read `attest_required` (+ `cloudProjectNumber` for Android), then hands off
+     * to the platform-guarded `OneloAttest` (no-op on Simulator/emulator-without-
+     * Play or unlinked native). Never throws — attestation is best-effort and
+     * independent of sign-in.
+     *
+     * NEVER swallow the catch silently (CLAUDE.md "No silent swallows" /
+     * `feedback_no_silent_swallows`) — everything on the happy path below this
+     * point (the dynamic `import('./attest')`, the constructor, `attest.start()`)
+     * already logs its own failures via `attest.ts`'s `log()`, but anything that
+     * throws BEFORE reaching that internal logging (e.g. the dynamic import
+     * itself failing to resolve under a given Metro/bundler config) used to
+     * vanish here with zero trace — exactly the diagnosability gap flagged for
+     * the Swift SDK (`OneloAuth.swift` `_refreshAttestToken`, `try?`). Attestation
+     * staying best-effort (never breaking SDK init) is preserved; only the
+     * silence is fixed.
      */
     private _initAttest;
     /**

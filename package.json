@@ -1,12 +1,13 @@
 {
   "name": "@onelo/react-native",
-  "version": "0.32.0",
+  "version": "0.34.0",
   "description": "Onelo React Native SDK",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "files": [
     "dist",
     "ios",
+    "android",
     "onelo-react-native.podspec"
   ],
   "scripts": {

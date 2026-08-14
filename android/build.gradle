@@ -1,0 +1,36 @@
+apply plugin: 'com.android.library'
+apply plugin: 'kotlin-android'
+
+// Android half of the `OneloAttest` native module. iOS owns App Attest
+// (../ios/OneloAttest.swift); this owns Play Integrity — same JS-facing module
+// name (`NativeModules.OneloAttest`) so `attest.ts` / `sdk-headers.ts` call one
+// name on both platforms and branch on the methods each side actually exposes.
+android {
+    namespace 'com.onelo.reactnative'
+    compileSdkVersion 34
+
+    defaultConfig {
+        minSdkVersion 24
+        targetSdkVersion 34
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    kotlinOptions {
+        jvmTarget = "17"
+    }
+}
+
+dependencies {
+    // `compileOnly` — the consuming app's `react-native` Gradle module provides
+    // these at build time (mirrors every other community RN native module);
+    // bundling our own copy would risk a duplicate-class clash with the app's.
+    compileOnly 'com.facebook.react:react-android:+'
+
+    implementation 'com.google.android.play:integrity:1.6.0'
+    implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3'
+    implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-play-services:1.7.3'
+}

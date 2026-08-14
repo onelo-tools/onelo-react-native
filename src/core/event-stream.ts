@@ -1,5 +1,6 @@
 import { sdkHeaders } from '../sdk-headers'
 import { getInstanceId } from './instance-id'
+import { maybeSelfHealFromError } from '../attest'
 
 /**
  * OneloEventStream — ONE persistent SSE connection to
@@ -288,6 +289,17 @@ export class OneloEventStream {
       statusChecked = true
       statusOk = xhr.status === 200
       if (!statusOk) {
+        // The SSE reconnect loop retries FOREVER on backoff — without this, a
+        // stale cached attest/integrity credential (backend registration
+        // changed underneath it) would keep 403ing on every single reconnect,
+        // presenting the SAME stale token each time instead of self-healing
+        // once (found via a live device test on the Flutter SDK's identical
+        // reconnect loop — see event_stream.dart's fix; ported here since RN
+        // had the same gap).
+        try {
+          const body = xhr.responseText
+          if (body) maybeSelfHealFromError(JSON.parse(body))
+        } catch { /* best-effort — an unparsable/absent body just skips self-heal */ }
         try { xhr.abort() } catch { /* ignore */ }
         end(true)
       }

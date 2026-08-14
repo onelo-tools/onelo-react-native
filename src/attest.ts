@@ -1,3 +1,4 @@
+import { sha256 } from 'js-sha256'
 import { httpGet, httpPost } from '@onelo/core'
 import { getInstanceId } from './core/instance-id'
 
@@ -20,11 +21,17 @@ import { getInstanceId } from './core/instance-id'
  * the token flows everywhere once cached. This mirrors Swift's model where the
  * HTTP client / monitor hold a cached `attestToken` property that requests read.
  *
- * ## iOS only
- * `start()` no-ops on Android (Play Integrity is a separate future task) and in
- * any non-RN / Simulator environment. `react-native` and `react-native-keychain`
- * are required LAZILY (never at module top) so importing `sdk-headers` — and
- * therefore this file — never pulls a native module into unit tests / SSR.
+ * ## iOS App Attest + Android Play Integrity
+ * `start()` branches on `Platform.OS`: iOS runs App Attest (above); Android runs
+ * Google Play Integrity (Standard API) — the native module exposes
+ * `prepareIntegrityToken`/`requestIntegrityToken` there instead of
+ * `generateKey`/`attestKey`, and the resulting token is cached separately and
+ * sent as `X-Integrity-Token` (see `sdk-headers.ts`), matching the native
+ * `onelo-android` SDK and the backend's `/api/sdk/auth/play-integrity`. Both
+ * paths no-op in any non-RN / Simulator-or-emulator-without-Play environment.
+ * `react-native` and `react-native-keychain` are required LAZILY (never at
+ * module top) so importing `sdk-headers` — and therefore this file — never
+ * pulls a native module into unit tests / SSR.
  *
  * ## Best-effort
  * Nothing here throws to the caller. A failure (unsupported device, missing App
@@ -36,6 +43,12 @@ import { getInstanceId } from './core/instance-id'
 const TOKEN_KEY = 'onelo.attest_token'
 const EXPIRY_KEY = 'onelo.attest_token_expiry'
 const KEY_ID_KEY = 'onelo.attest_key_id'
+
+/** Android (Play Integrity) token cache keys — separate from the iOS App Attest
+ *  keys above so the two never collide (they never run on the same device, but
+ *  distinct names keep Keychain contents self-describing). */
+const INTEGRITY_TOKEN_KEY = 'onelo.integrity_token'
+const INTEGRITY_EXPIRY_KEY = 'onelo.integrity_token_expiry'
 
 /** Refresh when the token is within this window of expiry (parity: Swift 5 min). */
 const REFRESH_SKEW_MS = 5 * 60 * 1000
@@ -60,6 +73,18 @@ export function getCachedAttestToken(): string | null {
   return _cachedAttestToken
 }
 
+/** In-memory Play Integrity token (Android), read synchronously by
+ *  `sdk-headers` as `X-Integrity-Token` — the Android twin of
+ *  {@link getCachedAttestToken}. `null` until the first successful exchange (or
+ *  a cache-warm from Keychain on relaunch). */
+let _cachedIntegrityToken: string | null = null
+
+/** The current Play Integrity token, or `null`. Synchronous + side-effect-free,
+ *  same contract as {@link getCachedAttestToken}. */
+export function getCachedIntegrityToken(): string | null {
+  return _cachedIntegrityToken
+}
+
 /** The active OneloAttest, set at SDK init so the shared header builder can reach
  *  per-request assertions without threading the instance through every module. */
 let _activeAttest: OneloAttest | null = null
@@ -77,15 +102,39 @@ export async function getAssertionHeaders(
  *  single-flight). Safe no-op when there's no active attest. */
 export function selfHealAttest(): void { void _activeAttest?.resetForSelfHeal() }
 
-/** If a non-2xx response body carries a HARD attestation reject code, fire the
- *  self-heal. Codes: attest_key_unknown/attest_key_revoked/invalid_assertion.
- *  NOT counter_stale (retryable — just re-sign) nor attest_store_unavailable
- *  (transient 503). Call from a request's non-2xx branch (FAZA 3). */
+/** If a non-2xx response body carries a HARD attestation/integrity reject
+ *  code, fire the self-heal (drop the cached credential, re-attest).
+ *
+ *  iOS App Attest: attest_key_unknown/attest_key_revoked/invalid_assertion.
+ *
+ *  Android Play Integrity: bundle_id_mismatch/package_not_registered/
+ *  integrity_token_required/integrity_invalid/integrity_token_stale — the
+ *  Play Integrity JWT is cached up to 30 days (`attest.ts`'s
+ *  `_loadCachedIntegrity`), so a backend-side change made OUT-OF-BAND (a
+ *  bundle manually removed/re-added in the dashboard during testing, a cert
+ *  rotation) leaves the cached token looking locally "valid" while the
+ *  backend has already stopped honoring it — the client would otherwise keep
+ *  presenting the same stale credential until the cache naturally expires or
+ *  is manually cleared (`pm clear` / reinstall). These codes are exactly the
+ *  backend's signal that what the client is presenting no longer matches its
+ *  current registration, so re-attesting (not just retrying) is the fix.
+ *
+ *  NOT included: counter_stale (retryable — just re-sign, no cache to drop),
+ *  attest_store_unavailable (transient 503), cert_digest_mismatch/
+ *  cert_digest_missing/integrity_not_configured/rate_limit_exceeded (re-
+ *  attesting with the SAME build/config can't change any of these — the
+ *  windowed cap in `resetForSelfHeal` still bounds a misfire either way).
+ *  Call from a request's non-2xx branch. */
 export function maybeSelfHealFromError(json: unknown): void {
   const detail = (json as { detail?: unknown } | null)?.detail
   const code = detail && typeof detail === 'object'
     ? (detail as { error?: string }).error : undefined
-  if (code && ['attest_key_unknown', 'attest_key_revoked', 'invalid_assertion'].includes(code)) {
+  const hardRejectCodes = [
+    'attest_key_unknown', 'attest_key_revoked', 'invalid_assertion',
+    'bundle_id_mismatch', 'package_not_registered', 'integrity_token_required',
+    'integrity_invalid', 'integrity_token_stale',
+  ]
+  if (code && hardRejectCodes.includes(code)) {
     selfHealAttest()
   }
 }
@@ -99,6 +148,13 @@ export interface AttestNativeModule {
    *  native SHA-256s it) with the attested key. Returns base64 CBOR assertion. */
   generateAssertion(keyId: string, clientData: string): Promise<string>
   getBundleId(): Promise<string>
+  /** Android only (Play Integrity). Prepares/caches the Standard API token
+   *  provider for `cloudProjectNumber`; rejects `integrity_not_configured` when
+   *  the number is missing. */
+  prepareIntegrityToken?(cloudProjectNumber: number): Promise<boolean>
+  /** Android only. Requests a fresh Standard Integrity token bound to
+   *  `requestHash`; must follow a successful `prepareIntegrityToken`. */
+  requestIntegrityToken?(requestHash: string): Promise<string>
 }
 
 /** Log-safe diagnostic. A silently-failing security mechanism is worse than none
@@ -123,15 +179,17 @@ export class OneloAttest {
     private readonly apiUrl: string,
     private readonly publishableKey: string,
     private readonly bundleId?: string,
+    private readonly cloudProjectNumber?: number | null,
   ) { _setActiveAttest(this) }
 
   /**
    * Warm the cache from Keychain and attest if needed. Call once after config
-   * resolves and `attest_required` is true. No-op on non-iOS / unsupported
-   * devices. Never throws.
+   * resolves and `attest_required` is true. No-op on non-iOS/Android or
+   * unsupported devices. Never throws.
    */
   async start(): Promise<void> {
     if (this.started) return
+    if (this._isAndroid()) { await this._startAndroid(); return }
     if (!this._isIOS()) return
 
     const native = this._native()
@@ -172,11 +230,135 @@ export class OneloAttest {
    */
   async refreshIfNeeded(): Promise<void> {
     if (!this.started) return
+    if (this._isAndroid()) { await this._refreshIntegrityIfNeeded(); return }
     const native = this._native()
     if (!native) return
     const current = _cachedAttestToken ? await this._loadCached() : null
     if (current && !this._isNearExpiry(current.expiresAt)) return
     await this._attestSingleFlight(native)
+  }
+
+  // ── Android (Play Integrity) ────────────────────────────────────────────────
+
+  /** Single-flight guard for the Android exchange — same rationale as
+   *  `_inflight` above (a foreground refresh must not race the initial call). */
+  private _integrityInflight: Promise<void> | null = null
+
+  private async _startAndroid(): Promise<void> {
+    const native = this._native()
+    if (!native?.prepareIntegrityToken || !native?.requestIntegrityToken) {
+      log('native module OneloAttest (Android) is not linked — did you rebuild the app after upgrading the SDK? Skipping Play Integrity.')
+      return
+    }
+    if (!this.cloudProjectNumber) {
+      log('no cloudProjectNumber in config — upload a Play Integrity service account for this app in the Onelo dashboard. Skipping Play Integrity.')
+      return
+    }
+
+    this.started = true
+
+    // Same relaunch-warm-cache behaviour as iOS.
+    const cached = await this._loadCachedIntegrity()
+    if (cached && !this._isNearExpiry(cached.expiresAt)) {
+      _cachedIntegrityToken = cached.token
+      return
+    }
+    await this._integritySingleFlight(native)
+  }
+
+  private async _refreshIntegrityIfNeeded(): Promise<void> {
+    const native = this._native()
+    if (!native?.prepareIntegrityToken || !native?.requestIntegrityToken) return
+    const current = _cachedIntegrityToken ? await this._loadCachedIntegrity() : null
+    if (current && !this._isNearExpiry(current.expiresAt)) return
+    await this._integritySingleFlight(native)
+  }
+
+  private _integritySingleFlight(native: AttestNativeModule): Promise<void> {
+    if (this._integrityInflight) return this._integrityInflight
+    this._integrityInflight = (async () => {
+      try {
+        await this._performIntegrityExchange(native)
+      } catch (e) {
+        log(`Play Integrity exchange failed: ${String(e)}`)
+      } finally {
+        this._integrityInflight = null
+      }
+    })()
+    return this._integrityInflight
+  }
+
+  /**
+   * `requestHash` binds the Google-signed verdict to this app's identity
+   * (publishable key + package), mirroring `onelo-android`'s
+   * `OneloPlayIntegrity.fetchAndVerify` exactly (`sha256Hex("$publishableKey|$packageName")`)
+   * so the backend can validate it identically regardless of which SDK sent it.
+   */
+  private async _performIntegrityExchange(native: AttestNativeModule): Promise<void> {
+    await native.prepareIntegrityToken!(this.cloudProjectNumber!)
+    const packageName = this.bundleId || (await native.getBundleId())
+    const requestHash = sha256(`${this.publishableKey}|${packageName}`)
+    const googleToken = await native.requestIntegrityToken!(requestHash)
+
+    const { token, expiresAt } = await this._sendIntegrityToken({ googleToken, packageName })
+    _cachedIntegrityToken = token
+    await this._saveCachedIntegrity(token, expiresAt)
+  }
+
+  /** `POST /api/sdk/auth/play-integrity` — the SAME endpoint the native
+   *  `onelo-android` SDK calls, so backend verification (package binding, cert
+   *  digest, freshness) is identical regardless of which SDK sent the token. */
+  private async _sendIntegrityToken(args: {
+    googleToken: string
+    packageName: string
+  }): Promise<{ token: string; expiresAt: Date }> {
+    const { status, json } = await _withTimeout(
+      httpPost(
+        `${this.apiUrl}/api/sdk/auth/play-integrity`,
+        {
+          integrity_token: args.googleToken,
+          package_name: args.packageName,
+          publishable_key: this.publishableKey,
+        },
+        { 'X-Onelo-Instance-Id': await getInstanceId() },
+      ),
+      ATTEST_HTTP_TIMEOUT_MS, 'play-integrity',
+    )
+    if (status !== 200) {
+      const detail = _truncate(JSON.stringify(json ?? ''), 300)
+      throw new Error(`play-integrity endpoint rejected (HTTP ${status}): ${detail}`)
+    }
+    const obj = (json ?? {}) as Record<string, unknown>
+    const token = obj['integrity_token']
+    if (typeof token !== 'string' || !token) throw new Error('play-integrity endpoint returned 200 but no integrity_token')
+    const expiresAt = this._parseExpiry(obj['expires_at'], token)
+    return { token, expiresAt }
+  }
+
+  private async _loadCachedIntegrity(): Promise<CachedToken | null> {
+    try {
+      const { KeychainStorage } = await import('./core/storage')
+      const storage = new KeychainStorage()
+      const token = await storage.get(INTEGRITY_TOKEN_KEY)
+      const expiryStr = await storage.get(INTEGRITY_EXPIRY_KEY)
+      if (!token || !expiryStr) return null
+      const expiresAt = new Date(expiryStr)
+      if (Number.isNaN(expiresAt.getTime())) return null
+      return { token, expiresAt }
+    } catch {
+      return null
+    }
+  }
+
+  private async _saveCachedIntegrity(token: string, expiresAt: Date): Promise<void> {
+    try {
+      const { KeychainStorage } = await import('./core/storage')
+      const storage = new KeychainStorage()
+      await storage.set(INTEGRITY_TOKEN_KEY, token)
+      await storage.set(INTEGRITY_EXPIRY_KEY, expiresAt.toISOString())
+    } catch {
+      // Keychain best-effort — the in-memory token still serves this session.
+    }
   }
 
   // ── Attestation ───────────────────────────────────────────────────────────
@@ -278,6 +460,21 @@ export class OneloAttest {
       return
     }
     this._selfHealCount++
+
+    if (this._isAndroid()) {
+      _cachedIntegrityToken = null
+      try {
+        const { KeychainStorage } = await import('./core/storage')
+        const storage = new KeychainStorage()
+        await storage.delete(INTEGRITY_TOKEN_KEY)
+        await storage.delete(INTEGRITY_EXPIRY_KEY)
+      } catch {
+        // best-effort — the re-exchange below still requests a fresh token.
+      }
+      await this._integritySingleFlight(native)
+      return
+    }
+
     _cachedAttestToken = null
     this._statelessChallenge = null
     try {
@@ -452,6 +649,16 @@ export class OneloAttest {
       // eslint-disable-next-line @typescript-eslint/no-var-requires
       const Platform = (require('react-native') as { Platform?: { OS?: string } }).Platform
       return Platform?.OS === 'ios'
+    } catch {
+      return false
+    }
+  }
+
+  protected _isAndroid(): boolean {
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const Platform = (require('react-native') as { Platform?: { OS?: string } }).Platform
+      return Platform?.OS === 'android'
     } catch {
       return false
     }

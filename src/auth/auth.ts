@@ -17,6 +17,7 @@ export type FlowDecision =
 import { generateCodeVerifier, generateCodeChallenge } from '../core/pkce'
 import { KeychainStorage } from '../core/storage'
 import { sdkHeaders, getNativeBundleId } from '../sdk-headers'
+import { maybeSelfHealFromError } from '../attest'
 import type { OneloEventStream } from '../core/event-stream'
 import type { ModalResult } from './auth-modal'
 
@@ -86,11 +87,18 @@ export class OneloAuth {
   allowCustomBranding = false
   appName = 'App'
   appLogoUrl: string | null = null
-  /** True when the backend requires iOS App Attest for this app (at least one
-   *  registered bundle id has `attest_enabled=true`). Read from `/api/sdk/config`
-   *  (`attest_required`); the composition root (`Onelo`) uses it to decide whether
-   *  to kick off attestation. Parity with Swift `OneloAuth.attestRequired`. */
+  /** True when the backend requires device attestation for this app (at least
+   *  one registered bundle id has `attest_enabled=true`) — App Attest on iOS,
+   *  Play Integrity on Android. Read from `/api/sdk/config` (`attest_required`);
+   *  the composition root (`Onelo`) uses it to decide whether to kick off
+   *  attestation. Parity with Swift `OneloAuth.attestRequired`. */
   attestRequired = false
+  /** Android Play Integrity: the developer's Google Cloud project NUMBER
+   *  (`/api/sdk/config`'s `cloud_project_number`), sourced from the Play
+   *  Integrity credential uploaded in the Onelo dashboard. Required by the
+   *  Standard Integrity API's `setCloudProjectNumber`; `null` when unconfigured
+   *  (the composition root then skips Play Integrity). Ignored on iOS. */
+  cloudProjectNumber: number | null = null
 
   /** Injected by the composition root (`Onelo`): resolves when background App
    *  Attest has produced its token (or settled). Gated entry points await it so
@@ -107,17 +115,19 @@ export class OneloAuth {
     this.bundleId = config.bundleId
     this._callbackScheme = config.callbackScheme || CALLBACK_SCHEME
     this.storage = new KeychainStorage()
-    // #18 DX: X-Bundle-Id auto-derives from the native module on iOS, but Android
-    // has no native bundle-id source (and iOS needs the module linked). If NEITHER
-    // config nor native can provide it, requests are rejected (bundle_id_mismatch
-    // 403) once enforcement is active — warn LOUDLY at init instead of a silent
-    // 403 much later. Fire-and-forget so it never blocks construction.
+    // #18 DX: X-Bundle-Id auto-derives from the native module on both platforms
+    // (iOS `Bundle.main.bundleIdentifier`, Android `Context.getPackageName()`),
+    // but only once the native module is linked (pod install / Gradle sync). If
+    // NEITHER config nor native can provide it, requests are rejected
+    // (bundle_id_mismatch 403) once enforcement is active — warn LOUDLY at init
+    // instead of a silent 403 much later. Fire-and-forget so it never blocks
+    // construction.
     if (!config.bundleId) {
       void getNativeBundleId().then((nb) => {
         if (!nb) {
           console.warn(
             '[Onelo] No `bundleId` in config and none could be derived natively ' +
-            '(Android has no native source; on iOS the native module must be linked). ' +
+            '(the OneloAttest native module is not linked — rebuild after pod install / Gradle sync). ' +
             'Set `bundleId` to your app id (e.g. "com.company.app") — it is REQUIRED for ' +
             'bundle attestation. Without it, requests are rejected with bundle_id_mismatch (403) ' +
             'once enforcement is active.',
@@ -218,6 +228,8 @@ export class OneloAuth {
       // App Attest requirement is not part of the typed ResolvedSDKConfig
       // (`@onelo/core`), so read it straight off the raw config JSON.
       this.attestRequired = (j['attest_required'] as boolean) ?? false
+      const cpn = j['cloud_project_number']
+      this.cloudProjectNumber = typeof cpn === 'number' && cpn > 0 ? cpn : null
       const resolved = this.resolvedConfig
       this.allowCustomBranding = resolved.allowCustomBranding
       if (resolved.appName) this.appName = resolved.appName
@@ -388,6 +400,13 @@ export class OneloAuth {
       `${this.apiUrl}/api/sdk/flow/init?key=${encodeURIComponent(this.publishableKey)}&callback_scheme=${this._callbackScheme}${langParam}`,
       headers,
     )
+    // A stale, still-"valid" cached attest/integrity token can silently drift
+    // from a backend registration that changed underneath it (bundle
+    // unregistered/re-registered, cert rotated) — the cache doesn't expire for
+    // up to 30 days, so without this the SDK would keep presenting the same
+    // stale credential forever. flow/init is the first gated request on every
+    // cold start, so checking here catches the drift as early as possible.
+    if (status !== 200) maybeSelfHealFromError(json)
     return { status, json: (json as Record<string, unknown> | null) ?? {} }
   }
 

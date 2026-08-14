@@ -1,6 +1,6 @@
 import { version as SDK_VERSION } from '../package.json'
 import { getInstanceId } from './core/instance-id'
-import { getCachedAttestToken, getAssertionHeaders } from './attest'
+import { getCachedAttestToken, getCachedIntegrityToken, getAssertionHeaders } from './attest'
 
 /**
  * Request context for a per-request App Attest assertion (FAZA 3). When passed,
@@ -23,7 +23,12 @@ export interface AssertionContext {
  * Always sent:
  * - `X-SDK-Version`             — SDK version string
  * - `X-Onelo-Instance-Id`      — per-install UUID (TOFU device binding)
- * - `X-Onelo-Sdk-Platform`     — always `react-native`
+ * - `X-Onelo-Sdk-Platform`     — always `react-native` (WHICH SDK)
+ * - `X-Onelo-OS`               — `ios` | `android` (WHICH OS, resolved at
+ *                                runtime). Distinct from the header above on
+ *                                purpose: one React Native codebase ships to
+ *                                both stores, and Apple's App Review rules
+ *                                apply to exactly one of them.
  *
  * Conditionally sent:
  * - `X-Bundle-Id`      — when `bundleId` is configured (backend
@@ -40,18 +45,23 @@ export interface AssertionContext {
  *                        place makes it ride every request (the Swift/macOS
  *                        lesson was a token that was computed but never sent).
  *                        Null on Android and before the first attestation.
+ * - `X-Integrity-Token` — Android Google Play Integrity JWT, ONCE a device has
+ *                        completed the exchange (see `attest.ts`). Same
+ *                        synchronous in-memory read as the attest token above.
+ *                        Null on iOS and before the first successful exchange.
  *
  * Async because the instance id is Keychain-backed. Every caller already runs
  * inside an async function — `await sdkHeaders(...)`.
  */
 let _nativeBundleId: string | null | undefined = undefined
 /**
- * The app's bundle id from the native module (iOS: `Bundle.main.bundleIdentifier`
- * via `NativeModules.OneloAttest`), or null on Android / when the native module
- * isn't linked. Memoized. Lets `X-Bundle-Id` auto-derive so a developer needn't
- * set `bundleId` in config on iOS — parity with the Flutter SDK (which reads it
- * from PackageInfo). Without this, omitting `bundleId` silently 403s every
- * request (bundle_id_mismatch) once enforcement is active.
+ * The app's bundle id from the native module — `Bundle.main.bundleIdentifier` on
+ * iOS, `Context.getPackageName()` on Android (both via `NativeModules.OneloAttest`)
+ * — or null when the native module isn't linked. Memoized. Lets `X-Bundle-Id`
+ * auto-derive on both platforms so a developer needn't set `bundleId` in config —
+ * parity with the Flutter SDK (which reads it from PackageInfo). Without this,
+ * omitting `bundleId` silently 403s every request (bundle_id_mismatch) once
+ * enforcement is active.
  */
 export async function getNativeBundleId(): Promise<string | null> {
   if (_nativeBundleId !== undefined) return _nativeBundleId
@@ -69,6 +79,27 @@ export async function getNativeBundleId(): Promise<string | null> {
   return _nativeBundleId
 }
 
+/**
+ * The OS this bundle is actually running on — `ios` | `android`, or `unknown`
+ * outside React Native (plain-Node tests).
+ *
+ * Needed because `X-Onelo-Sdk-Platform: react-native` says nothing about the
+ * store the app ships through, and App Review guideline 3.1.1 governs iOS only.
+ * `/api/sdk/config` reads this to decide whether the "Require plan on sign-up"
+ * gate applies (applications.paywall_gate_on_apple). Without it, an RN developer
+ * could set "sign-in only on Apple" in the dashboard and have it silently do
+ * nothing on their iOS build.
+ */
+function currentOS(): string {
+  try {
+    // Lazy require — same reason as getNativeBundleId above.
+    const rn = require('react-native') as { Platform?: { OS?: string } }
+    return rn.Platform?.OS ?? 'unknown'
+  } catch {
+    return 'unknown'
+  }
+}
+
 export async function sdkHeaders(
   bundleId?: string,
   publishableKey?: string,
@@ -76,6 +107,7 @@ export async function sdkHeaders(
 ): Promise<Record<string, string>> {
   const instanceId = await getInstanceId()
   const attestToken = getCachedAttestToken()
+  const integrityToken = getCachedIntegrityToken()
   // Prefer the explicit config value; fall back to the native bundle id (iOS) so
   // X-Bundle-Id is sent even when the dev didn't configure `bundleId`.
   const resolvedBundleId = bundleId ?? (await getNativeBundleId())
@@ -89,9 +121,11 @@ export async function sdkHeaders(
     'X-SDK-Version': SDK_VERSION,
     'X-Onelo-Instance-Id': instanceId,
     'X-Onelo-Sdk-Platform': 'react-native',
+    'X-Onelo-OS': currentOS(),
     ...(resolvedBundleId ? { 'X-Bundle-Id': resolvedBundleId } : {}),
     ...(publishableKey ? { 'X-Publishable-Key': publishableKey } : {}),
     ...(attestToken ? { 'X-Attest-Token': attestToken } : {}),
+    ...(integrityToken ? { 'X-Integrity-Token': integrityToken } : {}),
     ...(assertionHeaders ?? {}),
   }
 }
