@@ -17,6 +17,7 @@ import {
   parseCallbackDeepLink,
   isOAuthNavigation,
   buildHostedInitUrl,
+  isOneloHostedSurface,
   parseOAuthMessage,
   withOAuthPreauth,
   OAUTH_PROVIDER_HOSTS,
@@ -100,6 +101,85 @@ describe('isOAuthNavigation — system-browser diversion', () => {
 
   it('returns false for non-http(s) urls', () => {
     expect(isOAuthNavigation('onelorn://callback?code=x')).toBe(false)
+  })
+})
+
+describe('isOneloHostedSurface — the gate refusal is loaded, so it is checked', () => {
+  // A magic link the gate turns down carries no code; the surface travels as
+  // `<scheme>://callback?gate=<url>` and is LOADED in the app's own sign-in
+  // WebView. Any app on the device can fire that scheme at us, so an unchecked
+  // value here is a phishing page wearing this app's sign-in window.
+  //
+  // The anchor is the hosted URL already open — /flow/init named it moments ago.
+  const ANCHOR = 'https://st.onelo.tools/auth/hosted?token=art_1'
+
+  it('accepts a surface on the origin the BACKEND named', () => {
+    expect(isOneloHostedSurface('https://st.onelo.tools/no-plan/hosted?token=npt_1', ANCHOR)).toBe(true)
+  })
+
+  it('refuses a foreign origin', () => {
+    expect(isOneloHostedSurface('https://evil.example.com/no-plan/hosted', ANCHOR)).toBe(false)
+  })
+
+  it('refuses plain http on the right host', () => {
+    // Downgrade guard: a matching host over http is still interceptable.
+    expect(isOneloHostedSurface('http://st.onelo.tools/no-plan/hosted', ANCHOR)).toBe(false)
+  })
+
+  it('refuses a look-alike host', () => {
+    // Host comparison must be exact — a suffix match would accept this.
+    expect(isOneloHostedSurface('https://evil-st.onelo.tools.attacker.test/x', ANCHOR)).toBe(false)
+  })
+
+  it('refuses garbage rather than throwing', () => {
+    // Every incoming URL is funnelled through here, so a malformed one must be
+    // an answer, not an exception.
+    expect(isOneloHostedSurface('not a url', ANCHOR)).toBe(false)
+    expect(isOneloHostedSurface('https://st.onelo.tools/x', 'not a url')).toBe(false)
+  })
+})
+
+describe('buildHostedInitUrl — the sign-up intent must survive', () => {
+  // OAuth hands back a verified IDENTITY, never an intention, so the backend
+  // defaults to `signin` — which refuses to create an account. A sign-up that
+  // fails to say so is silently downgraded and the user is told "This account
+  // isn't registered" whichever button they pressed. Confirmed live on Flutter
+  // (2026-08-19); this builder had the same hole.
+  //
+  // The hosted page DECIDES the intent (only it knows the mode) and puts it on
+  // the bridge signal. This builder only has to carry it.
+
+  it('carries a sign-up so the backend may create the account', () => {
+    const url = buildHostedInitUrl('https://api.test', 'google', 'art_1', 'signup')
+    expect(url).toContain('intent=signup')
+  })
+
+  it('sends no intent for a sign-in, leaving the safe default', () => {
+    const url = buildHostedInitUrl('https://api.test', 'google', 'art_1')
+    expect(url).not.toContain('intent')
+  })
+
+  it('drops a value the backend does not define', () => {
+    // The value arrives over a bridge message. Forwarding anything unrecognised
+    // would be trusting a string to decide whether an account gets created.
+    const url = buildHostedInitUrl('https://api.test', 'google', 'art_1', 'signup-please')
+    expect(url).not.toContain('intent')
+  })
+
+  it('reads the intent off a native_oauth signal', () => {
+    const parsed = parseOAuthMessage(JSON.stringify({
+      type: 'onelo:native_oauth', provider: 'apple', token: 'art_1', intent: 'signup',
+    }))
+    expect(parsed).toEqual({ type: 'native_oauth', provider: 'apple', token: 'art_1', intent: 'signup' })
+  })
+
+  it('tolerates an older hosted page that sends no intent', () => {
+    // Forward compatibility in the other direction: an SDK released ahead of the
+    // page must not break, it must just get the safe sign-in default.
+    const parsed = parseOAuthMessage(JSON.stringify({
+      type: 'onelo:native_oauth', provider: 'github', token: 'art_1',
+    }))
+    expect(parsed).toEqual({ type: 'native_oauth', provider: 'github', token: 'art_1', intent: undefined })
   })
 })
 

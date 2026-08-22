@@ -39,6 +39,7 @@ var require_types = __commonJS({
     "use strict";
     Object.defineProperty(exports2, "__esModule", { value: true });
     exports2.OneloError = void 0;
+    exports2.extractErrorCode = extractErrorCode2;
     var OneloError7 = class _OneloError extends Error {
       constructor(code, message) {
         super(message);
@@ -91,6 +92,22 @@ var require_types = __commonJS({
       }
     };
     exports2.OneloError = OneloError7;
+    function extractErrorCode2(json) {
+      if (!json || typeof json !== "object")
+        return void 0;
+      const body = json;
+      if (typeof body.error === "string" && body.error)
+        return body.error;
+      const detail = body.detail;
+      if (typeof detail === "string" && detail)
+        return detail;
+      if (detail && typeof detail === "object") {
+        const nested = detail.error;
+        if (typeof nested === "string" && nested)
+          return nested;
+      }
+      return void 0;
+    }
   }
 });
 
@@ -199,7 +216,11 @@ var require_session = __commonJS({
           tenantId: appMeta["tenant_id"] ?? user["tenant_id"] ?? null,
           // Backend sends "active" | "none"; absent MUST decode to 'none' (never
           // treat a missing entitlement as active). Round-trips via USER_JSON.
-          entitlement: user["entitlement"] === "active" ? "active" : "none"
+          entitlement: user["entitlement"] === "active" ? "active" : "none",
+          // Undefined (not false) when the backend did not send it: "the server did
+          // not say" and "the server said no" are different, and only the first may
+          // fall back to the old client-side derivation.
+          allowedIn: typeof user["allowed_in"] === "boolean" ? user["allowed_in"] : void 0
         }
       };
     }
@@ -207,7 +228,22 @@ var require_session = __commonJS({
       ACCESS_TOKEN: "onelo_access_token",
       REFRESH_TOKEN: "onelo_refresh_token",
       EXPIRES_AT: "onelo_expires_at",
-      USER_JSON: "onelo_user"
+      USER_JSON: "onelo_user",
+      /**
+       * PKCE verifier for an OUTSTANDING magic link.
+       *
+       * Every other verifier this SDK uses lives in memory, which is correct for
+       * flows that finish in the same page. A magic link does not: the email opens
+       * a NEW tab (often after a relaunch), so an in-memory verifier is gone by the
+       * time the code comes back and /hosted-callback would 401 on a link that is
+       * already spent — locking the user out with no recovery. That is exactly why
+       * magic links shipped WITHOUT a challenge.
+       *
+       * Persisting it is what makes the binding possible on the web: the new tab is
+       * the same origin, so it can read this back. Deleted the moment the exchange
+       * finishes or fails, and cleared with the rest on sign-out.
+       */
+      MAGIC_LINK_VERIFIER: "onelo_magic_link_verifier"
     };
   }
 });
@@ -331,7 +367,7 @@ var require_package = __commonJS({
   "package.json"(exports2, module2) {
     module2.exports = {
       name: "@onelo/react-native",
-      version: "0.34.0",
+      version: "0.38.3",
       description: "Onelo React Native SDK",
       main: "./dist/index.js",
       types: "./dist/index.d.ts",
@@ -1098,8 +1134,501 @@ function base64urlEncode(bytes) {
 init_storage();
 init_sdk_headers();
 init_attest();
-var SDK_VERSION2 = require_package().version;
+
+// src/auth/auth-modal.tsx
+var import_react2 = __toESM(require("react"));
+
+// src/auth/webview-oauth.ts
+var OAUTH_PROVIDER_HOSTS = ["github.com", "accounts.google.com", "appleid.apple.com"];
+var OAUTH_INIT_PATH_RE = /^\/api\/sdk\/auth\/oauth\/(github|google|apple)(\/|$|\?)/;
+function parseOAuthMessage(data) {
+  try {
+    const msg = JSON.parse(data);
+    if (msg["type"] === "onelo:native_oauth" && typeof msg["provider"] === "string" && typeof msg["token"] === "string") {
+      return {
+        type: "native_oauth",
+        provider: msg["provider"],
+        token: msg["token"],
+        // WHICH BUTTON the user pressed. Carried, never decided here — see
+        // buildHostedInitUrl. Absent on an older hosted page, which the URL
+        // builder treats as a sign-in (the safe default).
+        intent: typeof msg["intent"] === "string" ? msg["intent"] : void 0
+      };
+    }
+    if (msg["type"] === "onelo:native_oauth_url" && typeof msg["url"] === "string") {
+      return { type: "native_oauth_url", url: msg["url"] };
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+function isOneloHostedSurface(gateUrl, hostedUrl) {
+  try {
+    const gate = new URL(gateUrl);
+    const anchor = new URL(hostedUrl);
+    if (gate.protocol !== "https:") return false;
+    return gate.host.toLowerCase() === anchor.host.toLowerCase();
+  } catch {
+    return false;
+  }
+}
+function parseCallbackDeepLink(url, scheme) {
+  const prefix = `${scheme}://`;
+  if (!url.toLowerCase().startsWith(prefix.toLowerCase())) return null;
+  let rest = url.slice(prefix.length);
+  let query = "";
+  const q = rest.indexOf("?");
+  if (q !== -1) {
+    query = rest.slice(q + 1);
+    rest = rest.slice(0, q);
+  }
+  const slash = rest.indexOf("/");
+  const host = (slash === -1 ? rest : rest.slice(0, slash)).toLowerCase();
+  const params = {};
+  for (const part of query.split("&")) {
+    if (!part) continue;
+    const eq = part.indexOf("=");
+    const k = eq === -1 ? part : part.slice(0, eq);
+    const v = eq === -1 ? "" : part.slice(eq + 1);
+    if (k) {
+      try {
+        params[decodeURIComponent(k)] = decodeURIComponent(v);
+      } catch {
+        params[k] = v;
+      }
+    }
+  }
+  return { host, params };
+}
+function httpHostPath(url) {
+  const m = /^https?:\/\/([^/?#]+)([^?#]*)/i.exec(url);
+  if (!m) return null;
+  return { host: m[1].toLowerCase().replace(/:\d+$/, ""), path: m[2] || "/" };
+}
+function isOAuthNavigation(url) {
+  const hp = httpHostPath(url);
+  if (!hp) return false;
+  return OAUTH_PROVIDER_HOSTS.includes(hp.host) || OAUTH_INIT_PATH_RE.test(hp.path);
+}
+function withOAuthPreauth(url, preauth) {
+  const [beforeHash, hash] = url.split("#");
+  const qIdx = beforeHash.indexOf("?");
+  const path = qIdx === -1 ? beforeHash : beforeHash.slice(0, qIdx);
+  const query = qIdx === -1 ? "" : beforeHash.slice(qIdx + 1);
+  const kept = query.split("&").filter((p) => p && !/^oauth_(preauth|code|error)=/i.test(p));
+  kept.push(`oauth_preauth=${encodeURIComponent(preauth)}`);
+  return `${path}?${kept.join("&")}${hash ? `#${hash}` : ""}`;
+}
+function buildHostedInitUrl(apiUrl, provider, token, intent) {
+  const wantsSignUp = intent === "signup" ? "&intent=signup" : "";
+  return `${apiUrl}/api/sdk/auth/oauth/hosted-init?provider=${encodeURIComponent(provider)}&token=${encodeURIComponent(token)}${wantsSignUp}`;
+}
+var OAUTH_RELAY_SCRIPT = `
+(function () {
+  function forward(d) {
+    try {
+      if (typeof d === 'string') { d = JSON.parse(d); }
+      // Forward the OAuth hand-off AND the hosted-flow success/cancel codes. The
+      // hosted store's sendSuccess() posts { type:'onelo:code', code } to
+      // window.parent \u2014 which, inside react-native-webview, is window itself, so it
+      // fires a same-window 'message' event that ONLY reaches the native side if we
+      // relay it to ReactNativeWebView.postMessage here. Without this, an in-WebView
+      // store purchase renders "You're in!" but the code never reaches the app \u2192
+      // no exchange, no auto-login.
+      if (d && (
+        d.type === 'onelo:native_oauth' ||
+        d.type === 'onelo:native_oauth_url' ||
+        d.type === 'onelo:code' ||
+        d.type === 'onelo:cancelled' ||
+        // #40 Phase 2 \u2014 the hosted page signals it has mounted so the host can hide
+        // its native fail-safe \u2715 (used by the customer-portal modal; auth/store
+        // ignore it). The canonical \u2715 is then owned by the hosted page.
+        d.type === 'onelo:ready'
+      )) {
+        window.ReactNativeWebView.postMessage(JSON.stringify(d));
+      }
+    } catch (err) { /* ignore non-JSON page messages */ }
+  }
+  window.addEventListener('message', function (e) { forward(e.data); });
+  true;
+})();
+`;
+function openInSystemBrowser(Linking, url, onError) {
+  Linking.openURL(url).catch(() => onError());
+}
+
+// src/auth/auth-skeleton.tsx
+var import_react = __toESM(require("react"));
+function authSkeletonHtml(socialCount, backgroundColor, redirectTo) {
+  const n = Math.max(0, Math.min(4, Math.floor(socialCount || 0)));
+  const bg = backgroundColor || "#111111";
+  const redirect = redirectTo ? `<script>requestAnimationFrame(function(){requestAnimationFrame(function(){location.replace(${JSON.stringify(redirectTo)})})})</script>` : "";
+  const pills = Array.from({ length: n }).map(() => '<div class="onelo-skel-strong pill"></div>').join("");
+  const divider = n > 0 ? '<div class="divider"><span class="dline"></span><span class="onelo-skel dtext"></span><span class="dline"></span></div>' : "";
+  return `<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%}
+body{background:${bg};font-family:-apple-system,BlinkMacSystemFont,sans-serif;overflow:hidden}
+.wrap{display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:100vh;width:100%;padding:48px 24px}
+.col{width:100%;max-width:300px;display:flex;flex-direction:column;gap:10px}
+.onelo-skel{background-color:rgba(255,255,255,0.04);background-image:linear-gradient(90deg,rgba(255,255,255,0) 0%,rgba(255,255,255,0.14) 50%,rgba(255,255,255,0) 100%);background-size:60vw 100%;background-repeat:no-repeat;background-position:-100vw 0;border-radius:8px}
+.onelo-skel-strong{background-color:rgba(255,255,255,0.08);background-image:linear-gradient(90deg,rgba(255,255,255,0) 0%,rgba(255,255,255,0.20) 50%,rgba(255,255,255,0) 100%);background-size:60vw 100%;background-repeat:no-repeat;background-position:-100vw 0;border-radius:9px}
+.icon{width:64px;height:64px;border-radius:14px;margin-bottom:14px}
+.title{width:200px;height:22px;margin-bottom:10px;border-radius:6px}
+.sub{width:140px;height:13px;opacity:0.7;margin-bottom:28px;border-radius:4px}
+.pill{height:44px;border-radius:9px}
+.divider{display:flex;align-items:center;gap:12px;margin:16px 0 4px}
+.dline{flex:1;height:1px;background:rgba(255,255,255,0.1)}
+.dtext{width:14px;height:11px;opacity:0.5}
+.lbl{width:38px;height:11px}
+.input{height:44px}
+.lblrow{display:flex;justify-content:space-between;align-items:center}
+.lbl2{width:58px;height:11px}
+.forgot{width:90px;height:11px;opacity:0.7}
+.cta{height:48px;border-radius:10px;margin-top:6px}
+.signup{width:200px;height:12px;opacity:0.6;border-radius:4px;margin:6px auto 0}
+</style></head><body>
+<div class="wrap" aria-hidden="true">
+<div class="onelo-skel icon"></div>
+<div class="onelo-skel title"></div>
+<div class="onelo-skel sub"></div>
+<div class="col">
+${pills}${divider}
+<div class="onelo-skel lbl"></div>
+<div class="onelo-skel-strong input"></div>
+<div class="lblrow"><div class="onelo-skel lbl2"></div><div class="onelo-skel forgot"></div></div>
+<div class="onelo-skel-strong input"></div>
+<div class="onelo-skel-strong cta"></div>
+<div class="onelo-skel signup"></div>
+</div>
+</div>
+<script>(function(){var D=2400,BW=60;var q=function(){return document.querySelectorAll('.onelo-skel,.onelo-skel-strong')};var s=performance.now();function tick(now){var vw=window.innerWidth;var bpx=vw*(BW/100);var span=vw+bpx;var p=((now-s)%D)/D;var bx=-bpx+p*span;q().forEach(function(el){var r=el.getBoundingClientRect();el.style.backgroundPositionX=(bx-r.left)+'px'});requestAnimationFrame(tick)}requestAnimationFrame(tick)})();</script>
+${redirect}
+</body></html>`;
+}
+function AuthSkeleton({ socialCount = 0, backgroundColor = "#111111" }) {
+  const RN = require("react-native");
+  const { WebView } = require("react-native-webview");
+  const { View } = RN;
+  const html = authSkeletonHtml(socialCount, backgroundColor);
+  return import_react.default.createElement(
+    View,
+    // pointerEvents none: it's a placeholder — never swallow touches (so the
+    // AuthModal close ✕ layered above it stays tappable).
+    { style: { flex: 1, backgroundColor }, pointerEvents: "none" },
+    import_react.default.createElement(WebView, {
+      source: { html },
+      originWhitelist: ["*"],
+      scrollEnabled: false,
+      showsVerticalScrollIndicator: false,
+      showsHorizontalScrollIndicator: false,
+      // Kill the react-native-webview white default paint before first render.
+      backgroundColor,
+      style: { flex: 1, backgroundColor }
+    })
+  );
+}
+
+// src/auth/auth-modal.tsx
 var CALLBACK_SCHEME = "onelorn";
+function isExpiredAuthError(err) {
+  return err === "invalid_token" || err === "expired_token" || err === "token_expired";
+}
+function shouldShowNativeStoreClose(opts) {
+  return opts.onStore && !opts.hostedReady && opts.failSafeArmed;
+}
+function parseModalMessage(data) {
+  try {
+    const msg = JSON.parse(data);
+    if (msg["type"] === "onelo:code" && typeof msg["code"] === "string") {
+      return { type: "code", code: msg["code"] };
+    }
+    if (msg["type"] === "onelo:cancelled") {
+      return { type: "cancelled" };
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+function AuthModal({ visible, hostedUrl, onResult, apiUrl, backgroundColor, callbackScheme, socialCount = 0 }) {
+  const scheme = callbackScheme || CALLBACK_SCHEME;
+  const RN = require("react-native");
+  const { WebView } = require("react-native-webview");
+  const { Modal, View, StyleSheet, TouchableOpacity, Text, Linking, Platform, StatusBar } = RN;
+  const [error, setError] = (0, import_react2.useState)(false);
+  const [retryKey, setRetryKey] = (0, import_react2.useState)(0);
+  const [currentUrl, setCurrentUrl] = (0, import_react2.useState)(hostedUrl);
+  const resolvedRef = (0, import_react2.useRef)(false);
+  const webViewRef = (0, import_react2.useRef)(null);
+  const [canGoBack, setCanGoBack] = (0, import_react2.useState)(false);
+  const isStoreUrl = (u) => u.toLowerCase().includes("/store/");
+  const [onStore, setOnStore] = (0, import_react2.useState)(isStoreUrl(hostedUrl));
+  const [hostedReady, setHostedReady] = (0, import_react2.useState)(false);
+  const [failSafeArmed, setFailSafeArmed] = (0, import_react2.useState)(false);
+  (0, import_react2.useEffect)(() => {
+    setCurrentUrl(hostedUrl);
+    resolvedRef.current = false;
+    setCanGoBack(false);
+    setOnStore(isStoreUrl(hostedUrl));
+    setHostedReady(false);
+    setFailSafeArmed(false);
+  }, [hostedUrl, visible]);
+  (0, import_react2.useEffect)(() => {
+    if (!visible) return;
+    const t = setTimeout(() => setFailSafeArmed(true), 3500);
+    return () => clearTimeout(t);
+  }, [visible, hostedUrl]);
+  const showNativeStoreClose = shouldShowNativeStoreClose({ onStore, hostedReady, failSafeArmed });
+  const resolveOnce = (0, import_react2.useCallback)(
+    (result) => {
+      if (resolvedRef.current) return;
+      resolvedRef.current = true;
+      onResult(result);
+    },
+    [onResult]
+  );
+  const handleCallbackUrl = (0, import_react2.useCallback)(
+    (url) => {
+      const parsed = parseCallbackDeepLink(url, scheme);
+      if (!parsed) return false;
+      if (parsed.host !== "callback") {
+        resolveOnce({ type: "error", message: "Auth callback URL has unexpected host" });
+        return true;
+      }
+      const { code, preauth, gate, error: errParam } = parsed.params;
+      if (gate) {
+        if (isOneloHostedSurface(gate, hostedUrl)) {
+          webViewRef.current?.injectJavaScript(
+            `window.location.replace(${JSON.stringify(gate)}); true;`
+          );
+        } else {
+          resolveOnce({ type: "error", message: "Refused a sign-in surface from an unknown origin" });
+        }
+      } else if (code) {
+        resolveOnce({ type: "code", code });
+      } else if (preauth) {
+        const preauthUrl = withOAuthPreauth(hostedUrl, preauth);
+        webViewRef.current?.injectJavaScript(
+          `window.location.replace(${JSON.stringify(preauthUrl)}); true;`
+        );
+      } else if (isExpiredAuthError(errParam)) {
+        resolveOnce({ type: "expired" });
+      } else if (errParam) {
+        resolveOnce({ type: "error", message: errParam });
+      } else {
+        resolveOnce({ type: "error", message: "Auth callback missing code parameter" });
+      }
+      return true;
+    },
+    [resolveOnce, hostedUrl, scheme]
+  );
+  const openInSystemBrowser2 = (0, import_react2.useCallback)(
+    (url) => {
+      openInSystemBrowser(Linking, url, () => {
+        resolveOnce({ type: "error", message: "Could not open the sign-in browser" });
+      });
+    },
+    [Linking, resolveOnce]
+  );
+  const openOAuth = (0, import_react2.useCallback)(
+    (msg) => {
+      if (msg.type === "native_oauth_url") {
+        openInSystemBrowser2(msg.url);
+        return;
+      }
+      if (!apiUrl) return;
+      openInSystemBrowser2(buildHostedInitUrl(apiUrl, msg.provider, msg.token, msg.intent));
+    },
+    [apiUrl, openInSystemBrowser2]
+  );
+  const handleMessage = (0, import_react2.useCallback)(
+    (event) => {
+      const data = event.nativeEvent.data;
+      const parsed = parseModalMessage(data);
+      if (parsed) {
+        if (parsed.type === "code") resolveOnce({ type: "code", code: parsed.code });
+        else resolveOnce({ type: "cancelled" });
+        return;
+      }
+      try {
+        if (JSON.parse(data)?.type === "onelo:ready") {
+          setHostedReady(true);
+          return;
+        }
+      } catch {
+      }
+      const oauth = parseOAuthMessage(data);
+      if (oauth) openOAuth(oauth);
+    },
+    [resolveOnce, openOAuth]
+  );
+  const handleShouldStartLoad = (0, import_react2.useCallback)(
+    (request) => {
+      const url = request.url ?? "";
+      if (url.toLowerCase().startsWith(`${scheme}://`)) {
+        handleCallbackUrl(url);
+        return false;
+      }
+      if (isOAuthNavigation(url)) {
+        openInSystemBrowser2(url);
+        return false;
+      }
+      return true;
+    },
+    [handleCallbackUrl, openInSystemBrowser2, scheme]
+  );
+  const handleNavChange = (0, import_react2.useCallback)(
+    (navState) => {
+      const url = navState.url ?? "";
+      if (url.toLowerCase().startsWith(`${scheme}://`)) handleCallbackUrl(url);
+      setCanGoBack(!!navState.canGoBack);
+      setOnStore(isStoreUrl(url));
+    },
+    [handleCallbackUrl, scheme]
+  );
+  (0, import_react2.useEffect)(() => {
+    if (!visible || !Linking?.addEventListener) return;
+    const onUrl = (event) => {
+      if (event?.url) handleCallbackUrl(event.url);
+    };
+    const sub = Linking.addEventListener("url", onUrl);
+    return () => {
+      if (sub && typeof sub.remove === "function") sub.remove();
+      else if (Linking.removeEventListener) Linking.removeEventListener("url", onUrl);
+    };
+  }, [visible, Linking, handleCallbackUrl]);
+  const handleError = (0, import_react2.useCallback)(() => {
+    setError(true);
+  }, []);
+  const handleRetry = (0, import_react2.useCallback)(() => {
+    setError(false);
+    setCurrentUrl(hostedUrl);
+    setRetryKey((k) => k + 1);
+  }, [hostedUrl]);
+  const handleCancel = (0, import_react2.useCallback)(() => {
+    resolveOnce({ type: "cancelled" });
+  }, [resolveOnce]);
+  const handleBackOrCancel = (0, import_react2.useCallback)(() => {
+    if (!isStoreUrl(hostedUrl) && canGoBack) webViewRef.current?.goBack();
+    else handleCancel();
+  }, [hostedUrl, canGoBack, handleCancel]);
+  const bg = backgroundColor || "#111111";
+  const styles = StyleSheet.create({
+    container: { flex: 1, backgroundColor: bg },
+    webview: { flex: 1, backgroundColor: bg },
+    errorContainer: { flex: 1, justifyContent: "center", alignItems: "center", gap: 16 },
+    retryButton: { backgroundColor: "#ffffff", paddingHorizontal: 32, paddingVertical: 14, borderRadius: 8 },
+    retryText: { color: "#000000", fontSize: 16, fontWeight: "600" },
+    cancelButton: { paddingHorizontal: 32, paddingVertical: 14 },
+    cancelText: { color: "#ffffff", fontSize: 16 },
+    // #27 — persistent close affordance in the NORMAL flow (the hosted page,
+    // e.g. the store, may not render its own cancel → user was trapped and had
+    // to kill the app). Top-trailing, cleared past the notch/status bar.
+    closeButton: {
+      position: "absolute",
+      top: Platform.OS === "ios" ? 52 : (StatusBar.currentHeight ?? 24) + 8,
+      right: 16,
+      width: 36,
+      height: 36,
+      borderRadius: 18,
+      backgroundColor: "rgba(0,0,0,0.4)",
+      justifyContent: "center",
+      alignItems: "center",
+      zIndex: 10
+    },
+    closeText: { color: "#ffffff", fontSize: 19, fontWeight: "600", lineHeight: 21 }
+  });
+  return import_react2.default.createElement(
+    Modal,
+    {
+      visible,
+      // #28 — 'none' (not 'slide'): the modal's loading skeleton is PIXEL-IDENTICAL
+      // to the gate's skeleton it appears over (same HTML, bg, socialCount), so a
+      // slide-in reads as a jarring "second load / jump". Swapping in place makes
+      // the gate→modal skeleton hand-off seamless (one continuous surface).
+      animationType: "none",
+      presentationStyle: "fullScreen",
+      // #27 — Android hardware back: step back in the hosted flow, else cancel.
+      onRequestClose: handleBackOrCancel
+    },
+    import_react2.default.createElement(
+      View,
+      { style: styles.container },
+      !error && import_react2.default.createElement(WebView, {
+        // Route the custom callback scheme THROUGH onShouldStartLoadWithRequest
+        // (where handleShouldStartLoad extracts the one-time code + returns false).
+        // Without the scheme whitelisted, react-native-webview shunts
+        // `onelorn://callback?code=…` to Linking.openURL ("Can't open url" when the
+        // scheme isn't registered) and the in-WebView interceptor is bypassed — the
+        // code is lost and sign-in never completes. http/https keep normal page loads.
+        originWhitelist: ["http://*", "https://*", `${scheme}://*`],
+        // Ephemeral session — RN analogue of Swift's `websiteDataStore =
+        // .nonPersistent()`. Auth cookies/localStorage/cache must NOT survive the
+        // modal or the app restart: otherwise a half-finished or expired hosted
+        // flow leaves stale state the page reloads into ("session expired" on a
+        // supposedly-fresh start, requiring a manual data clear).
+        incognito: true,
+        ref: webViewRef,
+        key: retryKey,
+        // #28 single-WebView: load the skeleton HTML, which `location.replace()`s
+        // to the hosted URL after it paints. ONE WebView shows the skeleton then
+        // the page — no separate overlay instance, no slide, no jump. The skeleton
+        // stays visible during the network load until the hosted page paints.
+        source: { html: authSkeletonHtml(socialCount, bg, currentUrl) },
+        onError: handleError,
+        onMessage: handleMessage,
+        injectedJavaScript: OAUTH_RELAY_SCRIPT,
+        onShouldStartLoadWithRequest: handleShouldStartLoad,
+        onNavigationStateChange: handleNavChange,
+        style: styles.webview,
+        // Native WebView bg (separate from style) — react-native-webview paints
+        // white by default before first paint; set it to the branding bg to kill
+        // the flash on both iOS and Android.
+        backgroundColor: bg
+      }),
+      // #27 — ✕ shown ONLY on the store ("Choose your plan"), never on the entry
+      // sign-in form. Reached via "Sign Up" → it steps BACK to the sign-in form
+      // (has history); reached as the entry page (signed-in-but-unentitled) → it
+      // cancels out (no history). Either way the user is never trapped. Rendered
+      // LAST so it sits on top of the WebView + skeleton overlay (pointerEvents:none).
+      // #40 Phase 2 — FAIL-SAFE only: once the hosted store page posts
+      // `onelo:ready`, ITS canonical ✕ (StoreExitX) takes over and this hides,
+      // so the two stop overlapping (reported 2026-08-20).
+      !error && showNativeStoreClose && import_react2.default.createElement(
+        TouchableOpacity,
+        {
+          style: styles.closeButton,
+          onPress: handleBackOrCancel,
+          accessibilityRole: "button",
+          accessibilityLabel: canGoBack ? "Back" : "Close",
+          hitSlop: { top: 8, bottom: 8, left: 8, right: 8 }
+        },
+        import_react2.default.createElement(Text, { style: styles.closeText }, "\u2715")
+      ),
+      error && import_react2.default.createElement(
+        View,
+        { style: styles.errorContainer },
+        import_react2.default.createElement(
+          TouchableOpacity,
+          { style: styles.retryButton, onPress: handleRetry },
+          import_react2.default.createElement(Text, { style: styles.retryText }, "Sign In")
+        ),
+        import_react2.default.createElement(
+          TouchableOpacity,
+          { style: styles.cancelButton, onPress: handleCancel },
+          import_react2.default.createElement(Text, { style: styles.cancelText }, "Cancel")
+        )
+      )
+    )
+  );
+}
+
+// src/auth/auth.ts
+var SDK_VERSION2 = require_package().version;
+var CALLBACK_SCHEME2 = "onelorn";
 var ATTEST_WAIT_CAP_MS = 5e3;
 var _OneloAuth = class _OneloAuth {
   constructor(config, attestReady) {
@@ -1156,7 +1685,7 @@ var _OneloAuth = class _OneloAuth {
     this.apiUrl = config.apiUrl;
     this.publishableKey = config.publishableKey;
     this.bundleId = config.bundleId;
-    this._callbackScheme = config.callbackScheme || CALLBACK_SCHEME;
+    this._callbackScheme = config.callbackScheme || CALLBACK_SCHEME2;
     this.storage = new KeychainStorage();
     if (!config.bundleId) {
       void getNativeBundleId().then((nb) => {
@@ -1300,6 +1829,14 @@ var _OneloAuth = class _OneloAuth {
         }
         if (result.type === "error") {
           reject(import_core2.OneloError.server(result.message));
+          return;
+        }
+        if (result.type === "expired") {
+          try {
+            resolve(await this.loadAuthView());
+          } catch (e) {
+            reject(e);
+          }
           return;
         }
         try {
@@ -1684,6 +2221,31 @@ var _OneloAuth = class _OneloAuth {
     return session?.user.entitlement === "active";
   }
   /**
+   * May this person see the app?
+   *
+   * READ from the server, never computed here. The rule
+   * `!paywallEnabled || entitlement === 'active'` once lived in this SDK, in the
+   * JS SDK and in Swift — three copies, each found wrong on a different day. The
+   * JS copy answered `true` while its config was still loading, so a plan-less
+   * user walked into a paid app on every page load (2026-08-18).
+   * `/api/sdk/auth/user` now ships the conclusion so it cannot recur.
+   *
+   * The fallback is COMPATIBILITY, not a second source of truth: an older
+   * backend simply does not send `allowed_in`, and treating absent as `false`
+   * would lock every user out of an app running this SDK ahead of the backend.
+   * Delete it once the field is everywhere. Note `=== false`: the config flag is
+   * only trustworthy once resolved, so anything else must deny.
+   *
+   * Contract: docs/sdk-access-gate-wiring.md
+   */
+  async isAllowedIn() {
+    const session = await this.getSession();
+    if (!session) return false;
+    const answer = session.user.allowedIn;
+    if (typeof answer === "boolean") return answer;
+    return this.isPaywallEnabled() === false || session.user.entitlement === "active";
+  }
+  /**
    * Re-fetch the user's entitlement from the backend and, if it changed, rebuild
    * + persist + republish the session so `hasActiveAccess()` and auth-state
    * listeners see the new value. Call after an external checkout or on app
@@ -1705,9 +2267,15 @@ var _OneloAuth = class _OneloAuth {
         })
       );
       if (status !== 200) return session.user.entitlement;
-      const next = json["entitlement"] === "active" ? "active" : "none";
-      if (next !== session.user.entitlement && epoch === this.signOutEpoch) {
-        await this.saveSession({ ...session, user: { ...session.user, entitlement: next } });
+      const body = json;
+      const next = body["entitlement"] === "active" ? "active" : "none";
+      const nextAllowedIn = typeof body["allowed_in"] === "boolean" ? body["allowed_in"] : session.user.allowedIn;
+      const changed = next !== session.user.entitlement || nextAllowedIn !== session.user.allowedIn;
+      if (changed && epoch === this.signOutEpoch) {
+        await this.saveSession({
+          ...session,
+          user: { ...session.user, entitlement: next, allowedIn: nextAllowedIn }
+        });
       }
       return next;
     } catch {
@@ -1825,7 +2393,10 @@ var _OneloAuth = class _OneloAuth {
     await this.initPromise;
     const { status } = await (0, import_core2.httpPost)(
       `${this.apiUrl}/api/sdk/auth/magic-link`,
-      { email, publishableKey: this.publishableKey },
+      {
+        email,
+        publishableKey: this.publishableKey
+      },
       await this._secHeaders()
     );
     if (status !== 200) throw import_core2.OneloError.server(`sendMagicLink failed: HTTP ${status}`);
@@ -1838,6 +2409,67 @@ var _OneloAuth = class _OneloAuth {
       await this._secHeaders()
     );
     if (status !== 200) throw import_core2.OneloError.server(`sendPasswordReset failed: HTTP ${status}`);
+  }
+  /**
+   * Complete a hosted-auth flow that finished OUTSIDE this app's own UI — a
+   * magic link opened in the system browser is the reason this exists. Call it
+   * from your app ROOT's own `Linking.addEventListener('url', …)` (in addition
+   * to, not instead of, rendering `<AuthModal>` off `getModalState()`).
+   *
+   * `<AuthModal>`'s OWN `Linking` listener only runs while it is visible/mounted
+   * (`auth-modal.tsx:298-308`, guarded `if (!visible …) return`) — a flow that
+   * finishes while the modal happens to be unmounted (navigated away, or the
+   * developer's own "Check your inbox" screen is shown via `sendMagicLink()`
+   * instead of the hosted modal) had nowhere to land: the code/gate value was
+   * silently dropped. React Native was the only Onelo SDK without a public,
+   * modal-lifetime-independent entry point for this — Swift's
+   * `handleAuthCallback`, Electron's `handleDeepLink`, Android's
+   * `Onelo.handleRedirect` and Flutter's internal `app_links` listener all
+   * already work regardless of whether their own presenting UI is on-screen.
+   *
+   * Two cases:
+   *  - A `loadAuthView()` call is still pending (`_modalResolve` set): hand the
+   *    outcome to the SAME parked resolver `<AuthModal>` would have used —
+   *    `code`/`expired`/`error` settle it directly; a `gate` refusal (origin-
+   *    checked against the flow's own hosted URL, exactly like `<AuthModal>`)
+   *    re-presents the modal on the refusal surface instead of the sign-in page.
+   *  - No flow is pending — the code came from a `sendMagicLink()` flow using a
+   *    developer-built "Check your inbox" screen, not the hosted modal.
+   *    Exchanges the code directly and returns the session.
+   *
+   * Does NOT recover a flow whose PROCESS was killed and relaunched — the
+   * in-memory `_modalResolve`/`pkceVerifier` are gone either way, the same
+   * limitation every other Onelo SDK's live-process shortcut has.
+   *
+   * Returns the session when this call itself completed the exchange (the
+   * no-pending-flow case); `null` when the URL wasn't ours, or when a pending
+   * `loadAuthView()` flow was handed the outcome and will resolve on its own.
+   */
+  async handleAuthCallback(url) {
+    await this.initPromise;
+    const parsed = parseCallbackDeepLink(url, this._callbackScheme);
+    if (!parsed || parsed.host !== "callback") return null;
+    const { code, gate, error: errParam } = parsed.params;
+    if (this._modalResolve) {
+      if (gate) {
+        if (isOneloHostedSurface(gate, this._modalUrl)) {
+          this._modalUrl = gate;
+          this._modalVisible = true;
+          this.notifyModalListeners();
+        } else {
+          this._modalResolve({ type: "error", message: "Refused a sign-in surface from an unknown origin" });
+        }
+      } else if (code) {
+        this._modalResolve({ type: "code", code });
+      } else if (isExpiredAuthError(errParam)) {
+        this._modalResolve({ type: "expired" });
+      } else if (errParam) {
+        this._modalResolve({ type: "error", message: errParam });
+      }
+      return null;
+    }
+    if (code) return this.exchangeHostedCode(code);
+    return null;
   }
 };
 _OneloAuth.HEARTBEAT_MS = 13 * 60 * 1e3;
@@ -3055,7 +3687,7 @@ var OneloWaitlist = class {
 var import_core4 = __toESM(require_dist());
 init_sdk_headers();
 var SDK_VERSION4 = require_package().version;
-var CALLBACK_SCHEME2 = "onelorn";
+var CALLBACK_SCHEME3 = "onelorn";
 var PORTAL_REVOKE_EVENTS = /* @__PURE__ */ new Set([
   "account_deletion_scheduled",
   "account_revoked",
@@ -3071,7 +3703,7 @@ var OneloCustomerPortal = class {
    *   account revoked, session compromised) so `auth.isUserRevoked` is set.
    *   Parity with Swift `portalRevokeEvents` + guard #9.
    */
-  constructor(apiUrl, publishableKey, bundleId, getAccessToken, signOut, onRevoked, pageBackgroundColor = () => "#111111", callbackScheme = CALLBACK_SCHEME2) {
+  constructor(apiUrl, publishableKey, bundleId, getAccessToken, signOut, onRevoked, pageBackgroundColor = () => "#111111", callbackScheme = CALLBACK_SCHEME3) {
     this._modalVisible = false;
     this._modalUrl = "";
     this._modalResolve = null;
@@ -3350,7 +3982,7 @@ var OneloConsent = class {
 var import_core6 = __toESM(require_dist());
 init_sdk_headers();
 var SDK_VERSION5 = require_package().version;
-var CALLBACK_SCHEME3 = "onelorn";
+var CALLBACK_SCHEME4 = "onelorn";
 var OneloStore = class {
   /**
    * @param exchangeCode Injected by `Onelo` — exchanges the hosted-flow one-time
@@ -3358,7 +3990,7 @@ var OneloStore = class {
    *   auth-state listeners fire). Delegates to the auth module's hosted-callback
    *   exchange. Required for `open()` to complete a purchase.
    */
-  constructor(apiUrl, publishableKey, bundleId, getAccessToken, exchangeCode, pageBackgroundColor = () => "#111111", callbackScheme = CALLBACK_SCHEME3) {
+  constructor(apiUrl, publishableKey, bundleId, getAccessToken, exchangeCode, pageBackgroundColor = () => "#111111", callbackScheme = CALLBACK_SCHEME4) {
     this._modalVisible = false;
     this._modalUrl = "";
     this._modalResolve = null;
@@ -3396,8 +4028,7 @@ var OneloStore = class {
     );
     if (status === 401) throw import_core6.OneloError.invalidKey("Store rejected the publishable key");
     if (status !== 200) {
-      const j = json;
-      const code = j?.error ?? j?.detail;
+      const code = (0, import_core6.extractErrorCode)(json);
       throw import_core6.OneloError.server(`Failed to initiate store flow: HTTP ${status}${code ? ` (${code})` : ""}`);
     }
     const storeUrl = json["store_url"];
@@ -3458,8 +4089,7 @@ var OneloStore = class {
     const { status, json } = await (0, import_core6.httpGet)(url, await this._secHeaders({ Authorization: `Bearer ${token}` }));
     if (status === 401) throw import_core6.OneloError.notAuthenticated();
     if (status !== 200) {
-      const j = json;
-      const code = j?.error ?? j?.detail;
+      const code = (0, import_core6.extractErrorCode)(json);
       throw import_core6.OneloError.server(`Failed to initiate upgrade: HTTP ${status}${code ? ` (${code})` : ""}`);
     }
     const upgradeUrl = json["upgrade_url"];
@@ -4035,442 +4665,6 @@ var Onelo = class {
   }
 };
 
-// src/auth/auth-modal.tsx
-var import_react2 = __toESM(require("react"));
-
-// src/auth/webview-oauth.ts
-var OAUTH_PROVIDER_HOSTS = ["github.com", "accounts.google.com", "appleid.apple.com"];
-var OAUTH_INIT_PATH_RE = /^\/api\/sdk\/auth\/oauth\/(github|google|apple)(\/|$|\?)/;
-function parseOAuthMessage(data) {
-  try {
-    const msg = JSON.parse(data);
-    if (msg["type"] === "onelo:native_oauth" && typeof msg["provider"] === "string" && typeof msg["token"] === "string") {
-      return { type: "native_oauth", provider: msg["provider"], token: msg["token"] };
-    }
-    if (msg["type"] === "onelo:native_oauth_url" && typeof msg["url"] === "string") {
-      return { type: "native_oauth_url", url: msg["url"] };
-    }
-    return null;
-  } catch {
-    return null;
-  }
-}
-function parseCallbackDeepLink(url, scheme) {
-  const prefix = `${scheme}://`;
-  if (!url.toLowerCase().startsWith(prefix.toLowerCase())) return null;
-  let rest = url.slice(prefix.length);
-  let query = "";
-  const q = rest.indexOf("?");
-  if (q !== -1) {
-    query = rest.slice(q + 1);
-    rest = rest.slice(0, q);
-  }
-  const slash = rest.indexOf("/");
-  const host = (slash === -1 ? rest : rest.slice(0, slash)).toLowerCase();
-  const params = {};
-  for (const part of query.split("&")) {
-    if (!part) continue;
-    const eq = part.indexOf("=");
-    const k = eq === -1 ? part : part.slice(0, eq);
-    const v = eq === -1 ? "" : part.slice(eq + 1);
-    if (k) {
-      try {
-        params[decodeURIComponent(k)] = decodeURIComponent(v);
-      } catch {
-        params[k] = v;
-      }
-    }
-  }
-  return { host, params };
-}
-function httpHostPath(url) {
-  const m = /^https?:\/\/([^/?#]+)([^?#]*)/i.exec(url);
-  if (!m) return null;
-  return { host: m[1].toLowerCase().replace(/:\d+$/, ""), path: m[2] || "/" };
-}
-function isOAuthNavigation(url) {
-  const hp = httpHostPath(url);
-  if (!hp) return false;
-  return OAUTH_PROVIDER_HOSTS.includes(hp.host) || OAUTH_INIT_PATH_RE.test(hp.path);
-}
-function withOAuthPreauth(url, preauth) {
-  const [beforeHash, hash] = url.split("#");
-  const qIdx = beforeHash.indexOf("?");
-  const path = qIdx === -1 ? beforeHash : beforeHash.slice(0, qIdx);
-  const query = qIdx === -1 ? "" : beforeHash.slice(qIdx + 1);
-  const kept = query.split("&").filter((p) => p && !/^oauth_(preauth|code|error)=/i.test(p));
-  kept.push(`oauth_preauth=${encodeURIComponent(preauth)}`);
-  return `${path}?${kept.join("&")}${hash ? `#${hash}` : ""}`;
-}
-function buildHostedInitUrl(apiUrl, provider, token) {
-  return `${apiUrl}/api/sdk/auth/oauth/hosted-init?provider=${encodeURIComponent(provider)}&token=${encodeURIComponent(token)}`;
-}
-var OAUTH_RELAY_SCRIPT = `
-(function () {
-  function forward(d) {
-    try {
-      if (typeof d === 'string') { d = JSON.parse(d); }
-      // Forward the OAuth hand-off AND the hosted-flow success/cancel codes. The
-      // hosted store's sendSuccess() posts { type:'onelo:code', code } to
-      // window.parent \u2014 which, inside react-native-webview, is window itself, so it
-      // fires a same-window 'message' event that ONLY reaches the native side if we
-      // relay it to ReactNativeWebView.postMessage here. Without this, an in-WebView
-      // store purchase renders "You're in!" but the code never reaches the app \u2192
-      // no exchange, no auto-login.
-      if (d && (
-        d.type === 'onelo:native_oauth' ||
-        d.type === 'onelo:native_oauth_url' ||
-        d.type === 'onelo:code' ||
-        d.type === 'onelo:cancelled' ||
-        // #40 Phase 2 \u2014 the hosted page signals it has mounted so the host can hide
-        // its native fail-safe \u2715 (used by the customer-portal modal; auth/store
-        // ignore it). The canonical \u2715 is then owned by the hosted page.
-        d.type === 'onelo:ready'
-      )) {
-        window.ReactNativeWebView.postMessage(JSON.stringify(d));
-      }
-    } catch (err) { /* ignore non-JSON page messages */ }
-  }
-  window.addEventListener('message', function (e) { forward(e.data); });
-  true;
-})();
-`;
-function openInSystemBrowser(Linking, url, onError) {
-  Linking.openURL(url).catch(() => onError());
-}
-
-// src/auth/auth-skeleton.tsx
-var import_react = __toESM(require("react"));
-function authSkeletonHtml(socialCount, backgroundColor, redirectTo) {
-  const n = Math.max(0, Math.min(4, Math.floor(socialCount || 0)));
-  const bg = backgroundColor || "#111111";
-  const redirect = redirectTo ? `<script>requestAnimationFrame(function(){requestAnimationFrame(function(){location.replace(${JSON.stringify(redirectTo)})})})</script>` : "";
-  const pills = Array.from({ length: n }).map(() => '<div class="onelo-skel-strong pill"></div>').join("");
-  const divider = n > 0 ? '<div class="divider"><span class="dline"></span><span class="onelo-skel dtext"></span><span class="dline"></span></div>' : "";
-  return `<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
-<style>
-*{box-sizing:border-box;margin:0;padding:0}
-html,body{height:100%}
-body{background:${bg};font-family:-apple-system,BlinkMacSystemFont,sans-serif;overflow:hidden}
-.wrap{display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:100vh;width:100%;padding:48px 24px}
-.col{width:100%;max-width:300px;display:flex;flex-direction:column;gap:10px}
-.onelo-skel{background-color:rgba(255,255,255,0.04);background-image:linear-gradient(90deg,rgba(255,255,255,0) 0%,rgba(255,255,255,0.14) 50%,rgba(255,255,255,0) 100%);background-size:60vw 100%;background-repeat:no-repeat;background-position:-100vw 0;border-radius:8px}
-.onelo-skel-strong{background-color:rgba(255,255,255,0.08);background-image:linear-gradient(90deg,rgba(255,255,255,0) 0%,rgba(255,255,255,0.20) 50%,rgba(255,255,255,0) 100%);background-size:60vw 100%;background-repeat:no-repeat;background-position:-100vw 0;border-radius:9px}
-.icon{width:64px;height:64px;border-radius:14px;margin-bottom:14px}
-.title{width:200px;height:22px;margin-bottom:10px;border-radius:6px}
-.sub{width:140px;height:13px;opacity:0.7;margin-bottom:28px;border-radius:4px}
-.pill{height:44px;border-radius:9px}
-.divider{display:flex;align-items:center;gap:12px;margin:16px 0 4px}
-.dline{flex:1;height:1px;background:rgba(255,255,255,0.1)}
-.dtext{width:14px;height:11px;opacity:0.5}
-.lbl{width:38px;height:11px}
-.input{height:44px}
-.lblrow{display:flex;justify-content:space-between;align-items:center}
-.lbl2{width:58px;height:11px}
-.forgot{width:90px;height:11px;opacity:0.7}
-.cta{height:48px;border-radius:10px;margin-top:6px}
-.signup{width:200px;height:12px;opacity:0.6;border-radius:4px;margin:6px auto 0}
-</style></head><body>
-<div class="wrap" aria-hidden="true">
-<div class="onelo-skel icon"></div>
-<div class="onelo-skel title"></div>
-<div class="onelo-skel sub"></div>
-<div class="col">
-${pills}${divider}
-<div class="onelo-skel lbl"></div>
-<div class="onelo-skel-strong input"></div>
-<div class="lblrow"><div class="onelo-skel lbl2"></div><div class="onelo-skel forgot"></div></div>
-<div class="onelo-skel-strong input"></div>
-<div class="onelo-skel-strong cta"></div>
-<div class="onelo-skel signup"></div>
-</div>
-</div>
-<script>(function(){var D=2400,BW=60;var q=function(){return document.querySelectorAll('.onelo-skel,.onelo-skel-strong')};var s=performance.now();function tick(now){var vw=window.innerWidth;var bpx=vw*(BW/100);var span=vw+bpx;var p=((now-s)%D)/D;var bx=-bpx+p*span;q().forEach(function(el){var r=el.getBoundingClientRect();el.style.backgroundPositionX=(bx-r.left)+'px'});requestAnimationFrame(tick)}requestAnimationFrame(tick)})();</script>
-${redirect}
-</body></html>`;
-}
-function AuthSkeleton({ socialCount = 0, backgroundColor = "#111111" }) {
-  const RN = require("react-native");
-  const { WebView } = require("react-native-webview");
-  const { View } = RN;
-  const html = authSkeletonHtml(socialCount, backgroundColor);
-  return import_react.default.createElement(
-    View,
-    // pointerEvents none: it's a placeholder — never swallow touches (so the
-    // AuthModal close ✕ layered above it stays tappable).
-    { style: { flex: 1, backgroundColor }, pointerEvents: "none" },
-    import_react.default.createElement(WebView, {
-      source: { html },
-      originWhitelist: ["*"],
-      scrollEnabled: false,
-      showsVerticalScrollIndicator: false,
-      showsHorizontalScrollIndicator: false,
-      // Kill the react-native-webview white default paint before first render.
-      backgroundColor,
-      style: { flex: 1, backgroundColor }
-    })
-  );
-}
-
-// src/auth/auth-modal.tsx
-var CALLBACK_SCHEME4 = "onelorn";
-function parseModalMessage(data) {
-  try {
-    const msg = JSON.parse(data);
-    if (msg["type"] === "onelo:code" && typeof msg["code"] === "string") {
-      return { type: "code", code: msg["code"] };
-    }
-    if (msg["type"] === "onelo:cancelled") {
-      return { type: "cancelled" };
-    }
-    return null;
-  } catch {
-    return null;
-  }
-}
-function AuthModal({ visible, hostedUrl, onResult, apiUrl, backgroundColor, callbackScheme, socialCount = 0 }) {
-  const scheme = callbackScheme || CALLBACK_SCHEME4;
-  const RN = require("react-native");
-  const { WebView } = require("react-native-webview");
-  const { Modal, View, StyleSheet, TouchableOpacity, Text, Linking, Platform, StatusBar } = RN;
-  const [error, setError] = (0, import_react2.useState)(false);
-  const [retryKey, setRetryKey] = (0, import_react2.useState)(0);
-  const [currentUrl, setCurrentUrl] = (0, import_react2.useState)(hostedUrl);
-  const resolvedRef = (0, import_react2.useRef)(false);
-  const webViewRef = (0, import_react2.useRef)(null);
-  const [canGoBack, setCanGoBack] = (0, import_react2.useState)(false);
-  const isStoreUrl = (u) => u.toLowerCase().includes("/store/");
-  const [onStore, setOnStore] = (0, import_react2.useState)(isStoreUrl(hostedUrl));
-  (0, import_react2.useEffect)(() => {
-    setCurrentUrl(hostedUrl);
-    resolvedRef.current = false;
-    setCanGoBack(false);
-    setOnStore(isStoreUrl(hostedUrl));
-  }, [hostedUrl, visible]);
-  const resolveOnce = (0, import_react2.useCallback)(
-    (result) => {
-      if (resolvedRef.current) return;
-      resolvedRef.current = true;
-      onResult(result);
-    },
-    [onResult]
-  );
-  const handleCallbackUrl = (0, import_react2.useCallback)(
-    (url) => {
-      const parsed = parseCallbackDeepLink(url, scheme);
-      if (!parsed) return false;
-      if (parsed.host !== "callback") {
-        resolveOnce({ type: "error", message: "Auth callback URL has unexpected host" });
-        return true;
-      }
-      const { code, preauth, error: errParam } = parsed.params;
-      if (code) {
-        resolveOnce({ type: "code", code });
-      } else if (preauth) {
-        const preauthUrl = withOAuthPreauth(hostedUrl, preauth);
-        webViewRef.current?.injectJavaScript(
-          `window.location.replace(${JSON.stringify(preauthUrl)}); true;`
-        );
-      } else if (errParam) {
-        resolveOnce({ type: "error", message: errParam });
-      } else {
-        resolveOnce({ type: "error", message: "Auth callback missing code parameter" });
-      }
-      return true;
-    },
-    [resolveOnce, hostedUrl, scheme]
-  );
-  const openInSystemBrowser2 = (0, import_react2.useCallback)(
-    (url) => {
-      openInSystemBrowser(Linking, url, () => {
-        resolveOnce({ type: "error", message: "Could not open the sign-in browser" });
-      });
-    },
-    [Linking, resolveOnce]
-  );
-  const openOAuth = (0, import_react2.useCallback)(
-    (msg) => {
-      if (msg.type === "native_oauth_url") {
-        openInSystemBrowser2(msg.url);
-        return;
-      }
-      if (!apiUrl) return;
-      openInSystemBrowser2(buildHostedInitUrl(apiUrl, msg.provider, msg.token));
-    },
-    [apiUrl, openInSystemBrowser2]
-  );
-  const handleMessage = (0, import_react2.useCallback)(
-    (event) => {
-      const data = event.nativeEvent.data;
-      const parsed = parseModalMessage(data);
-      if (parsed) {
-        if (parsed.type === "code") resolveOnce({ type: "code", code: parsed.code });
-        else resolveOnce({ type: "cancelled" });
-        return;
-      }
-      const oauth = parseOAuthMessage(data);
-      if (oauth) openOAuth(oauth);
-    },
-    [resolveOnce, openOAuth]
-  );
-  const handleShouldStartLoad = (0, import_react2.useCallback)(
-    (request) => {
-      const url = request.url ?? "";
-      if (url.toLowerCase().startsWith(`${scheme}://`)) {
-        handleCallbackUrl(url);
-        return false;
-      }
-      if (isOAuthNavigation(url)) {
-        openInSystemBrowser2(url);
-        return false;
-      }
-      return true;
-    },
-    [handleCallbackUrl, openInSystemBrowser2, scheme]
-  );
-  const handleNavChange = (0, import_react2.useCallback)(
-    (navState) => {
-      const url = navState.url ?? "";
-      if (url.toLowerCase().startsWith(`${scheme}://`)) handleCallbackUrl(url);
-      setCanGoBack(!!navState.canGoBack);
-      setOnStore(isStoreUrl(url));
-    },
-    [handleCallbackUrl, scheme]
-  );
-  (0, import_react2.useEffect)(() => {
-    if (!visible || !Linking?.addEventListener) return;
-    const onUrl = (event) => {
-      if (event?.url) handleCallbackUrl(event.url);
-    };
-    const sub = Linking.addEventListener("url", onUrl);
-    return () => {
-      if (sub && typeof sub.remove === "function") sub.remove();
-      else if (Linking.removeEventListener) Linking.removeEventListener("url", onUrl);
-    };
-  }, [visible, Linking, handleCallbackUrl]);
-  const handleError = (0, import_react2.useCallback)(() => {
-    setError(true);
-  }, []);
-  const handleRetry = (0, import_react2.useCallback)(() => {
-    setError(false);
-    setCurrentUrl(hostedUrl);
-    setRetryKey((k) => k + 1);
-  }, [hostedUrl]);
-  const handleCancel = (0, import_react2.useCallback)(() => {
-    resolveOnce({ type: "cancelled" });
-  }, [resolveOnce]);
-  const handleBackOrCancel = (0, import_react2.useCallback)(() => {
-    if (!isStoreUrl(hostedUrl) && canGoBack) webViewRef.current?.goBack();
-    else handleCancel();
-  }, [hostedUrl, canGoBack, handleCancel]);
-  const bg = backgroundColor || "#111111";
-  const styles = StyleSheet.create({
-    container: { flex: 1, backgroundColor: bg },
-    webview: { flex: 1, backgroundColor: bg },
-    errorContainer: { flex: 1, justifyContent: "center", alignItems: "center", gap: 16 },
-    retryButton: { backgroundColor: "#ffffff", paddingHorizontal: 32, paddingVertical: 14, borderRadius: 8 },
-    retryText: { color: "#000000", fontSize: 16, fontWeight: "600" },
-    cancelButton: { paddingHorizontal: 32, paddingVertical: 14 },
-    cancelText: { color: "#ffffff", fontSize: 16 },
-    // #27 — persistent close affordance in the NORMAL flow (the hosted page,
-    // e.g. the store, may not render its own cancel → user was trapped and had
-    // to kill the app). Top-trailing, cleared past the notch/status bar.
-    closeButton: {
-      position: "absolute",
-      top: Platform.OS === "ios" ? 52 : (StatusBar.currentHeight ?? 24) + 8,
-      right: 16,
-      width: 36,
-      height: 36,
-      borderRadius: 18,
-      backgroundColor: "rgba(0,0,0,0.4)",
-      justifyContent: "center",
-      alignItems: "center",
-      zIndex: 10
-    },
-    closeText: { color: "#ffffff", fontSize: 19, fontWeight: "600", lineHeight: 21 }
-  });
-  return import_react2.default.createElement(
-    Modal,
-    {
-      visible,
-      // #28 — 'none' (not 'slide'): the modal's loading skeleton is PIXEL-IDENTICAL
-      // to the gate's skeleton it appears over (same HTML, bg, socialCount), so a
-      // slide-in reads as a jarring "second load / jump". Swapping in place makes
-      // the gate→modal skeleton hand-off seamless (one continuous surface).
-      animationType: "none",
-      presentationStyle: "fullScreen",
-      // #27 — Android hardware back: step back in the hosted flow, else cancel.
-      onRequestClose: handleBackOrCancel
-    },
-    import_react2.default.createElement(
-      View,
-      { style: styles.container },
-      !error && import_react2.default.createElement(WebView, {
-        // Route the custom callback scheme THROUGH onShouldStartLoadWithRequest
-        // (where handleShouldStartLoad extracts the one-time code + returns false).
-        // Without the scheme whitelisted, react-native-webview shunts
-        // `onelorn://callback?code=…` to Linking.openURL ("Can't open url" when the
-        // scheme isn't registered) and the in-WebView interceptor is bypassed — the
-        // code is lost and sign-in never completes. http/https keep normal page loads.
-        originWhitelist: ["http://*", "https://*", `${scheme}://*`],
-        // Ephemeral session — RN analogue of Swift's `websiteDataStore =
-        // .nonPersistent()`. Auth cookies/localStorage/cache must NOT survive the
-        // modal or the app restart: otherwise a half-finished or expired hosted
-        // flow leaves stale state the page reloads into ("session expired" on a
-        // supposedly-fresh start, requiring a manual data clear).
-        incognito: true,
-        ref: webViewRef,
-        key: retryKey,
-        // #28 single-WebView: load the skeleton HTML, which `location.replace()`s
-        // to the hosted URL after it paints. ONE WebView shows the skeleton then
-        // the page — no separate overlay instance, no slide, no jump. The skeleton
-        // stays visible during the network load until the hosted page paints.
-        source: { html: authSkeletonHtml(socialCount, bg, currentUrl) },
-        onError: handleError,
-        onMessage: handleMessage,
-        injectedJavaScript: OAUTH_RELAY_SCRIPT,
-        onShouldStartLoadWithRequest: handleShouldStartLoad,
-        onNavigationStateChange: handleNavChange,
-        style: styles.webview,
-        // Native WebView bg (separate from style) — react-native-webview paints
-        // white by default before first paint; set it to the branding bg to kill
-        // the flash on both iOS and Android.
-        backgroundColor: bg
-      }),
-      // #27 — ✕ shown ONLY on the store ("Choose your plan"), never on the entry
-      // sign-in form. Reached via "Sign Up" → it steps BACK to the sign-in form
-      // (has history); reached as the entry page (signed-in-but-unentitled) → it
-      // cancels out (no history). Either way the user is never trapped. Rendered
-      // LAST so it sits on top of the WebView + skeleton overlay (pointerEvents:none).
-      !error && onStore && import_react2.default.createElement(
-        TouchableOpacity,
-        {
-          style: styles.closeButton,
-          onPress: handleBackOrCancel,
-          accessibilityRole: "button",
-          accessibilityLabel: canGoBack ? "Back" : "Close",
-          hitSlop: { top: 8, bottom: 8, left: 8, right: 8 }
-        },
-        import_react2.default.createElement(Text, { style: styles.closeText }, "\u2715")
-      ),
-      error && import_react2.default.createElement(
-        View,
-        { style: styles.errorContainer },
-        import_react2.default.createElement(
-          TouchableOpacity,
-          { style: styles.retryButton, onPress: handleRetry },
-          import_react2.default.createElement(Text, { style: styles.retryText }, "Sign In")
-        ),
-        import_react2.default.createElement(
-          TouchableOpacity,
-          { style: styles.cancelButton, onPress: handleCancel },
-          import_react2.default.createElement(Text, { style: styles.cancelText }, "Cancel")
-        )
-      )
-    )
-  );
-}
-
 // src/auth/OneloAuthGate.tsx
 var import_react4 = __toESM(require("react"));
 var import_core7 = __toESM(require_dist());
@@ -4496,8 +4690,8 @@ function errorMessage(e) {
 }
 function OneloAuthGate({ onelo, children, fallback }) {
   const RN = require("react-native");
-  const { View, StyleSheet, TouchableOpacity, Text, AppState } = RN;
-  const [state, setState] = (0, import_react4.useState)({ resolved: false, allowedIn: false });
+  const { View, StyleSheet, TouchableOpacity, Text, AppState, Linking } = RN;
+  const [state, setState] = (0, import_react4.useState)({ resolved: false, allowedIn: false, signedIn: false });
   const [restoring, setRestoring] = (0, import_react4.useState)(true);
   const [retry, setRetry] = (0, import_react4.useState)(null);
   const modal = useModalState(onelo.auth);
@@ -4511,7 +4705,7 @@ function OneloAuthGate({ onelo, children, fallback }) {
     const entitled = session?.user.entitlement === "active";
     const allowedIn = signedIn && (!paywallEnabled || entitled);
     if (!mountedRef.current) return;
-    setState({ resolved: true, allowedIn });
+    setState({ resolved: true, allowedIn, signedIn });
     setRestoring(false);
   }, [onelo]);
   const driveFlow = (0, import_react4.useCallback)(async () => {
@@ -4547,12 +4741,21 @@ function OneloAuthGate({ onelo, children, fallback }) {
       }
     };
     const appSub = AppState && typeof AppState.addEventListener === "function" ? AppState.addEventListener("change", handleAppState) : void 0;
+    const onUrl = (event) => {
+      if (event?.url) void onelo.auth.handleAuthCallback(event.url).catch(() => {
+      });
+    };
+    const linkingSub = Linking && typeof Linking.addEventListener === "function" ? Linking.addEventListener("url", onUrl) : void 0;
     return () => {
       mountedRef.current = false;
       unsubAuth();
       if (appSub && typeof appSub.remove === "function") appSub.remove();
       else if (AppState && typeof AppState.removeEventListener === "function") {
         AppState.removeEventListener("change", handleAppState);
+      }
+      if (linkingSub && typeof linkingSub.remove === "function") linkingSub.remove();
+      else if (Linking && typeof Linking.removeEventListener === "function") {
+        Linking.removeEventListener("url", onUrl);
       }
     };
   }, [onelo, recompute]);
@@ -4574,7 +4777,7 @@ function OneloAuthGate({ onelo, children, fallback }) {
     retryText: { color: "#000000", fontSize: 16, fontWeight: "600" }
   });
   const handleRetry = (0, import_react4.useCallback)(() => setRetry(null), []);
-  const preAuth = restoring && !state.resolved ? import_react4.default.createElement(View, { style: styles.restoringContainer }) : retry ? import_react4.default.createElement(
+  const preAuth = restoring && !state.resolved || state.signedIn && !state.allowedIn && !retry ? import_react4.default.createElement(View, { style: styles.restoringContainer }) : retry ? import_react4.default.createElement(
     View,
     { style: styles.retryContainer },
     retry.message ? import_react4.default.createElement(Text, { style: styles.errorText }, retry.message) : null,
@@ -5203,7 +5406,7 @@ function StoreModalView({ visible, hostedUrl, callbackScheme, apiUrl, onResult, 
         return;
       }
       if (!apiUrl) return;
-      openInSystemBrowser2(buildHostedInitUrl(apiUrl, msg.provider, msg.token));
+      openInSystemBrowser2(buildHostedInitUrl(apiUrl, msg.provider, msg.token, msg.intent));
     },
     [apiUrl, openInSystemBrowser2]
   );

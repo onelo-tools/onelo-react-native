@@ -180,6 +180,18 @@ type ModalResult = {
 } | {
     type: 'error';
     message: string;
+}
+/**
+ * The hosted page handed control back saying its addressing token is spent
+ * (`?error=invalid_token`). NOT an error: it is what "Use a different account"
+ * on the no-plan page sends after signing the user out, and what an idle
+ * expiry sends. Treating it as an error closed the modal and showed the user
+ * the literal string "invalid_token"; the correct response is to re-resolve
+ * the flow and reopen on a clean sign-in page. Parity with Swift's
+ * `onSessionExpired`.
+ */
+ | {
+    type: 'expired';
 };
 interface AuthModalProps {
     visible: boolean;
@@ -432,6 +444,25 @@ declare class OneloAuth {
      */
     hasActiveAccess(): Promise<boolean>;
     /**
+     * May this person see the app?
+     *
+     * READ from the server, never computed here. The rule
+     * `!paywallEnabled || entitlement === 'active'` once lived in this SDK, in the
+     * JS SDK and in Swift — three copies, each found wrong on a different day. The
+     * JS copy answered `true` while its config was still loading, so a plan-less
+     * user walked into a paid app on every page load (2026-08-18).
+     * `/api/sdk/auth/user` now ships the conclusion so it cannot recur.
+     *
+     * The fallback is COMPATIBILITY, not a second source of truth: an older
+     * backend simply does not send `allowed_in`, and treating absent as `false`
+     * would lock every user out of an app running this SDK ahead of the backend.
+     * Delete it once the field is everywhere. Note `=== false`: the config flag is
+     * only trustworthy once resolved, so anything else must deny.
+     *
+     * Contract: docs/sdk-access-gate-wiring.md
+     */
+    isAllowedIn(): Promise<boolean>;
+    /**
      * Re-fetch the user's entitlement from the backend and, if it changed, rebuild
      * + persist + republish the session so `hasActiveAccess()` and auth-state
      * listeners see the new value. Call after an external checkout or on app
@@ -476,6 +507,42 @@ declare class OneloAuth {
     private notifyModalListeners;
     sendMagicLink(email: string): Promise<void>;
     sendPasswordReset(email: string): Promise<void>;
+    /**
+     * Complete a hosted-auth flow that finished OUTSIDE this app's own UI — a
+     * magic link opened in the system browser is the reason this exists. Call it
+     * from your app ROOT's own `Linking.addEventListener('url', …)` (in addition
+     * to, not instead of, rendering `<AuthModal>` off `getModalState()`).
+     *
+     * `<AuthModal>`'s OWN `Linking` listener only runs while it is visible/mounted
+     * (`auth-modal.tsx:298-308`, guarded `if (!visible …) return`) — a flow that
+     * finishes while the modal happens to be unmounted (navigated away, or the
+     * developer's own "Check your inbox" screen is shown via `sendMagicLink()`
+     * instead of the hosted modal) had nowhere to land: the code/gate value was
+     * silently dropped. React Native was the only Onelo SDK without a public,
+     * modal-lifetime-independent entry point for this — Swift's
+     * `handleAuthCallback`, Electron's `handleDeepLink`, Android's
+     * `Onelo.handleRedirect` and Flutter's internal `app_links` listener all
+     * already work regardless of whether their own presenting UI is on-screen.
+     *
+     * Two cases:
+     *  - A `loadAuthView()` call is still pending (`_modalResolve` set): hand the
+     *    outcome to the SAME parked resolver `<AuthModal>` would have used —
+     *    `code`/`expired`/`error` settle it directly; a `gate` refusal (origin-
+     *    checked against the flow's own hosted URL, exactly like `<AuthModal>`)
+     *    re-presents the modal on the refusal surface instead of the sign-in page.
+     *  - No flow is pending — the code came from a `sendMagicLink()` flow using a
+     *    developer-built "Check your inbox" screen, not the hosted modal.
+     *    Exchanges the code directly and returns the session.
+     *
+     * Does NOT recover a flow whose PROCESS was killed and relaunched — the
+     * in-memory `_modalResolve`/`pkceVerifier` are gone either way, the same
+     * limitation every other Onelo SDK's live-process shortcut has.
+     *
+     * Returns the session when this call itself completed the exchange (the
+     * no-pending-flow case); `null` when the URL wasn't ours, or when a pending
+     * `loadAuthView()` flow was handed the outcome and will resolve on its own.
+     */
+    handleAuthCallback(url: string): Promise<OneloSession | null>;
 }
 
 type FeatureStatus = 'enabled' | 'disabled' | 'greyed' | 'hidden' | 'upsell' | 'new' | 'beta' | 'coming_soon';

@@ -4,6 +4,7 @@ import {
   parseOAuthMessage,
   parseCallbackDeepLink,
   isOAuthNavigation,
+  isOneloHostedSurface,
   withOAuthPreauth,
   buildHostedInitUrl,
   openInSystemBrowser as openBrowser,
@@ -22,15 +23,59 @@ declare const require: (id: string) => any
  */
 const CALLBACK_SCHEME = 'onelorn'
 
+/**
+ * Is this `?error=` value the hosted page saying its addressing token is spent?
+ *
+ * Exported so it can be tested against the REAL rule rather than a copy: the
+ * classification used to live inline inside `handleCallbackUrl`, which is bound
+ * to a React component, so a test could only re-implement it — and a test that
+ * re-implements the thing it is testing passes even after the behaviour is
+ * deleted.
+ *
+ * NOT a catch-all: a genuine failure (e.g. `attest_invalid`) must still reach
+ * the caller as an error. Reloading on every error would loop forever on one.
+ */
+export function isExpiredAuthError(err: string | null | undefined): boolean {
+  return err === 'invalid_token' || err === 'expired_token' || err === 'token_expired'
+}
+
 export type ModalResult =
   | { type: 'code'; code: string }
   | { type: 'cancelled' }
   | { type: 'error'; message: string }
+  /**
+   * The hosted page handed control back saying its addressing token is spent
+   * (`?error=invalid_token`). NOT an error: it is what "Use a different account"
+   * on the no-plan page sends after signing the user out, and what an idle
+   * expiry sends. Treating it as an error closed the modal and showed the user
+   * the literal string "invalid_token"; the correct response is to re-resolve
+   * the flow and reopen on a clean sign-in page. Parity with Swift's
+   * `onSessionExpired`.
+   */
+  | { type: 'expired' }
 
 export type ParsedMessage =
   | { type: 'code'; code: string }
   | { type: 'cancelled' }
   | null
+
+/**
+ * The store's native fail-safe ✕ shows ONLY while the hosted page hasn't
+ * confirmed it's ready AND the grace period elapsed — pulled out as a pure
+ * function so the rule is unit-testable without rendering the component (no
+ * RN render-testing infra in this package). Parity with Feedback/Portal's
+ * `showNativeClose`, minus their `loadError` branch: a store load error here
+ * swaps in a whole different retry screen with its own Cancel button, so
+ * `error` never belongs in this formula (the render site's `!error &&` guard
+ * keeps this out of that state already).
+ */
+export function shouldShowNativeStoreClose(opts: {
+  onStore: boolean
+  hostedReady: boolean
+  failSafeArmed: boolean
+}): boolean {
+  return opts.onStore && !opts.hostedReady && opts.failSafeArmed
+}
 
 export function parseModalMessage(data: string): ParsedMessage {
   try {
@@ -102,6 +147,17 @@ export function AuthModal({ visible, hostedUrl, onResult, apiUrl, backgroundColo
   // page (signed-in-but-unentitled → no history → ✕ cancels out).
   const isStoreUrl = (u: string) => u.toLowerCase().includes('/store/')
   const [onStore, setOnStore] = useState(isStoreUrl(hostedUrl))
+  // #40 Phase 2 parity (FeedbackModal / CustomerPortalModal) — true once the
+  // hosted store page posts `onelo:ready`. While false, this ✕ is a FAIL-SAFE
+  // for the pre-load/error window; once the hosted page is up, ITS canonical
+  // ✕ (StoreExitX) owns the affordance and this one hides. Before this fix
+  // BOTH stayed on screen for the whole store visit — two overlapping circles
+  // (reported 2026-08-20). Only the store gets a native ✕ at all (`onStore`),
+  // so this only needs to matter there.
+  const [hostedReady, setHostedReady] = useState(false)
+  // #44 parity — arm the fail-safe only after a short grace so a normal fast
+  // load (which posts `onelo:ready` first) never flashes the native ✕.
+  const [failSafeArmed, setFailSafeArmed] = useState(false)
 
   // Reset per-open state whenever a new hosted flow is presented.
   useEffect(() => {
@@ -109,7 +165,18 @@ export function AuthModal({ visible, hostedUrl, onResult, apiUrl, backgroundColo
     resolvedRef.current = false
     setCanGoBack(false)
     setOnStore(isStoreUrl(hostedUrl))
+    setHostedReady(false)
+    setFailSafeArmed(false)
   }, [hostedUrl, visible])
+
+  // #44 parity — grace timer for the fail-safe ✕, reset on every new open.
+  useEffect(() => {
+    if (!visible) return
+    const t = setTimeout(() => setFailSafeArmed(true), 3500)
+    return () => clearTimeout(t)
+  }, [visible, hostedUrl])
+
+  const showNativeStoreClose = shouldShowNativeStoreClose({ onStore, hostedReady, failSafeArmed })
 
   const resolveOnce = useCallback(
     (result: ModalResult) => {
@@ -135,8 +202,27 @@ export function AuthModal({ visible, hostedUrl, onResult, apiUrl, backgroundColo
         resolveOnce({ type: 'error', message: 'Auth callback URL has unexpected host' })
         return true
       }
-      const { code, preauth, error: errParam } = parsed.params
-      if (code) {
+      const { code, preauth, gate, error: errParam } = parsed.params
+      if (gate) {
+        // An Access Gate REFUSAL, not a sign-in: there is deliberately no code.
+        // WHICH screen is owed — the store or "No active plan" — was decided
+        // server-side; this SDK only carries the URL and shows it.
+        //
+        // Without this branch the refusal died here (no code, no error, so it
+        // fell through to "missing code parameter") while the browser tab held
+        // the real answer and the app waited on "Check your inbox" forever —
+        // the exact failure fixed in Swift and Flutter on 2026-08-19.
+        //
+        // Navigated IN PLACE like the preauth path above: changing the React
+        // `source` would re-flash the skeleton.
+        if (isOneloHostedSurface(gate, hostedUrl)) {
+          webViewRef.current?.injectJavaScript(
+            `window.location.replace(${JSON.stringify(gate)}); true;`,
+          )
+        } else {
+          resolveOnce({ type: 'error', message: 'Refused a sign-in surface from an unknown origin' })
+        }
+      } else if (code) {
         resolveOnce({ type: 'code', code })
       } else if (preauth) {
         // Paid-product store flow: OAuth succeeded + account provisioned, but the
@@ -153,6 +239,8 @@ export function AuthModal({ visible, hostedUrl, onResult, apiUrl, backgroundColo
         webViewRef.current?.injectJavaScript(
           `window.location.replace(${JSON.stringify(preauthUrl)}); true;`,
         )
+      } else if (isExpiredAuthError(errParam)) {
+        resolveOnce({ type: 'expired' })
       } else if (errParam) {
         resolveOnce({ type: 'error', message: errParam })
       } else {
@@ -186,7 +274,7 @@ export function AuthModal({ visible, hostedUrl, onResult, apiUrl, backgroundColo
       // baseUrl; if the host didn't thread it, we can't build the URL — the
       // navigation-diversion path handles the hosted page's location.href fallback.
       if (!apiUrl) return
-      openInSystemBrowser(buildHostedInitUrl(apiUrl, msg.provider, msg.token))
+      openInSystemBrowser(buildHostedInitUrl(apiUrl, msg.provider, msg.token, msg.intent))
     },
     [apiUrl, openInSystemBrowser],
   )
@@ -201,6 +289,15 @@ export function AuthModal({ visible, hostedUrl, onResult, apiUrl, backgroundColo
         else resolveOnce({ type: 'cancelled' })
         return
       }
+      // #40 Phase 2 — hosted page mounted → hide the native fail-safe store ✕
+      // (its own canonical StoreExitX takes over). parseModalMessage only
+      // recognises code/cancelled, so this is read directly.
+      try {
+        if ((JSON.parse(data) as { type?: unknown })?.type === 'onelo:ready') {
+          setHostedReady(true)
+          return
+        }
+      } catch { /* not JSON — fall through */ }
       const oauth = parseOAuthMessage(data)
       if (oauth) openOAuth(oauth)
     },
@@ -367,7 +464,10 @@ export function AuthModal({ visible, hostedUrl, onResult, apiUrl, backgroundColo
       // (has history); reached as the entry page (signed-in-but-unentitled) → it
       // cancels out (no history). Either way the user is never trapped. Rendered
       // LAST so it sits on top of the WebView + skeleton overlay (pointerEvents:none).
-      !error && onStore && React.createElement(TouchableOpacity, {
+      // #40 Phase 2 — FAIL-SAFE only: once the hosted store page posts
+      // `onelo:ready`, ITS canonical ✕ (StoreExitX) takes over and this hides,
+      // so the two stop overlapping (reported 2026-08-20).
+      !error && showNativeStoreClose && React.createElement(TouchableOpacity, {
         style: styles.closeButton,
         onPress: handleBackOrCancel,
         accessibilityRole: 'button',

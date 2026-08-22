@@ -23,7 +23,7 @@ export const OAUTH_INIT_PATH_RE = /^\/api\/sdk\/auth\/oauth\/(github|google|appl
  *  already called `/store-oauth-init`). Swift parity (`onelo:native_oauth` /
  *  `onelo:native_oauth_url` in `userContentController`). */
 export type ParsedOAuthMessage =
-  | { type: 'native_oauth'; provider: string; token: string }
+  | { type: 'native_oauth'; provider: string; token: string; intent?: string }
   | { type: 'native_oauth_url'; url: string }
   | null
 
@@ -35,7 +35,15 @@ export function parseOAuthMessage(data: string): ParsedOAuthMessage {
       typeof msg['provider'] === 'string' &&
       typeof msg['token'] === 'string'
     ) {
-      return { type: 'native_oauth', provider: msg['provider'] as string, token: msg['token'] as string }
+      return {
+        type: 'native_oauth',
+        provider: msg['provider'] as string,
+        token: msg['token'] as string,
+        // WHICH BUTTON the user pressed. Carried, never decided here — see
+        // buildHostedInitUrl. Absent on an older hosted page, which the URL
+        // builder treats as a sign-in (the safe default).
+        intent: typeof msg['intent'] === 'string' ? (msg['intent'] as string) : undefined,
+      }
     }
     if (msg['type'] === 'onelo:native_oauth_url' && typeof msg['url'] === 'string') {
       return { type: 'native_oauth_url', url: msg['url'] as string }
@@ -56,6 +64,34 @@ export function parseOAuthMessage(data: string): ParsedOAuthMessage {
  * it a stored XSS on the hosted page could navigate to `onelorn://anything?code=X`
  * and smuggle an arbitrary code into the exchange (Swift parity, guard #6).
  */
+/**
+ * Is this deep-linked gate URL one of Onelo's own hosted surfaces?
+ *
+ * A magic link the Access Gate turns down carries no code, by design — the
+ * backend withholds it rather than let the app decide. The refusal travels as
+ * `<scheme>://callback?gate=<url>` and is then LOADED in the app's own sign-in
+ * WebView, and any app on the device can fire a custom scheme at us. So the URL
+ * is checked against an origin the BACKEND named, never accepted on trust.
+ *
+ * The anchor is the hosted URL this flow is already showing — `/flow/init` gave
+ * it to us moments ago. No persistence needed: a gate refusal can only arrive
+ * while a hosted flow is open.
+ *
+ * Fails CLOSED — non-https, unparsable, or a different host all answer false. A
+ * false negative costs one re-resolve back to sign-in; a false positive renders
+ * an attacker's page inside this app.
+ */
+export function isOneloHostedSurface(gateUrl: string, hostedUrl: string): boolean {
+  try {
+    const gate = new URL(gateUrl)
+    const anchor = new URL(hostedUrl)
+    if (gate.protocol !== 'https:') return false
+    return gate.host.toLowerCase() === anchor.host.toLowerCase()
+  } catch {
+    return false
+  }
+}
+
 export function parseCallbackDeepLink(
   url: string,
   scheme: string,
@@ -128,10 +164,25 @@ export function withOAuthPreauth(url: string, preauth: string): string {
  * requires `key` + `redirect_uri` + `code_challenge` and 422s on a plain token —
  * do NOT target it here (shared-with-Swift bug; RN fixes it).
  */
-export function buildHostedInitUrl(apiUrl: string, provider: string, token: string): string {
+export function buildHostedInitUrl(
+  apiUrl: string,
+  provider: string,
+  token: string,
+  intent?: string,
+): string {
+  // `intent` decides whether the backend may CREATE an account. OAuth returns a
+  // verified identity and never an intention, so the backend defaults to
+  // `signin`, which refuses to create one — and a sign-up that fails to say so
+  // is silently downgraded into "This account isn't registered", whichever
+  // button the user pressed (found on Flutter, 2026-08-19; this builder had the
+  // same hole).
+  //
+  // Only the value the backend defines travels; anything else falls back to the
+  // safe default. This function CARRIES the intent — the hosted page decided it.
+  const wantsSignUp = intent === 'signup' ? '&intent=signup' : ''
   return (
     `${apiUrl}/api/sdk/auth/oauth/hosted-init` +
-    `?provider=${encodeURIComponent(provider)}&token=${encodeURIComponent(token)}`
+    `?provider=${encodeURIComponent(provider)}&token=${encodeURIComponent(token)}${wantsSignUp}`
   )
 }
 

@@ -42,6 +42,17 @@ describe('OneloAuth — sendMagicLink & sendPasswordReset', () => {
     const magicLinkCall = calls.find(c => (c[0] as string).includes('magic-link'))
     expect(magicLinkCall).toBeDefined()
     expect(magicLinkCall![1]).toMatchObject({ email: 'ada@example.com', publishableKey: 'onelo_pk_test' })
+    // Bound to THIS install. Without a challenge the emailed link works from
+    // wherever the mail lands; the backend stores this on the magic-link row and
+    // mints a code carrying it, so /hosted-callback only succeeds from here.
+    // No code_challenge, deliberately — the verifier is in-memory and is nulled
+    // after every password sign-in, while a magic link is opened later, often
+    // after a relaunch. Binding a challenge to it burns the link permanently.
+    const body = magicLinkCall![1] as Record<string, unknown>
+    // Asserted on the request BODY, not on the helper: `initialize()` legitimately
+    // derives a challenge for the /api/sdk/config registration, so a
+    // "never called" assertion would be measuring the wrong thing.
+    expect(body.code_challenge).toBeUndefined()
   })
 
   it('calls /api/sdk/auth/reset-password with email and publishableKey', async () => {

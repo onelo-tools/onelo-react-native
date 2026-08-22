@@ -28,6 +28,10 @@ export interface OneloAuthGateProps {
 interface GateState {
   resolved: boolean
   allowedIn: boolean
+  /** Signed in but not allowed in — a session exists, entitlement does not.
+   *  Whatever the hosted flow shows such a caller (store, "no active plan") is
+   *  never the sign-in form, so the pre-auth surface must not promise one. */
+  signedIn: boolean
 }
 
 function errorMessage(e: unknown): string | undefined {
@@ -65,9 +69,9 @@ function errorMessage(e: unknown): string | undefined {
 export function OneloAuthGate({ onelo, children, fallback }: OneloAuthGateProps) {
   // React Native peer deps — loaded lazily at runtime (mirrors the other components).
   const RN = require('react-native')
-  const { View, StyleSheet, TouchableOpacity, Text, AppState } = RN
+  const { View, StyleSheet, TouchableOpacity, Text, AppState, Linking } = RN
 
-  const [state, setState] = useState<GateState>({ resolved: false, allowedIn: false })
+  const [state, setState] = useState<GateState>({ resolved: false, allowedIn: false, signedIn: false })
   // #36 — true while a stored session MIGHT still be restoring on cold start.
   // Seeded true so the VERY FIRST paint is a neutral branded background, never
   // the sign-in skeleton. A fast `hasStoredSession()` probe flips it false the
@@ -100,7 +104,7 @@ export function OneloAuthGate({ onelo, children, fallback }: OneloAuthGateProps)
     const entitled = session?.user.entitlement === 'active'
     const allowedIn = signedIn && (!paywallEnabled || entitled)
     if (!mountedRef.current) return
-    setState({ resolved: true, allowedIn })
+    setState({ resolved: true, allowedIn, signedIn })
     // #36 — the gate has resolved; the branded restore splash is done in every
     // case (allowed-in → content; not allowed → the driveFlow effect below opens
     // the hosted flow behind the skeleton/retry surface).
@@ -166,6 +170,32 @@ export function OneloAuthGate({ onelo, children, fallback }: OneloAuthGateProps)
         ? AppState.addEventListener('change', handleAppState)
         : undefined
 
+    // A hosted flow that finishes OUTSIDE the built-in <AuthModal> — a magic
+    // link opened in the system browser — has to land somewhere even while
+    // that modal is unmounted/invisible: its OWN `Linking` listener only runs
+    // `if (visible)` (auth-modal.tsx), so before this the refusal/code was
+    // silently dropped unless the developer wired `onelo.auth.handleAuthCallback`
+    // themselves at their own app root (2026-08-20 — the SAME failure already
+    // fixed on Swift/Electron/Android/Flutter). `OneloAuthGate` is the flagship,
+    // "nothing else to wire" entry point, so it owns this instead of leaving it
+    // to be documented as a manual step.
+    //
+    // Runs for the gate's WHOLE lifetime, independent of `modal.visible` —
+    // deliberately NOT scoped like AuthModal's own listener. When the modal IS
+    // visible and the SAME url also reaches AuthModal's listener (a normal
+    // OAuth return), `handleAuthCallback` finds nothing parked (AuthModal's own
+    // handler already consumed it via `_modalResolve`, which nulls itself out
+    // synchronously before its first await) and its fallback direct-exchange
+    // attempt fails on the now-already-used one-time code — caught here and
+    // dropped, never surfaced as an unhandled rejection.
+    const onUrl = (event: { url: string }) => {
+      if (event?.url) void onelo.auth.handleAuthCallback(event.url).catch(() => {})
+    }
+    const linkingSub =
+      Linking && typeof Linking.addEventListener === 'function'
+        ? Linking.addEventListener('url', onUrl)
+        : undefined
+
     return () => {
       mountedRef.current = false
       unsubAuth()
@@ -173,9 +203,13 @@ export function OneloAuthGate({ onelo, children, fallback }: OneloAuthGateProps)
       else if (AppState && typeof AppState.removeEventListener === 'function') {
         AppState.removeEventListener('change', handleAppState)
       }
+      if (linkingSub && typeof linkingSub.remove === 'function') linkingSub.remove()
+      else if (Linking && typeof Linking.removeEventListener === 'function') {
+        Linking.removeEventListener('url', onUrl)
+      }
     }
-    // AppState comes from the lazily-required RN module (stable across renders);
-    // recompute is the only reactive dependency.
+    // AppState/Linking come from the lazily-required RN module (stable across
+    // renders); recompute is the only reactive dependency.
   }, [onelo, recompute]) // eslint-disable-line react-hooks/exhaustive-deps
 
   // Drive the hosted flow whenever we're resolved, not allowed in, and not
@@ -213,7 +247,7 @@ export function OneloAuthGate({ onelo, children, fallback }: OneloAuthGateProps)
   // settles (`recompute` resolves) or a definite no-session is probed, we fall
   // through to the retry prompt / loading skeleton (custom `fallback` or the
   // auth-shaped skeleton). Never `children`.
-  const preAuth = (restoring && !state.resolved)
+  const preAuth = (restoring && !state.resolved) || (state.signedIn && !state.allowedIn && !retry)
     ? React.createElement(View, { style: styles.restoringContainer })
     : retry
     ? React.createElement(View, { style: styles.retryContainer },

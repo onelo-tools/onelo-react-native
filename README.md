@@ -1,76 +1,133 @@
 # @onelo/react-native
 
-Onelo React Native SDK — auth, features, monitor, store, paywall, feedback, waitlist, forms, consent.
+The Onelo SDK for React Native — iOS and Android.
 
-## iOS App Attest
+Part of [Onelo](https://onelo.tools): hosted sign-in, a paywall on **your own Stripe** account, plan-gated feature flags, uptime monitoring, in-app feedback, a public roadmap and a waitlist — one SDK, wired together.
 
-On iOS, the SDK performs Apple **App Attest** and attaches an `X-Attest-Token`
-header to **every** request (auth, event-stream/monitor, store, customer-portal,
-features, consent, forms, waitlist, feedback). This proves requests come from a
-genuine, unmodified build of your app. It runs automatically — there is no API to
-call — and only when the backend reports the app requires it
-(`attest_required` from `GET /api/sdk/config`).
+## Install
 
-Android does nothing here (Play Integrity is a separate future task).
+```bash
+npm install github:onelo-tools/onelo-react-native react-native-keychain react-native-webview react-native-get-random-values
+```
 
-### 1. Link the native module
-
-The SDK ships a native iOS module (`OneloAttest`). It is picked up by React
-Native **autolinking** — no manual Podfile edit:
-
-```sh
+```bash
 cd ios && pod install
 ```
 
-If your app uses `use_frameworks!`, App Attest still works, but ensure your
-Podfile settings allow static Swift pods with a bridging header (the default
-setup does).
+The native module is picked up by React Native autolinking — no Podfile or Gradle edit needed.
 
-### 2. Enable the App Attest capability
+### One required line
 
-App Attest requires the **App Attest** entitlement on the host app:
+Add this as the **first line** of your `index.js`. Sign-in uses PKCE, which needs a secure random source, and React Native does not provide one out of the box:
 
-- Xcode → your app target → **Signing & Capabilities** → **+ Capability** →
-  **App Attest**.
-- This adds `com.apple.developer.devicecheck.appattest-environment` to your
-  entitlements. Use `development` for debug builds and `production` for
-  TestFlight / App Store (Xcode manages this automatically for managed signing).
+```js
+import 'react-native-get-random-values'
+```
 
-Without this capability, `DCAppAttestService` reports unsupported / rejects key
-generation, the SDK logs the reason (search the console for `[Onelo][attest]`)
-and requests simply go out without `X-Attest-Token`.
+## Quick start
 
-### 3. Requires a REAL device
+```ts
+import { Onelo } from '@onelo/react-native'
 
-App Attest is **not available on the iOS Simulator**. `isSupported` returns
-`false` there, so attestation is skipped silently. You must smoke-test on a
-physical iPhone/iPad running iOS 14+.
+const onelo = new Onelo({
+  publishableKey: 'onelo_pk_live_YOUR_KEY',
+  apiUrl: 'https://api.onelo.tools',
+  bundleId: 'com.company.app',
+  callbackScheme: 'myapp',
+})
+```
 
-### 4. Smoke test
+`publishableKey` and `apiUrl` are both required. Your Onelo dashboard shows the snippet with your values already filled in.
 
-1. Run the app on a real device (Debug is fine).
-2. Ensure your Onelo app has App Attest required (a registered bundle id with
-   `attest_enabled = true`) so `/api/sdk/config` returns `attest_required: true`.
-3. Trigger any SDK call (e.g. open the auth view, or let monitor/features run).
-4. In a proxy (Charles/Proxyman) or your backend logs, confirm outgoing Onelo
-   requests carry an `X-Attest-Token: <JWT>` header. The **first** couple of
-   requests (the config fetch itself, and the challenge/attest round-trip) will
-   NOT have it yet — the token is attached once attestation completes, then rides
-   every subsequent request.
-5. If the header never appears, check the Xcode console for `[Onelo][attest]`
-   lines — they state exactly why (Simulator, missing capability, Apple server
-   error, or a backend rejection with the HTTP status + reason).
+### Gate your app with one component
 
-### How it works
+`OneloAuthGate` drives the whole flow for you — it opens the hosted sign-in page, sends users who haven't paid to your store, and renders your app only once they're signed in and entitled:
 
-- `ios/OneloAttest.swift` (bridged via `ios/OneloAttest.m`) owns the DeviceCheck
-  calls: `isSupported`, `generateKey`, `attestKey(keyId, challenge)`
-  (`clientDataHash = SHA256(challenge)`), and `getBundleId`.
-- `src/attest.ts` orchestrates the HTTP flow — `GET /api/sdk/auth/attest-challenge`
-  → native `attestKey` → `POST /api/sdk/auth/attest` (`platform: "ios"`) — and
-  caches the returned `attest_token` JWT in the Keychain, refreshing when it is
-  within 5 minutes of expiry (on app foreground).
-- `src/sdk-headers.ts` reads the cached token synchronously and adds
-  `X-Attest-Token` to the shared header set, so it is sent on every transport.
-- A **fresh** App Attest key is generated for each attestation (an App Attest key
-  can be attested only once).
+```tsx
+import { OneloAuthGate } from '@onelo/react-native'
+
+export default function App() {
+  return (
+    <OneloAuthGate onelo={onelo}>
+      <YourApp />
+    </OneloAuthGate>
+  )
+}
+```
+
+Prefer to drive it yourself? The imperative API is there too:
+
+```ts
+await onelo.auth.loadAuthView()
+
+const unsubscribe = onelo.auth.onAuthStateChange((session) => {
+  console.log(session ? 'signed in' : 'signed out')
+})
+
+if (await onelo.auth.isAllowedIn()) showApp()
+
+await onelo.auth.signOut()
+```
+
+### Deep links (required for most flows)
+
+Social sign-in and Stripe redirects leave your app and come back through a custom URL scheme. It must match `callbackScheme`.
+
+**Android** — `android/app/src/main/AndroidManifest.xml`:
+
+```xml
+<intent-filter>
+    <action android:name="android.intent.action.VIEW" />
+    <category android:name="android.intent.category.DEFAULT" />
+    <category android:name="android.intent.category.BROWSABLE" />
+    <data android:scheme="myapp" />
+</intent-filter>
+```
+
+**iOS** — add the scheme under URL Types (`CFBundleURLSchemes`) in `Info.plist`.
+
+## Modules
+
+Everything below hangs off the one `onelo` instance.
+
+| Accessor | What it does | Key methods |
+|---|---|---|
+| `onelo.auth` | Hosted sign-in and sessions | `loadAuthView()`, `isAllowedIn()`, `onAuthStateChange()`, `getSession()`, `signOut()` |
+| `onelo.features` | Plan-gated feature flags, pushed live | `isEnabled()`, `feature()`, `subscribe()`, `refresh()` |
+| `onelo.monitor` | Error and event reporting | `track()`, `capture()`, `event()` |
+| `onelo.store` | Your hosted store, on your own Stripe | `open()`, `openUpgrade()` |
+| `onelo.customerPortal` | Cancel, change plan, refunds, invoices | `open()` |
+| `onelo.feedback` | In-app bug reports and feature requests | `open()`, `close()` |
+| `onelo.forms` | Form submissions | `submit()` |
+| `onelo.waitlist` | Pre-launch signups | `join()` |
+| `onelo.consent` | Versioned terms / privacy consent gate | `requiredConsents()`, `acceptConsent()`, `onConsentRequired()` |
+
+Each surface also ships a ready-made component and a state hook if you'd rather render it yourself — `StoreModal` / `useStoreModalState`, `CustomerPortalModal` / `usePortalModalState`, `ConsentGateModal` / `useConsentModalState`, `FeedbackModal`, `AuthModal`.
+
+## Device attestation
+
+The SDK proves requests come from a genuine, unmodified build of your app — **App Attest** on iOS and **Play Integrity** on Android. It is automatic: there is no API to call, and it only runs when your Onelo app is configured to require it.
+
+What you need to do:
+
+- **iOS:** enable the **App Attest** capability in Xcode → your target → Signing & Capabilities, and test on a **real device** — App Attest is unavailable in the Simulator, where it is skipped silently.
+- **Android:** nothing — Play Integrity is wired up by the SDK.
+
+If attestation can't run, requests still go out without the token rather than failing. Filter your logs for `[Onelo][attest]` to see exactly why.
+
+## Requirements
+
+- React **18+**, React Native **0.71+**
+- iOS **14+**, Android **minSdk 24**
+- Peer dependencies: `react-native-keychain`, `react-native-webview`, `react-native-get-random-values` (tokens are stored in the Keychain / Android keystore)
+- TypeScript declarations included
+
+## Links
+
+- **Docs:** [onelo.tools/docs](https://onelo.tools/docs)
+- **Dashboard:** [onelo.tools](https://onelo.tools) — your app's snippet comes pre-filled with your keys
+- **Issues:** please report them on this repository
+
+## License
+
+MIT

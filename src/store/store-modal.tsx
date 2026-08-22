@@ -242,7 +242,7 @@ export function StoreModalView({ visible, hostedUrl, callbackScheme, apiUrl, onR
       // if the host didn't thread it, the navigation-diversion path handles the
       // hosted page's location.href fallback.
       if (!apiUrl) return
-      openInSystemBrowser(buildHostedInitUrl(apiUrl, msg.provider, msg.token))
+      openInSystemBrowser(buildHostedInitUrl(apiUrl, msg.provider, msg.token, msg.intent))
     },
     [apiUrl, openInSystemBrowser],
   )

@@ -20,6 +20,8 @@ import { sdkHeaders, getNativeBundleId } from '../sdk-headers'
 import { maybeSelfHealFromError } from '../attest'
 import type { OneloEventStream } from '../core/event-stream'
 import type { ModalResult } from './auth-modal'
+import { isExpiredAuthError } from './auth-modal'
+import { parseCallbackDeepLink, isOneloHostedSurface } from './webview-oauth'
 
 const SDK_VERSION: string = require('../../package.json').version
 
@@ -305,6 +307,18 @@ export class OneloAuth {
         this.notifyModalListeners()
         if (result.type === 'cancelled') { resolve(null); return }
         if (result.type === 'error') { reject(OneloError.server(result.message)); return }
+        if (result.type === 'expired') {
+          // The addressing token is spent. Re-resolve and reopen rather than
+          // failing: /flow/init now answers `sign_in` (the session was just
+          // revoked), so the user lands on a clean form instead of an error.
+          // The modal was already hidden above, so this reopens it.
+          try {
+            resolve(await this.loadAuthView())
+          } catch (e) {
+            reject(e)
+          }
+          return
+        }
         try {
           resolve(await this.exchangeHostedCode(result.code))
         } catch (e) {
@@ -725,6 +739,32 @@ export class OneloAuth {
   }
 
   /**
+   * May this person see the app?
+   *
+   * READ from the server, never computed here. The rule
+   * `!paywallEnabled || entitlement === 'active'` once lived in this SDK, in the
+   * JS SDK and in Swift — three copies, each found wrong on a different day. The
+   * JS copy answered `true` while its config was still loading, so a plan-less
+   * user walked into a paid app on every page load (2026-08-18).
+   * `/api/sdk/auth/user` now ships the conclusion so it cannot recur.
+   *
+   * The fallback is COMPATIBILITY, not a second source of truth: an older
+   * backend simply does not send `allowed_in`, and treating absent as `false`
+   * would lock every user out of an app running this SDK ahead of the backend.
+   * Delete it once the field is everywhere. Note `=== false`: the config flag is
+   * only trustworthy once resolved, so anything else must deny.
+   *
+   * Contract: docs/sdk-access-gate-wiring.md
+   */
+  async isAllowedIn(): Promise<boolean> {
+    const session = await this.getSession()
+    if (!session) return false
+    const answer = session.user.allowedIn
+    if (typeof answer === 'boolean') return answer
+    return this.isPaywallEnabled() === false || session.user.entitlement === 'active'
+  }
+
+  /**
    * Re-fetch the user's entitlement from the backend and, if it changed, rebuild
    * + persist + republish the session so `hasActiveAccess()` and auth-state
    * listeners see the new value. Call after an external checkout or on app
@@ -746,12 +786,23 @@ export class OneloAuth {
         }),
       )
       if (status !== 200) return session.user.entitlement
-      const next: OneloEntitlement =
-        (json as Record<string, unknown>)['entitlement'] === 'active' ? 'active' : 'none'
+      const body = json as Record<string, unknown>
+      const next: OneloEntitlement = body['entitlement'] === 'active' ? 'active' : 'none'
+      // Persist the ANSWER too, not only the ingredient. Refreshing entitlement
+      // alone left a paying customer holding a stored "not allowed" — locked out
+      // by the very call meant to let them in (found in JS/Swift/Flutter/
+      // Electron, 2026-08-19). Absent stays undefined so the fallback applies.
+      const nextAllowedIn = typeof body['allowed_in'] === 'boolean'
+        ? (body['allowed_in'] as boolean)
+        : session.user.allowedIn
       // Don't resurrect a session that was signed out while this request was in
       // flight (epoch guard, parity with Swift).
-      if (next !== session.user.entitlement && epoch === this.signOutEpoch) {
-        await this.saveSession({ ...session, user: { ...session.user, entitlement: next } })
+      const changed = next !== session.user.entitlement || nextAllowedIn !== session.user.allowedIn
+      if (changed && epoch === this.signOutEpoch) {
+        await this.saveSession({
+          ...session,
+          user: { ...session.user, entitlement: next, allowedIn: nextAllowedIn },
+        })
       }
       return next
     } catch {
@@ -885,9 +936,17 @@ export class OneloAuth {
 
   async sendMagicLink(email: string): Promise<void> {
     await this.initPromise
+    // NOTE — no `code_challenge` here, deliberately (2026-08-18). See the JS SDK
+    // for the full reasoning: `pkceVerifier` is in-memory and nulled after every
+    // password sign-in, while a magic link is opened later, often after a
+    // relaunch. A challenge bound to a verifier that no longer exists makes
+    // /hosted-callback 401, and the token is already used, so the link is burnt.
     const { status } = await httpPost(
       `${this.apiUrl}/api/sdk/auth/magic-link`,
-      { email, publishableKey: this.publishableKey },
+      {
+        email,
+        publishableKey: this.publishableKey,
+      },
       await this._secHeaders()
     )
     if (status !== 200) throw OneloError.server(`sendMagicLink failed: HTTP ${status}`)
@@ -901,5 +960,69 @@ export class OneloAuth {
       await this._secHeaders()
     )
     if (status !== 200) throw OneloError.server(`sendPasswordReset failed: HTTP ${status}`)
+  }
+
+  /**
+   * Complete a hosted-auth flow that finished OUTSIDE this app's own UI — a
+   * magic link opened in the system browser is the reason this exists. Call it
+   * from your app ROOT's own `Linking.addEventListener('url', …)` (in addition
+   * to, not instead of, rendering `<AuthModal>` off `getModalState()`).
+   *
+   * `<AuthModal>`'s OWN `Linking` listener only runs while it is visible/mounted
+   * (`auth-modal.tsx:298-308`, guarded `if (!visible …) return`) — a flow that
+   * finishes while the modal happens to be unmounted (navigated away, or the
+   * developer's own "Check your inbox" screen is shown via `sendMagicLink()`
+   * instead of the hosted modal) had nowhere to land: the code/gate value was
+   * silently dropped. React Native was the only Onelo SDK without a public,
+   * modal-lifetime-independent entry point for this — Swift's
+   * `handleAuthCallback`, Electron's `handleDeepLink`, Android's
+   * `Onelo.handleRedirect` and Flutter's internal `app_links` listener all
+   * already work regardless of whether their own presenting UI is on-screen.
+   *
+   * Two cases:
+   *  - A `loadAuthView()` call is still pending (`_modalResolve` set): hand the
+   *    outcome to the SAME parked resolver `<AuthModal>` would have used —
+   *    `code`/`expired`/`error` settle it directly; a `gate` refusal (origin-
+   *    checked against the flow's own hosted URL, exactly like `<AuthModal>`)
+   *    re-presents the modal on the refusal surface instead of the sign-in page.
+   *  - No flow is pending — the code came from a `sendMagicLink()` flow using a
+   *    developer-built "Check your inbox" screen, not the hosted modal.
+   *    Exchanges the code directly and returns the session.
+   *
+   * Does NOT recover a flow whose PROCESS was killed and relaunched — the
+   * in-memory `_modalResolve`/`pkceVerifier` are gone either way, the same
+   * limitation every other Onelo SDK's live-process shortcut has.
+   *
+   * Returns the session when this call itself completed the exchange (the
+   * no-pending-flow case); `null` when the URL wasn't ours, or when a pending
+   * `loadAuthView()` flow was handed the outcome and will resolve on its own.
+   */
+  async handleAuthCallback(url: string): Promise<OneloSession | null> {
+    await this.initPromise
+    const parsed = parseCallbackDeepLink(url, this._callbackScheme)
+    if (!parsed || parsed.host !== 'callback') return null
+    const { code, gate, error: errParam } = parsed.params
+
+    if (this._modalResolve) {
+      if (gate) {
+        if (isOneloHostedSurface(gate, this._modalUrl)) {
+          this._modalUrl = gate
+          this._modalVisible = true
+          this.notifyModalListeners()
+        } else {
+          this._modalResolve({ type: 'error', message: 'Refused a sign-in surface from an unknown origin' })
+        }
+      } else if (code) {
+        this._modalResolve({ type: 'code', code })
+      } else if (isExpiredAuthError(errParam)) {
+        this._modalResolve({ type: 'expired' })
+      } else if (errParam) {
+        this._modalResolve({ type: 'error', message: errParam })
+      }
+      return null
+    }
+
+    if (code) return this.exchangeHostedCode(code)
+    return null
   }
 }
