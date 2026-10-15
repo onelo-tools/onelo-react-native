@@ -1,4 +1,4 @@
-import { httpGet, httpPost, OneloError } from '@onelo/core'
+import { httpGet, httpPost, OneloError, type BrandTokens } from '@onelo/core'
 import { sdkHeaders } from '../sdk-headers'
 import type { OneloAuth } from '../auth/auth'
 import type { OneloEventStream } from '../core/event-stream'
@@ -39,8 +39,9 @@ export type ConsentModalState = {
   visible: boolean
   hostedUrl: string
   onResult: ((result: ConsentResult) => void) | null
-  /** Branding page background (--onelo-page-bg) so the gate WebView never flashes
-   *  white before the hosted legal page paints. */
+  /** The app's brand tokens (#681): the gate's chrome is painted from them. */
+  tokens: BrandTokens
+  /** @deprecated Use `tokens.page_bg`. */
   backgroundColor: string
 }
 
@@ -278,7 +279,8 @@ export class OneloConsent {
       visible: this._modalVisible,
       hostedUrl: this._modalUrl,
       onResult: this._modalResolve,
-      backgroundColor: this.auth.pageBackgroundColor(),
+      tokens: this.auth.brandTokens(),
+      backgroundColor: this.auth.brandTokens().page_bg,
     }
   }
 

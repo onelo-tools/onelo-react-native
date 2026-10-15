@@ -11,6 +11,9 @@ import {
   OAUTH_RELAY_SCRIPT,
 } from './webview-oauth'
 import { authSkeletonHtml } from './auth-skeleton'
+import { classifyHandBackMessage } from '../core/hand-back'
+import type { BrandTokens } from '@onelo/core'
+import { chromeStyles, resolveModalTokens } from '../core/brand'
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 declare const require: (id: string) => any
@@ -54,11 +57,6 @@ export type ModalResult =
    */
   | { type: 'expired' }
 
-export type ParsedMessage =
-  | { type: 'code'; code: string }
-  | { type: 'cancelled' }
-  | null
-
 /**
  * The store's native fail-safe ✕ shows ONLY while the hosted page hasn't
  * confirmed it's ready AND the grace period elapsed — pulled out as a pure
@@ -77,21 +75,6 @@ export function shouldShowNativeStoreClose(opts: {
   return opts.onStore && !opts.hostedReady && opts.failSafeArmed
 }
 
-export function parseModalMessage(data: string): ParsedMessage {
-  try {
-    const msg = JSON.parse(data) as Record<string, unknown>
-    if (msg['type'] === 'onelo:code' && typeof msg['code'] === 'string') {
-      return { type: 'code', code: msg['code'] as string }
-    }
-    if (msg['type'] === 'onelo:cancelled') {
-      return { type: 'cancelled' }
-    }
-    return null
-  } catch {
-    return null
-  }
-}
-
 interface AuthModalProps {
   visible: boolean
   hostedUrl: string
@@ -101,9 +84,10 @@ interface AuthModalProps {
    *  via `buildHostedInitUrl`). Optional: OAuth still works without it via the
    *  navigation-diversion path. */
   apiUrl?: string
-  /** Branding "Page background" color (from `onelo.auth.pageBackgroundColor()`).
-   *  Painted on the container + WebView + loading overlay so there is no white
-   *  flash before the hosted page renders. Defaults to #111111. */
+  /** The app's brand tokens (#681, from `onelo.auth.brandTokens()`): ground,
+   *  skeleton, ✕ chip and retry are painted from them. Neutral when absent. */
+  tokens?: BrandTokens
+  /** @deprecated Pass `tokens`. Page ground only, for pre-#681 callers. */
   backgroundColor?: string
   /** Deep-link callback scheme (from `onelo.auth.callbackScheme`, config-driven,
    *  default 'onelorn'). Used to catch `<scheme>://callback?…` returns in the
@@ -114,7 +98,7 @@ interface AuthModalProps {
   socialCount?: number
 }
 
-export function AuthModal({ visible, hostedUrl, onResult, apiUrl, backgroundColor, callbackScheme, socialCount = 0 }: AuthModalProps) {
+export function AuthModal({ visible, hostedUrl, onResult, apiUrl, tokens, backgroundColor, callbackScheme, socialCount = 0 }: AuthModalProps) {
   // Config-driven deep-link scheme (default 'onelorn'). Register it natively so a
   // system-browser return (OAuth) can reopen the app; in-WebView returns are caught
   // by handleShouldStartLoad regardless.
@@ -283,15 +267,16 @@ export function AuthModal({ visible, hostedUrl, onResult, apiUrl, backgroundColo
   const handleMessage = useCallback(
     (event: any) => {
       const data: string = event.nativeEvent.data
-      const parsed = parseModalMessage(data)
-      if (parsed) {
-        if (parsed.type === 'code') resolveOnce({ type: 'code', code: parsed.code })
-        else resolveOnce({ type: 'cancelled' })
-        return
-      }
+      // The one Store Hand-back decoder (#615 / #627). A code-less plan switch
+      // cannot start from sign-in, so only a purchase or a cancel ends it here.
+      const hb = classifyHandBackMessage(data)
+      if (hb?.kind === 'purchase') { resolveOnce({ type: 'code', code: hb.code }); return }
+      if (hb?.kind === 'cancelled') { resolveOnce({ type: 'cancelled' }); return }
+      // A dead gate-store link (#619): restart the flow, as a dead deep link does.
+      if (hb?.kind === 'expired') { resolveOnce({ type: 'expired' }); return }
       // #40 Phase 2 — hosted page mounted → hide the native fail-safe store ✕
-      // (its own canonical StoreExitX takes over). parseModalMessage only
-      // recognises code/cancelled, so this is read directly.
+      // (its own canonical StoreExitX takes over). Not a hand-back, so it is
+      // read directly.
       try {
         if ((JSON.parse(data) as { type?: unknown })?.type === 'onelo:ready') {
           setHostedReady(true)
@@ -384,19 +369,21 @@ export function AuthModal({ visible, hostedUrl, onResult, apiUrl, backgroundColo
     else handleCancel()
   }, [hostedUrl, canGoBack, handleCancel])
 
-  // Branding page background — matches what the hosted auth page paints behind its
-  // card (--onelo-page-bg), so the native WebView/overlay never flashes white in the
-  // gap before the hosted page's own background renders. Default #111111.
-  const bg = backgroundColor || '#111111'
+  // Brand tokens (#681) — the ground matches what the hosted auth page paints
+  // behind its card (--onelo-page-bg), so the native WebView/overlay never flashes
+  // white; skeleton, ✕ chip and retry come from the same tokens.
+  const t = resolveModalTokens(tokens, backgroundColor)
+  const bg = t.page_bg
+  const c = chromeStyles(t)
 
   const styles = StyleSheet.create({
     container: { flex: 1, backgroundColor: bg },
     webview: { flex: 1, backgroundColor: bg },
     errorContainer: { flex: 1, justifyContent: 'center', alignItems: 'center', gap: 16 },
-    retryButton: { backgroundColor: '#ffffff', paddingHorizontal: 32, paddingVertical: 14, borderRadius: 8 },
-    retryText: { color: '#000000', fontSize: 16, fontWeight: '600' },
+    retryButton: c.retryButton,
+    retryText: c.retryText,
     cancelButton: { paddingHorizontal: 32, paddingVertical: 14 },
-    cancelText: { color: '#ffffff', fontSize: 16 },
+    cancelText: c.cancelText,
     // #27 — persistent close affordance in the NORMAL flow (the hosted page,
     // e.g. the store, may not render its own cancel → user was trapped and had
     // to kill the app). Top-trailing, cleared past the notch/status bar.
@@ -404,15 +391,10 @@ export function AuthModal({ visible, hostedUrl, onResult, apiUrl, backgroundColo
       position: 'absolute',
       top: Platform.OS === 'ios' ? 52 : (StatusBar.currentHeight ?? 24) + 8,
       right: 16,
-      width: 36,
-      height: 36,
-      borderRadius: 18,
-      backgroundColor: 'rgba(0,0,0,0.4)',
-      justifyContent: 'center',
-      alignItems: 'center',
+      ...c.closeChip,
       zIndex: 10,
     },
-    closeText: { color: '#ffffff', fontSize: 19, fontWeight: '600', lineHeight: 21 },
+    closeText: c.closeText,
   })
 
   return React.createElement(Modal, {
@@ -447,7 +429,7 @@ export function AuthModal({ visible, hostedUrl, onResult, apiUrl, backgroundColo
         // to the hosted URL after it paints. ONE WebView shows the skeleton then
         // the page — no separate overlay instance, no slide, no jump. The skeleton
         // stays visible during the network load until the hosted page paints.
-        source: { html: authSkeletonHtml(socialCount, bg, currentUrl) },
+        source: { html: authSkeletonHtml(socialCount, t, currentUrl) },
         onError: handleError,
         onMessage: handleMessage,
         injectedJavaScript: OAUTH_RELAY_SCRIPT,

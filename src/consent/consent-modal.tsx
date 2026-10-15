@@ -1,5 +1,7 @@
 import React, { useState, useEffect, useCallback } from 'react'
 import type { OneloConsent, ConsentModalState } from './consent'
+import type { BrandTokens } from '@onelo/core'
+import { chromeStyles, resolveModalTokens } from '../core/brand'
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 declare const require: (id: string) => any
@@ -50,8 +52,10 @@ export interface ConsentGateModalViewProps {
   visible: boolean
   hostedUrl: string
   onResult: (result: ConsentResult) => void
-  /** Branding page background — painted on the container + WebView + overlay so
-   *  the gate never flashes white before the hosted legal page renders. */
+  /** The app's brand tokens (#681) — ground, spinner and retry are painted from
+   *  them. Pass `onelo.auth.brandTokens()`; neutral when absent. */
+  tokens?: BrandTokens
+  /** @deprecated Pass `tokens`. Page ground only, for pre-#681 callers. */
   backgroundColor?: string
 }
 
@@ -104,7 +108,7 @@ export function ConsentGateModal({ onelo }: ConsentGateModalProps) {
     visible: state.visible,
     hostedUrl: state.hostedUrl,
     onResult: handleResult,
-    backgroundColor: state.backgroundColor,
+    tokens: state.tokens,
   })
 }
 
@@ -116,9 +120,12 @@ export function ConsentGateModal({ onelo }: ConsentGateModalProps) {
  * button is swallowed while the gate is visible. The only exits are Accept
  * (→ record consent) or Decline (→ sign out), both relayed from the hosted page.
  */
-export function ConsentGateModalView({ visible, hostedUrl, onResult, backgroundColor }: ConsentGateModalViewProps) {
-  // Branding page background — matches the hosted legal page so no white flash.
-  const bg = backgroundColor || '#111111'
+export function ConsentGateModalView({ visible, hostedUrl, onResult, tokens, backgroundColor }: ConsentGateModalViewProps) {
+  // Brand tokens (#681) — ground matches the hosted legal page so no white
+  // flash; spinner and retry from the same tokens.
+  const t = resolveModalTokens(tokens, backgroundColor)
+  const bg = t.page_bg
+  const c = chromeStyles(t)
   const RN = require('react-native')
   const { WebView } = require('react-native-webview')
   const { Modal, View, StyleSheet, ActivityIndicator, TouchableOpacity, Text, BackHandler } = RN
@@ -169,8 +176,8 @@ export function ConsentGateModalView({ visible, hostedUrl, onResult, backgroundC
     webview: { flex: 1, backgroundColor: bg },
     overlay: { position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: bg, justifyContent: 'center', alignItems: 'center' },
     errorContainer: { flex: 1, justifyContent: 'center', alignItems: 'center', gap: 16 },
-    retryButton: { backgroundColor: '#ffffff', paddingHorizontal: 32, paddingVertical: 14, borderRadius: 8 },
-    retryText: { color: '#000000', fontSize: 16, fontWeight: '600' },
+    retryButton: c.retryButton,
+    retryText: c.retryText,
   })
 
   return React.createElement(Modal, { visible, animationType: 'slide', presentationStyle: 'fullScreen' },
@@ -186,7 +193,7 @@ export function ConsentGateModalView({ visible, hostedUrl, onResult, backgroundC
         backgroundColor: bg,
       }),
       loading && !error && React.createElement(View, { style: styles.overlay },
-        React.createElement(ActivityIndicator, { size: 'large', color: '#ffffff' })
+        React.createElement(ActivityIndicator, { size: 'large', color: c.spinnerColor })
       ),
       // On a load failure allow a Retry (still no Cancel — the gate stays a hard
       // block, but a network blip must not trap the user behind a blank screen).

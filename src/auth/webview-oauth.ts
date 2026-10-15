@@ -211,8 +211,11 @@ export const OAUTH_RELAY_SCRIPT = `
       if (d && (
         d.type === 'onelo:native_oauth' ||
         d.type === 'onelo:native_oauth_url' ||
+        // The store's hand-back (#615 / #627): decoded on the native side by
+        // classifyHandBackMessage — the relay only forwards, it never decides.
         d.type === 'onelo:code' ||
-        d.type === 'onelo:cancelled' ||
+        d.type === 'onelo:done' ||
+        d.type === 'onelo:cancel' ||
         // #40 Phase 2 — the hosted page signals it has mounted so the host can hide
         // its native fail-safe ✕ (used by the customer-portal modal; auth/store
         // ignore it). The canonical ✕ is then owned by the hosted page.

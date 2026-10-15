@@ -128,3 +128,64 @@ describe('isAllowedIn', () => {
     expect(await auth.isAllowedIn()).toBe(true)
   })
 })
+
+describe('Email Verification (#819)', () => {
+  it('withholds an unverified user on a FREE app — the server says no', async () => {
+    seedSession({ entitlement: 'none', allowedIn: false, emailVerified: false, accessReason: 'email_unverified' })
+    const auth = await makeAuth()
+    expect(await auth.isAllowedIn()).toBe(false)
+    const session = await auth.getSession()
+    expect(session?.user.accessReason).toBe('email_unverified')
+  })
+
+  it('lets them in once the refresh reports the address verified', async () => {
+    seedSession({ entitlement: 'none', allowedIn: false, emailVerified: false, accessReason: 'email_unverified' })
+    const auth = await makeAuth()
+
+    userRes.value = { entitlement: 'none', allowed_in: true, email_verified: true }
+    await auth.revalidateEntitlement()
+
+    expect(await auth.isAllowedIn()).toBe(true)
+    const session = await auth.getSession()
+    expect(session?.user.emailVerified).toBe(true)
+    expect(session?.user.accessReason).toBeUndefined()
+  })
+
+  it('resends as the signed-in user and confirms with the publishable key', async () => {
+    const core = await import('@onelo/core')
+    const post = vi.mocked(core.httpPost)
+    seedSession({ entitlement: 'none', allowedIn: false })
+    const auth = await makeAuth()
+
+    post.mockResolvedValueOnce({ status: 200, json: { sent: true, email_verified: false } })
+    await expect(auth.resendVerificationEmail()).resolves.toEqual({ sent: true, emailVerified: false })
+    const [rUrl, rBody, rHeaders] = post.mock.calls.at(-1) as [string, Record<string, unknown>, Record<string, string>]
+    expect(rUrl).toBe('https://api.test/api/sdk/auth/verify-email/resend')
+    expect(rBody).toEqual({ publishableKey: 'pk_test' })
+    expect(rHeaders.Authorization).toBe('Bearer atok')
+
+    post.mockResolvedValueOnce({ status: 200, json: { email_verified: true } })
+    // The refresh after confirming answers fresh; /user is deliberately left
+    // saying "no" — it is cached per token for 30 s and must not be asked.
+    post.mockResolvedValueOnce({ status: 200, json: {
+      session: { access_token: 'atok2', refresh_token: 'rtok2', expires_in: 900 },
+      user: { id: 'u1', email: 'a@b.com', entitlement: 'none', allowed_in: true, email_verified: true },
+    } })
+    userRes.value = { entitlement: 'none', allowed_in: false, email_verified: false, access_reason: 'email_unverified' }
+    await auth.confirmEmail('tok')
+    const urls = post.mock.calls.slice(-2).map((c) => c[0])
+    expect(urls).toEqual([
+      'https://api.test/api/sdk/auth/verify-email/confirm',
+      'https://api.test/api/sdk/auth/refresh',
+    ])
+    expect(post.mock.calls.at(-2)![1]).toEqual({ publishableKey: 'pk_test', token: 'tok' })
+    // Confirming on this device lets the user in at once.
+    expect(await auth.isAllowedIn()).toBe(true)
+    expect((await auth.getSession())?.user.emailVerified).toBe(true)
+  })
+
+  it('resend refuses with no session', async () => {
+    const auth = await makeAuth()
+    await expect(auth.resendVerificationEmail()).rejects.toMatchObject({ code: 'not_authenticated' })
+  })
+})

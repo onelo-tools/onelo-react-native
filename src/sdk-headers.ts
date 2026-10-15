@@ -23,7 +23,8 @@ export interface AssertionContext {
  * Always sent:
  * - `X-SDK-Version`             — SDK version string
  * - `X-Onelo-Instance-Id`      — per-install UUID (TOFU device binding)
- * - `X-Onelo-Sdk-Platform`     — always `react-native` (WHICH SDK)
+ * - `X-Onelo-Sdk-Name`         — always `onelo-react-native` (WHICH SDK, registry key; #122)
+ * - `X-Onelo-Sdk-Platform`     — always `react-native` (discovery language tag)
  * - `X-Onelo-OS`               — `ios` | `android` (WHICH OS, resolved at
  *                                runtime). Distinct from the header above on
  *                                purpose: one React Native codebase ships to
@@ -119,6 +120,9 @@ export async function sdkHeaders(
     : null
   return {
     'X-SDK-Version': SDK_VERSION,
+    // WHICH SDK, by registry key (#122): the dashboard compares X-SDK-Version
+    // against LATEST_SDK_VERSIONS[this] instead of guessing from app_type.
+    'X-Onelo-Sdk-Name': 'onelo-react-native',
     'X-Onelo-Instance-Id': instanceId,
     'X-Onelo-Sdk-Platform': 'react-native',
     'X-Onelo-OS': currentOS(),

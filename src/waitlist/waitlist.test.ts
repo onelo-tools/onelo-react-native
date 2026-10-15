@@ -41,3 +41,16 @@ describe('OneloWaitlist', () => {
     expect('slug' in body).toBe(false)
   })
 })
+
+describe('OneloWaitlist — consent flags (#818)', () => {
+  const waitlist = new OneloWaitlist('https://api.onelo.tools', 'onelo_pk_test')
+  beforeEach(() => mockFetch.mockReset())
+
+  it('sends the checkboxes the form showed, and nothing when none were given', async () => {
+    mockFetch.mockResolvedValue(mockResponse(200, { ok: true, position: 1 }))
+    await waitlist.join('beta', 'ada@example.com', { consent: { marketing: true, custom: true } })
+    await waitlist.join('beta', 'ada@example.com')
+    expect(JSON.parse(mockFetch.mock.calls[0][1].body).consent).toEqual({ marketing: true, custom: true })
+    expect(JSON.parse(mockFetch.mock.calls[1][1].body)).not.toHaveProperty('consent')
+  })
+})

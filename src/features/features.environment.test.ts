@@ -60,4 +60,18 @@ describe('OneloFeatures featureEnvironment', () => {
     }
     expect(bodyForPath('/api/sdk/features/batch-ping')?.['environment']).toBe('test')
   })
+
+  it('sends the key as X-Publishable-Key on /poll and NOT in the query string (ADR-0003, #105)', async () => {
+    const f = new OneloFeatures('https://api', 'pk_live', null, undefined)
+    await f.load('u1') // polls run only for a loaded identity (#736)
+    f.stopPolling()
+    await (f as unknown as { _poll: (u: string | null) => Promise<void> })._poll('u1')
+    const call = httpGetMock.mock.calls.find((c) => String(c[0]).includes('/api/sdk/features/poll'))
+    expect(call).toBeDefined()
+    const url = new URL(String(call![0]))
+    const headers = call![1] as Record<string, string>
+    expect(headers['X-Publishable-Key']).toBe('pk_live')
+    expect(url.searchParams.has('key')).toBe(false)
+    expect(url.toString()).not.toContain('pk_live')
+  })
 })

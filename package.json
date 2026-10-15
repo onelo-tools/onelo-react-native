@@ -1,6 +1,6 @@
 {
   "name": "@onelo/react-native",
-  "version": "0.38.3",
+  "version": "0.53.1",
   "description": "Onelo React Native SDK",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",

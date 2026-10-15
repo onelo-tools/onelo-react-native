@@ -1,7 +1,9 @@
 import {
   httpGet, httpPost, checkHostedFlowRequired,
-  mapSession, TOKEN_KEYS,
+  mapSession, mergeAccessAnswer, resendVerificationEmail as postResendVerification, confirmEmail as postConfirmEmail, type ResendVerificationResult, TOKEN_KEYS, isSessionEndError, BrandSource, brandTokensFromResponse, NEUTRAL_BRAND_TOKENS, type BrandTokens,
   type OneloConfig, type OneloSession, type OneloUser, type OneloEntitlement, OneloError, type ResolvedSDKConfig,
+  configLanguageParam, signUpConsentFields, signupMarketingConsentFromConfig, NO_SIGNUP_MARKETING_CONSENT,
+  type SignUpOptions, type SignupMarketingConsent,
 } from '@onelo/core'
 
 /**
@@ -14,6 +16,7 @@ import {
 export type FlowDecision =
   | { action: 'authorized' }
   | { action: 'present'; surface: string; url: string; appName?: string; appLogo?: string }
+import type { PlanChange } from '../core/plan-change'
 import { generateCodeVerifier, generateCodeChallenge } from '../core/pkce'
 import { KeychainStorage } from '../core/storage'
 import { sdkHeaders, getNativeBundleId } from '../sdk-headers'
@@ -50,12 +53,36 @@ export class OneloAuth {
    *  the backend on initiate/flow-init and used by AuthModal to catch the return. */
   private readonly _callbackScheme: string
   private pkceVerifier: string | null = null
+  /**
+   * PKCE verifier of the latest hosted flow (#542). Its challenge goes to
+   * `/flow/init`, which binds every code that flow hands out, including one
+   * from a magic link opened on another device (#540). Kept separate from
+   * `pkceVerifier`, which belongs to the custom-UI `signIn`/`signUp` and is
+   * nulled after each of them. Persisted in the Keychain as well, because a
+   * link opened on THIS device returns through the OS, often after the app was
+   * killed while the user was in Mail.
+   */
+  private flowVerifier: string | null = null
+  /** The launch URL is handed over once per instance: `getInitialURL()`
+   *  keeps returning it for the whole process. */
+  private _launchUrlHandled = false
   private resolvedConfig: ResolvedSDKConfig | null = null
+  /** The SDK's one brand-token model (#681), shared with every module. */
+  readonly brand = new BrandSource()
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null
   private refreshTimer: ReturnType<typeof setTimeout> | null = null
   private static readonly HEARTBEAT_MS = 13 * 60 * 1000
   /** Refresh this many seconds before the access token expires. */
   private static readonly REFRESH_LEAD_SECONDS = 60
+  /** Retry a TRANSIENT refresh failure (offline, a lost response, 429, 5xx —
+   *  incl. `503 refresh_unavailable`) with backoff: 5 s, 10 s, 20 s, 40 s,
+   *  then every 60 s, keeping the session. The first retry lands inside the
+   *  server's 30 s refresh-token grace window. Parity with onelo-js. */
+  private static readonly REFRESH_RETRY_BASE_MS = 5000
+  private static readonly REFRESH_RETRY_MAX_MS = 60_000
+  private refreshRetryAttempt = 0
+  /** Until this time (ms) getSession() does not start a refresh on its own. */
+  private refreshBackoffUntil = 0
   // Monotonic sign-out counter. signOut() bumps it; any in-flight entitlement
   // revalidation captures it BEFORE its network await and refuses to write tokens
   // back if it moved — prevents a proactive revalidate completing just after
@@ -202,11 +229,15 @@ export class OneloAuth {
       const verifier = generateCodeVerifier()
       this.pkceVerifier = verifier
       const challenge = generateCodeChallenge(verifier)
-      const url = `${this.apiUrl}/api/sdk/config?key=${encodeURIComponent(this.publishableKey)}&code_challenge=${encodeURIComponent(challenge)}`
+      // #818: `lang` puts the sign-up Marketing Consent text in the device language.
+      const url = `${this.apiUrl}/api/sdk/config?key=${encodeURIComponent(this.publishableKey)}&code_challenge=${encodeURIComponent(challenge)}${configLanguageParam()}`
       const { status, json } = await httpGet(url, await this._secHeaders())
       if (status === 401 || status === 404) throw OneloError.invalidKey('Server rejected the key')
       if (status !== 200) throw OneloError.server(`Config request failed: HTTP ${status}`)
       const j = json as Record<string, unknown>
+      // #681: `brand_tokens`, or the shape the legacy colours imply.
+      const brandTokens = brandTokensFromResponse(j) ?? NEUTRAL_BRAND_TOKENS
+      this.brand.set(brandTokens)
       this.resolvedConfig = {
         supabaseUrl: j['supabase_url'] as string,
         supabaseAnonKey: j['supabase_anon_key'] as string,
@@ -219,13 +250,14 @@ export class OneloAuth {
         sdkRedirectUrl: (j['sdk_redirect_url'] as string | null) ?? null,
         storeUrl: (j['store_url'] as string | null) ?? null,
         manageUrl: (j['manage_url'] as string | null) ?? null,
-        // Branding page background (--onelo-page-bg). Native WebViews paint this so
-        // there is no white flash before the hosted page renders. Default #111111.
-        pageBackgroundColor: (j['checkout_bg_color'] as string) || '#111111',
+        // Branding page background — the token's page_bg (#681).
+        pageBackgroundColor: brandTokens.page_bg,
+        brandTokens,
         // Plan-gated enabled OAuth providers (google/github/apple). Previously
         // unmapped — the field is surfaced via the `oauthProviders` getter and
         // consumed by the Round 2 OAuth entry point.
         oauthProviders: Array.isArray(j['oauth_providers']) ? (j['oauth_providers'] as string[]) : undefined,
+        signupMarketingConsent: signupMarketingConsentFromConfig(j),
       }
       // App Attest requirement is not part of the typed ResolvedSDKConfig
       // (`@onelo/core`), so read it straight off the raw config JSON.
@@ -320,7 +352,12 @@ export class OneloAuth {
           return
         }
         try {
-          resolve(await this.exchangeHostedCode(result.code))
+          const session = await this.exchangeHostedCode(result.code)
+          // The hosted flow can chain sign-in → store, so the code may carry
+          // a purchase: reconcile the plan at once (#659). A plain sign-in
+          // costs one extra resolve.
+          this.onPlanChange?.({ kind: 'purchase' })
+          resolve(session)
         } catch (e) {
           reject(e)
         }
@@ -339,12 +376,34 @@ export class OneloAuth {
    * body `{publishableKey, code, code_verifier}` (PKCE snake even in a camel body).
    */
   async exchangeHostedCode(code: string): Promise<OneloSession> {
+    // The verifier of the flow this code came from: in memory while that flow
+    // is live, from the Keychain after a relaunch. A code from a flow without
+    // a challenge (the store's own initiate, the legacy /auth/initiate) is
+    // not checked against it, so sending it there is harmless.
+    const verifier = this.flowVerifier ?? (await this.storage.get(TOKEN_KEYS.MAGIC_LINK_VERIFIER))
     const { status, json } = await httpPost(
       `${this.apiUrl}/api/sdk/auth/hosted-callback`,
-      { publishableKey: this.publishableKey, code, code_verifier: this.pkceVerifier },
+      { publishableKey: this.publishableKey, code, code_verifier: verifier },
       await this._secHeaders(),
     )
-    if (status !== 200) throw OneloError.server('Hosted callback failed')
+    if (status !== 200) {
+      // One attempt, never retried. A failure leaves the stored verifier in
+      // place: it may belong to a newer flow that is still open, and the
+      // backend does not spend the link on a failed exchange.
+      const detail = (json as Record<string, unknown> | null)?.['detail']
+      if (detail === 'code_verifier required' || detail === 'PKCE verification failed') {
+        throw OneloError.server(
+          'This sign-in link belongs to a different sign-in on this device. ' +
+          'Open the sign-in again and request a new link.',
+        )
+      }
+      throw OneloError.server(`Hosted callback failed: ${typeof detail === 'string' ? detail : `HTTP ${status}`}`)
+    }
+    // The flow is finished; its verifier is single use. Cleared BEFORE the
+    // session is saved: saving notifies auth listeners, which may start a new
+    // flow, and clearing afterwards would erase that flow's fresh verifier.
+    this.flowVerifier = null
+    await this.storage.delete(TOKEN_KEYS.MAGIC_LINK_VERIFIER)
     const session = mapSession(json as Record<string, unknown>)
     await this.saveSession(session)
     return session
@@ -410,8 +469,9 @@ export class OneloAuth {
     // Same Bearer pattern as GET /api/sdk/auth/user (revalidateEntitlement).
     if (existing?.accessToken) headers['Authorization'] = `Bearer ${existing.accessToken}`
     const langParam = lang ? `&lang=${encodeURIComponent(lang)}` : ''
+    const challenge = await this._beginFlowPkce()
     const { status, json } = await httpGet(
-      `${this.apiUrl}/api/sdk/flow/init?key=${encodeURIComponent(this.publishableKey)}&callback_scheme=${this._callbackScheme}${langParam}`,
+      `${this.apiUrl}/api/sdk/flow/init?key=${encodeURIComponent(this.publishableKey)}&callback_scheme=${this._callbackScheme}&code_challenge=${encodeURIComponent(challenge)}${langParam}`,
       headers,
     )
     // A stale, still-"valid" cached attest/integrity token can silently drift
@@ -422,6 +482,23 @@ export class OneloAuth {
     // cold start, so checking here catches the drift as early as possible.
     if (status !== 200) maybeSelfHealFromError(json)
     return { status, json: (json as Record<string, unknown> | null) ?? {} }
+  }
+
+  /**
+   * Start a hosted flow's PKCE pair (#542): a fresh verifier, kept in memory
+   * and in the Keychain, and its S256 challenge for `/flow/init`. With the
+   * challenge on the flow token, the hosted page pairs a magic link opened on
+   * another device with a code, and every code the flow hands out can only be
+   * exchanged by this install. One slot, as in onelo-js (#535): a newer flow
+   * overwrites it, and a link from the older one then fails with a clear error
+   * without being spent. A failed Keychain write leaves the in-memory verifier,
+   * which still covers every return while the app keeps running.
+   */
+  private async _beginFlowPkce(): Promise<string> {
+    const verifier = generateCodeVerifier()
+    this.flowVerifier = verifier
+    await this.storage.set(TOKEN_KEYS.MAGIC_LINK_VERIFIER, verifier)
+    return generateCodeChallenge(verifier)
   }
 
   /** Map a `/flow/init` response to a FlowDecision, throwing on any non-200. */
@@ -472,14 +549,28 @@ export class OneloAuth {
     return session
   }
 
-  async signUp(email: string, password: string): Promise<OneloSession> {
+  /**
+   * #818 — should your own sign-up screen show the optional Marketing Consent
+   * checkbox, and with what text? Set on the parent App in Auth → Sign-up; an
+   * App that sells asks at Checkout instead (`asked` false). Show `text`
+   * unticked and pass the person's choice to `signUp(..., { marketingConsent })`.
+   */
+  getSignupMarketingConsent(): SignupMarketingConsent {
+    return this.resolvedConfig?.signupMarketingConsent ?? NO_SIGNUP_MARKETING_CONSENT
+  }
+
+  async signUp(email: string, password: string, options?: SignUpOptions): Promise<OneloSession> {
     await this.initPromise
     await this._awaitAttestReady()  // #25: gated POST — wait for the attest token
     if (!this.allowCustomBranding) throw OneloError.planRequired()
     if (!this.pkceVerifier) this.pkceVerifier = generateCodeVerifier()
     const { status, json } = await httpPost(
       `${this.apiUrl}/api/sdk/auth/signup`,
-      { email, password, publishableKey: this.publishableKey, code_verifier: this.pkceVerifier },
+      {
+        email, password, publishableKey: this.publishableKey, code_verifier: this.pkceVerifier,
+        // #818: only when the person ticked it, in the language of the text shown.
+        ...signUpConsentFields(options, this.getSignupMarketingConsent()),
+      },
       await this._secHeaders()
     )
     checkHostedFlowRequired(json)
@@ -533,6 +624,17 @@ export class OneloAuth {
    */
   attachEventStream(stream: OneloEventStream): void {
     stream.on('session.revoked', (data) => { void this._handleSessionRevoked(data) })
+    // #635: the user's grant changed (purchase, switch, refund, pause…). The
+    // backend sends it only to this user's streams, right after the fresh
+    // `features_updated`; re-read the entitlement so hasActiveAccess() follows.
+    stream.on('paywall.access_changed', () => { void this.revalidateEntitlement().catch(() => {}) })
+  }
+
+  /** Told when the hosted flow this class presented ended in a code — which
+   *  can carry a purchase (#659). Set by `Onelo` to its plan-change refresher. */
+  private onPlanChange: ((change: PlanChange) => void) | null = null
+  setPlanChangeHandler(fn: ((change: PlanChange) => void) | null): void {
+    this.onPlanChange = fn
   }
 
   /**
@@ -600,7 +702,21 @@ export class OneloAuth {
     if (!accessToken || !refreshToken || !userJson) return null
     const expiresAt = parseInt(expiresAtStr ?? '0', 10)
     if (Date.now() / 1000 > expiresAt - 60) {
-      return this.refreshSession()
+      // A transient failure already scheduled a retry: don't start another
+      // refresh per read. The access token may still be good for a moment.
+      if (Date.now() < this.refreshBackoffUntil) return this._storedSession()
+      // A refused refresh is an expected state change: the session is already
+      // cleared and announced (onAuthStateChange(null)). Answer "no session" —
+      // getSession() runs from the gate, timers and background work, where a
+      // throw surfaced to Monitor as an `unhandled` error. refreshSession()
+      // says why the session ended.
+      // A TRANSIENT failure (offline, 429, 5xx) is not a sign-out either: the
+      // session is kept and a retry is scheduled, so the read answers with the
+      // stored session instead of throwing into the gate or a caller.
+      return this.refreshSession().catch((e: unknown) => {
+        if (isSessionEndError(e)) return null
+        return this._storedSession()
+      })
     }
     const user = JSON.parse(userJson) as OneloUser
     if (!user.id) {
@@ -633,16 +749,32 @@ export class OneloAuth {
     const epoch = this.signOutEpoch
     const refreshToken = await this.storage.get(TOKEN_KEYS.REFRESH_TOKEN)
     if (!refreshToken) return null
-    const { status, json } = await httpPost(
-      `${this.apiUrl}/api/sdk/auth/refresh`,
-      // Wire key MUST be snake_case `refresh_token`: the backend
-      // RefreshRequest model (sdk_auth.py) requires it and rejects a
-      // camelCase `refreshToken` with a hard 422 (the handler never runs).
-      // Matches every response payload + the Swift SDK request.
-      { publishableKey: this.publishableKey, refresh_token: refreshToken },
-      await this._secHeaders()
-    )
+    let res: Awaited<ReturnType<typeof httpPost>>
+    try {
+      res = await httpPost(
+        `${this.apiUrl}/api/sdk/auth/refresh`,
+        // Wire key MUST be snake_case `refresh_token`: the backend
+        // RefreshRequest model (sdk_auth.py) requires it and rejects a
+        // camelCase `refreshToken` with a hard 422 (the handler never runs).
+        // Matches every response payload + the Swift SDK request.
+        { publishableKey: this.publishableKey, refresh_token: refreshToken },
+        await this._secHeaders()
+      )
+    } catch (e) {
+      // Offline, or the response was lost after the server rotated the token.
+      // Keep the session; the retry re-reads storage and lands inside the
+      // server's grace window.
+      if (epoch === this.signOutEpoch) this._scheduleRefreshRetry()
+      throw e
+    }
+    const { status, json } = res
     checkHostedFlowRequired(json)
+    if (status === 429 || status >= 500) {
+      // Transient — incl. 503 `refresh_unavailable`: the presented token is
+      // STILL VALID. Never clear the session for it; retry with backoff.
+      if (epoch === this.signOutEpoch) this._scheduleRefreshRetry()
+      throw OneloError.server(`Session refresh is temporarily unavailable (HTTP ${status})`)
+    }
     const j = json as Record<string, unknown>
     // Only tear down when THIS refresh's epoch is still current — a signOut() or a
     // sign-in that superseded us mid-flight must not have its state clobbered by a
@@ -655,7 +787,22 @@ export class OneloAuth {
     // a concurrent sign-in that superseded this stale refresh must not be re-flagged.
     if (j['error'] === 'user_revoked') { if (epoch === this.signOutEpoch) this.isUserRevoked = true; await teardown(); throw OneloError.userRevoked() }
     if (j['error'] === 'app_revoked') { if (epoch === this.signOutEpoch) this.isRevoked = true; await teardown(); throw OneloError.revoked() }
-    if (status !== 200) { await teardown(); return null }
+    if (status !== 200) {
+      // A sign-out / newer sign-in superseded this refresh: its refusal is stale.
+      if (epoch !== this.signOutEpoch) return null
+      // The backend's reason sits in the HTTPException body:
+      // { detail: { error | error_code } } (sdk_auth.py refresh).
+      const detail = j['detail'] as Record<string, unknown> | undefined
+      const reason = (detail?.['error'] ?? detail?.['error_code']) as string | undefined
+      // Only a real ban says "suspended".
+      if (reason === 'banned') { this.isUserRevoked = true; await teardown(); throw OneloError.userRevoked() }
+      await teardown()
+      // A lapsed plan is plan-accurate, never "suspended".
+      if (reason === 'no_plan_available') throw OneloError.noActivePlan()
+      // session_compromised (token reused outside the server's grace window) /
+      // session_expired / session_invalid / any other refusal: neutral.
+      throw OneloError.sessionEnded()
+    }
     if (epoch !== this.signOutEpoch) return null
     const session = mapSession(j)
     await this.saveSession(session)
@@ -792,17 +939,17 @@ export class OneloAuth {
       // alone left a paying customer holding a stored "not allowed" — locked out
       // by the very call meant to let them in (found in JS/Swift/Flutter/
       // Electron, 2026-08-19). Absent stays undefined so the fallback applies.
-      const nextAllowedIn = typeof body['allowed_in'] === 'boolean'
-        ? (body['allowed_in'] as boolean)
-        : session.user.allowedIn
+      // #819: allowedIn, emailVerified and accessReason move together — a
+      // just-verified user must not keep a stored "not allowed".
+      const nextUser = mergeAccessAnswer({ ...session.user, entitlement: next }, body)
       // Don't resurrect a session that was signed out while this request was in
       // flight (epoch guard, parity with Swift).
-      const changed = next !== session.user.entitlement || nextAllowedIn !== session.user.allowedIn
+      const changed = next !== session.user.entitlement
+        || nextUser.allowedIn !== session.user.allowedIn
+        || nextUser.emailVerified !== session.user.emailVerified
+        || nextUser.accessReason !== session.user.accessReason
       if (changed && epoch === this.signOutEpoch) {
-        await this.saveSession({
-          ...session,
-          user: { ...session.user, entitlement: next, allowedIn: nextAllowedIn },
-        })
+        await this.saveSession({ ...session, user: nextUser })
       }
       return next
     } catch {
@@ -818,12 +965,17 @@ export class OneloAuth {
     return this.resolvedConfig?.paywallEnabled ?? false
   }
 
-  /** Branding "Page background" color (`checkout_bg_color`, --onelo-page-bg) from
-   *  `/api/sdk/config`. Native modals paint their WebView + container with this so
-   *  there is no white flash before the hosted page's own background renders.
-   *  Defaults to #111111 (the hosted-page default) before config resolves. */
+  /** The app's brand tokens (#681) from `/api/sdk/config` (refreshed by store /
+   *  portal / upgrade initiate responses). Every native modal paints its chrome
+   *  from these; the NEUTRAL set before config resolves — never Onelo orange. */
+  brandTokens(): BrandTokens {
+    return this.brand.current()
+  }
+
+  /** Branding "Page background" color — `brandTokens().page_bg`. Native modals
+   *  paint their WebView + container with it so there is no white flash. */
   pageBackgroundColor(): string {
-    return this.resolvedConfig?.pageBackgroundColor ?? '#111111'
+    return this.brand.current().page_bg
   }
 
   /** Plan-gated enabled OAuth providers (google/github/apple) from
@@ -890,6 +1042,8 @@ export class OneloAuth {
    * an idle app would carry a stale token past its TTL and the next request would 401.
    */
   private scheduleRefresh(session: OneloSession): void {
+    // A retry after a transient failure is pending: it owns the timer.
+    if (Date.now() < this.refreshBackoffUntil) return
     this.clearRefreshTimer()
     const nowSec = Date.now() / 1000
     const delaySec = session.expiresAt - nowSec - OneloAuth.REFRESH_LEAD_SECONDS
@@ -897,7 +1051,8 @@ export class OneloAuth {
     this.refreshTimer = setTimeout(() => {
       this.refreshTimer = null
       void this.refreshSession().catch(() => {
-        // Errors already handled inside refreshSession.
+        // Expected: an ended session is already cleared + announced; a
+        // transient failure keeps the session. Never escapes the timer.
       })
     }, delayMs)
   }
@@ -908,8 +1063,49 @@ export class OneloAuth {
       this.refreshTimer = null
     }
   }
+  /** The complete session in storage (read fresh — a sign-out may have
+   *  cleared it meanwhile), or null. */
+  private async _storedSession(): Promise<OneloSession | null> {
+    const [accessToken, refreshToken, expiresAtStr, userJson] = await Promise.all([
+      this.storage.get(TOKEN_KEYS.ACCESS_TOKEN),
+      this.storage.get(TOKEN_KEYS.REFRESH_TOKEN),
+      this.storage.get(TOKEN_KEYS.EXPIRES_AT),
+      this.storage.get(TOKEN_KEYS.USER_JSON),
+    ])
+    if (!accessToken || !refreshToken || !userJson) return null
+    try {
+      const user = JSON.parse(userJson) as OneloUser
+      if (!user.id) return null
+      return { accessToken, refreshToken, expiresAt: parseInt(expiresAtStr ?? '0', 10), user }
+    } catch {
+      return null
+    }
+  }
+
+  /** Re-arm the refresh after a transient failure, with backoff. Reset by the
+   *  next saved session. */
+  private _scheduleRefreshRetry(): void {
+    const delay = Math.min(
+      OneloAuth.REFRESH_RETRY_BASE_MS * 2 ** this.refreshRetryAttempt,
+      OneloAuth.REFRESH_RETRY_MAX_MS,
+    )
+    this.refreshRetryAttempt++
+    this.refreshBackoffUntil = Date.now() + delay
+    this.clearRefreshTimer()
+    this.refreshTimer = setTimeout(() => {
+      this.refreshTimer = null
+      this.refreshBackoffUntil = 0
+      void this.refreshSession().catch(() => {
+        // A further transient failure re-arms itself; an ended session is
+        // already cleared + announced. Never escapes the timer.
+      })
+    }, delay)
+  }
+
 
   private async saveSession(session: OneloSession): Promise<void> {
+    this.refreshRetryAttempt = 0
+    this.refreshBackoffUntil = 0
     await Promise.all([
       this.storage.set(TOKEN_KEYS.ACCESS_TOKEN, session.accessToken),
       this.storage.set(TOKEN_KEYS.REFRESH_TOKEN, session.refreshToken),
@@ -936,11 +1132,10 @@ export class OneloAuth {
 
   async sendMagicLink(email: string): Promise<void> {
     await this.initPromise
-    // NOTE — no `code_challenge` here, deliberately (2026-08-18). See the JS SDK
-    // for the full reasoning: `pkceVerifier` is in-memory and nulled after every
-    // password sign-in, while a magic link is opened later, often after a
-    // relaunch. A challenge bound to a verifier that no longer exists makes
-    // /hosted-callback 401, and the token is already used, so the link is burnt.
+    // NOTE — no `code_challenge` here, deliberately. This is the custom-UI
+    // link and stays unpaired: it must be opened on this device (#540, #542).
+    // The hosted sign-in's magic link is paired through the flow's own
+    // challenge (`_beginFlowPkce`), not through this call.
     const { status } = await httpPost(
       `${this.apiUrl}/api/sdk/auth/magic-link`,
       {
@@ -950,6 +1145,62 @@ export class OneloAuth {
       await this._secHeaders()
     )
     if (status !== 200) throw OneloError.server(`sendMagicLink failed: HTTP ${status}`)
+  }
+
+  /**
+   * Send the signed-in user a fresh Email Verification link (#819).
+   *
+   * Only for Apps with their own screen: when the parent App requires Email
+   * Verification, Onelo's hosted flow already shows "check your inbox" with a
+   * resend button and hands the session back by itself. The previous link
+   * stops working; at most 3 e-mails an hour (`verification_rate_limited`).
+   * Throws `email_verification_off` when the App has Email verification Off.
+   *
+   * `redirectTo` — your own landing page (an allowed web origin) or
+   * `<your-scheme>://…`; the link then carries `onelo_verify_token` for
+   * `confirmEmail`. Omitted, the link opens Onelo's hosted page.
+   */
+  async resendVerificationEmail(options: { redirectTo?: string } = {}): Promise<ResendVerificationResult> {
+    await this.initPromise
+    const session = await this.getSession()
+    if (!session) throw OneloError.notAuthenticated()
+    return postResendVerification({
+      apiUrl: this.apiUrl,
+      publishableKey: this.publishableKey,
+      post: httpPost,
+      accessToken: session.accessToken,
+      headers: await this._secHeaders(),
+      redirectTo: options.redirectTo,
+    })
+  }
+
+  /**
+   * Confirm the user's address with the `onelo_verify_token` your own landing
+   * page received from the verification link (#819). Single use. When a
+   * session is signed in on this device, it is refreshed so `isAllowedIn()`
+   * opens the app without waiting for the next scheduled refresh.
+   */
+  async confirmEmail(token: string): Promise<void> {
+    await this.initPromise
+    await postConfirmEmail({
+      apiUrl: this.apiUrl,
+      publishableKey: this.publishableKey,
+      post: httpPost,
+      token,
+      headers: await this._secHeaders(),
+    })
+    // Refresh, not revalidateEntitlement: /api/sdk/auth/user caches its answer
+    // per access token for 30 s, so a read right after confirming could still
+    // say "not allowed". /refresh builds the access answer fresh and rotates
+    // the token. Best-effort: the address IS confirmed; on failure the next
+    // scheduled refresh or foreground revalidation carries the new answer.
+    if (await this.getSession()) {
+      try {
+        await this.refreshSession()
+      } catch (e) {
+        console.warn('[onelo] confirmEmail: session refresh after confirming failed', e)
+      }
+    }
   }
 
   async sendPasswordReset(email: string): Promise<void> {
@@ -989,9 +1240,9 @@ export class OneloAuth {
    *    developer-built "Check your inbox" screen, not the hosted modal.
    *    Exchanges the code directly and returns the session.
    *
-   * Does NOT recover a flow whose PROCESS was killed and relaunched — the
-   * in-memory `_modalResolve`/`pkceVerifier` are gone either way, the same
-   * limitation every other Onelo SDK's live-process shortcut has.
+   * After a relaunch there is no pending flow, so the code is exchanged
+   * directly with the hosted flow's verifier kept in the Keychain (#542). For
+   * the URL that LAUNCHED the app, use `handleLaunchUrl`.
    *
    * Returns the session when this call itself completed the exchange (the
    * no-pending-flow case); `null` when the URL wasn't ours, or when a pending
@@ -1024,5 +1275,22 @@ export class OneloAuth {
 
     if (code) return this.exchangeHostedCode(code)
     return null
+  }
+
+  /**
+   * Complete a sign-in from the URL that launched the app, i.e.
+   * `await Linking.getInitialURL()` (#542). A magic link opened on this device
+   * after the app was killed arrives only there, never as a `'url'` event.
+   * `OneloAuthGate` calls this on mount; a host app with its own root should
+   * call it BEFORE `loadAuthView()`, because a new hosted flow replaces the
+   * stored verifier the link needs.
+   *
+   * Handled once per instance, since `getInitialURL()` keeps returning the
+   * same URL for the whole process. Same result as `handleAuthCallback`.
+   */
+  async handleLaunchUrl(url: string | null | undefined): Promise<OneloSession | null> {
+    if (this._launchUrlHandled || !url) return null
+    this._launchUrlHandled = true
+    return this.handleAuthCallback(url)
   }
 }

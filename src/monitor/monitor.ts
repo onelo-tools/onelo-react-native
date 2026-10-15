@@ -1,5 +1,6 @@
 import { version as SDK_VERSION } from '../../package.json'
 import { scrubText, scrubMeta } from './scrubber'
+import { classifyErrorOrigin } from '@onelo/core'
 
 export interface MonitorEventOptions {
   ok: boolean
@@ -543,7 +544,9 @@ export class OneloMonitor {
         const handler: GlobalErrorHandler = (err: unknown, isFatal?: boolean) => {
           try {
             const { message, stack, errorType } = _extractError(err)
-            this._push('unhandled', false, undefined, message, this._withError(undefined, stack, errorType), 'global_error')
+            // meta.origin: whose error this is (#548) — see classifyErrorOrigin.
+            this._push('unhandled', false, undefined, message,
+              { ...this._withError(undefined, stack, errorType), origin: classifyErrorOrigin(err) }, 'global_error')
           } catch {
             // never let monitoring break the crash path
           }

@@ -159,3 +159,48 @@ describe('OneloAuth.handleAuthCallback', () => {
     await expect(auth.handleAuthCallback('onelorn://callback?error=access_denied')).resolves.toBeNull()
   })
 })
+
+// #625 — the hosted page found its `art_` flow token dead (the modal sat in the
+// background past the 5-minute TTL) and navigated to
+// `<scheme>://callback?error=token_expired` (frontend/lib/auth-expiry-handback.ts).
+// The pending flow must start OVER on a fresh /flow/init URL and still complete.
+describe('a dead flow token handed back as token_expired', () => {
+  const OLD = 'https://hosted.onelo.tools/auth/hosted?token=art_old'
+  const NEW = 'https://hosted.onelo.tools/auth/hosted?token=art_new'
+
+  beforeEach(() => {
+    store.clear()
+    httpGetMock.mockClear()
+    httpPostMock.mockClear()
+  })
+
+  const flowInits = () => httpGetMock.mock.calls.filter((c) => String(c[0]).includes('/api/sdk/flow/init'))
+
+  async function waitForUrl(auth: OneloAuth, url: string): Promise<void> {
+    for (let i = 0; i < 50 && auth.getModalState().url !== url; i++) await new Promise((r) => setTimeout(r, 0))
+  }
+
+  it.each([
+    ['caught by the modal WebView (AuthModal → onResult)', 'modal'],
+    ['arriving through the app-root Linking handler', 'linking'],
+  ])('%s: reopens on a NEW hosted URL and the original promise completes', async (_n, via) => {
+    flow.value = { status: 200, json: { action: 'present', url: OLD } }
+    const auth = await makeAuth()
+    const pending = auth.loadAuthView()
+    await waitForModal(auth)
+    expect(auth.getModalState().url).toBe(OLD)
+
+    flow.value = { status: 200, json: { action: 'present', url: NEW } }
+    if (via === 'modal') auth.getModalState().onResult!({ type: 'expired' })
+    else await auth.handleAuthCallback('onelorn://callback?error=token_expired')
+
+    await waitForUrl(auth, NEW)
+    expect(auth.getModalState()).toMatchObject({ visible: true, url: NEW })
+    expect(flowInits()).toHaveLength(2)
+
+    await auth.handleAuthCallback('onelorn://callback?code=oac_new')
+    const session = await pending
+    expect(session?.user.id).toBe('u1')
+    await auth.signOut()
+  })
+})

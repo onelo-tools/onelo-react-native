@@ -1,6 +1,9 @@
 import { sdkHeaders } from '../sdk-headers'
 import { getInstanceId } from './instance-id'
 import { maybeSelfHealFromError } from '../attest'
+import {
+  bearerHeader, isInvalidUserToken, readUserToken, refreshAfterRefusal, userTokenAccepted, type UserTokenSource,
+} from './user-token'
 
 /**
  * OneloEventStream — ONE persistent SSE connection to
@@ -33,6 +36,12 @@ import { maybeSelfHealFromError } from '../attest'
  * headers, so we apply `sdkHeaders()` (X-SDK-Version / X-Bundle-Id / …) to the
  * stream request just like Swift's `applySecurityHeaders`.
  *
+ * The signed-in user is proven with `Authorization: Bearer <access token>`
+ * (#518), read fresh on EVERY (re)connect so a reconnect never carries an
+ * expired token. A refused token (`401 invalid_user_token`) is refreshed once
+ * and retried once; refused again, that connection is opened anonymous (no
+ * Bearer, no `userId`) and the next reconnect tries the user again.
+ *
  * ─────────────────────────────────────────────────────────────────────────
  * OWNERSHIP
  * ─────────────────────────────────────────────────────────────────────────
@@ -42,6 +51,13 @@ import { maybeSelfHealFromError } from '../attest'
  * reconnects, so nothing races `session.revoked`.
  */
 export type SseHandler = (data: Record<string, unknown>) => void
+/** Identity the open connection authenticated. `anonymousFallback` is true when
+ *  a signed-in user's token was refused and the connection went out without a
+ *  user — its snapshots must never replace that user's (#736). */
+export interface StreamConnectionIdentity {
+  userId: string | null
+  anonymousFallback: boolean
+}
 
 /** Optional overrides for {@link OneloEventStream.start}. Any omitted field keeps its current value. */
 export interface OneloEventStreamStartParams {
@@ -51,9 +67,13 @@ export interface OneloEventStreamStartParams {
   sinceVersion?: number
   /** Host app version (`app_version`). Omitted = keep current. */
   appVersion?: string
-  /** Host-supplied HMAC of the user id for secure-mode features (camelCase `userIdHash`). */
+  /** @deprecated Ignored: Secure Mode is retired, and the signed-in Onelo user
+   *  is proven with their access token automatically. */
   userIdHash?: string
 }
+
+/** Which user proof the next connection sends (see the class comment, #518). */
+type UserTokenStage = 'current' | 'refreshed' | 'anonymous'
 
 // Bounded backoff — near-instant recovery for a WiFi blip, no tight loop on a
 // hard failure. Verbatim from the Swift/JS clients: [1, 2, 5, 10, 30]s.
@@ -70,6 +90,7 @@ const DONE = 4
 
 export class OneloEventStream {
   private readonly handlers = new Map<string, SseHandler[]>()
+  private readonly connectionListeners: Array<(identity: StreamConnectionIdentity | null) => void> = []
 
   // Connection state.
   private xhr: XMLHttpRequest | null = null
@@ -83,8 +104,13 @@ export class OneloEventStream {
 
   // Query identity — the current values sent on the NEXT (re)connect.
   private userId: string | null = null
-  private userIdHash: string | undefined = undefined
   private sinceVersion = 0
+  // #518: `current` reads the session's token; `refreshed` sends the token a
+  // refresh just returned; `anonymous` sends neither token nor userId. Back to
+  // `current` once a connection is accepted.
+  private tokenStage: UserTokenStage = 'current'
+  private refreshedToken: string | null = null
+  private userTokenRefusedWarned = false
   private appVersion: string | undefined = undefined
 
   /**
@@ -117,7 +143,7 @@ export class OneloEventStream {
 
   /**
    * @param apiUrl          Base API URL (no trailing slash), e.g. `https://st.backend.onelo.tools`.
-   * @param publishableKey  `onelo_pk_...` — authenticates the stream via the `key` query param.
+   * @param publishableKey  `onelo_pk_...` — authenticates the stream via the `X-Publishable-Key` header (ADR-0003).
    * @param sdkVersion      SDK version string, forwarded as `sdk_version`.
    * @param bundleId        Host app bundle id, forwarded via `sdkHeaders()` as `X-Bundle-Id`.
    *
@@ -130,6 +156,8 @@ export class OneloEventStream {
     private readonly publishableKey: string,
     private readonly sdkVersion?: string,
     private readonly bundleId?: string,
+    /** The signed-in user's access token, sent as `Authorization: Bearer`. */
+    private readonly userToken?: UserTokenSource,
   ) {}
 
   /**
@@ -148,7 +176,7 @@ export class OneloEventStream {
    * Open (or re-open) the connection.
    *
    * Idempotent: a repeat call with identical params while already connected is a
-   * no-op (no needless reconnect). A changed userId / userIdHash / sinceVersion /
+   * no-op (no needless reconnect). A changed userId / sinceVersion /
    * appVersion reconnects so per-user routing stays correct.
    *
    * Downgrade refusal: once bound to a non-null userId, a `start({userId: null})`
@@ -170,22 +198,35 @@ export class OneloEventStream {
     // userId while features owns sinceVersion via updateSinceVersion()).
     const nextSinceVersion = params.sinceVersion ?? this.sinceVersion
     const nextAppVersion = params.appVersion ?? this.appVersion
-    const nextUserIdHash = params.userIdHash ?? this.userIdHash
 
     const changed =
       !this.started ||
       nextUserId !== this.userId ||
-      nextUserIdHash !== this.userIdHash ||
       nextSinceVersion !== this.sinceVersion ||
       nextAppVersion !== this.appVersion
 
+    if (nextUserId !== this.userId) this._resetTokenStage()
     this.userId = nextUserId
-    this.userIdHash = nextUserIdHash
     this.sinceVersion = nextSinceVersion
     this.appVersion = nextAppVersion
     this.started = true
 
     if (changed) this._connect()
+  }
+
+  /**
+   * Observe which identity the open connection actually authenticated — distinct
+   * from the requested user: a refused token opens an anonymous-fallback
+   * connection. `null` while no connection is open.
+   */
+  onConnectionIdentity(fn: (identity: StreamConnectionIdentity | null) => void): void {
+    this.connectionListeners.push(fn)
+  }
+
+  private _setConnectionIdentity(identity: StreamConnectionIdentity | null): void {
+    for (const fn of this.connectionListeners) {
+      try { fn(identity) } catch { /* a listener must never break the stream */ }
+    }
   }
 
   /**
@@ -204,7 +245,9 @@ export class OneloEventStream {
    * resumes delivery.
    */
   stop(): void {
+    this._setConnectionIdentity(null)
     this.started = false
+    this._resetTokenStage()
     this._clearReconnect()
     this._closeXhr()
   }
@@ -226,6 +269,7 @@ export class OneloEventStream {
     // can't tear down this connection a moment later.
     this._clearReconnect()
     this._closeXhr() // bumps connGen → invalidates any in-flight _openXhr
+    this._setConnectionIdentity(null)
 
     // Reset the incremental parser for the new (independent) responseText.
     this.offset = 0
@@ -252,11 +296,18 @@ export class OneloEventStream {
     try {
       securityHeaders = await sdkHeaders(this.bundleId)
     } catch { securityHeaders = {} }
+    // The user's proof for THIS connection, read now so a reconnect always
+    // carries a current token (never one cached from an earlier connect).
+    const stage = this.tokenStage
+    const requestedUserId = this.userId
+    const userToken = stage === 'current'
+      ? await readUserToken(this.userToken ? () => this.userToken!.current() : undefined)
+      : stage === 'refreshed' ? this.refreshedToken : null
 
     // Superseded (newer connect) or torn down (stop/destroy) while awaiting.
     if (gen !== this.connGen || this.destroyed || !this.started) return
 
-    const url = this._buildUrl(instanceId)
+    const url = this._buildUrl(instanceId, stage === 'anonymous')
     const xhr = new XMLHttpRequest()
     this.xhr = xhr
 
@@ -286,9 +337,22 @@ export class OneloEventStream {
     const checkStatus = (): boolean => {
       if (statusChecked) return statusOk
       if (xhr.readyState < HEADERS_RECEIVED) return false
+      // A 401 may be the user's token being refused (#518): wait for its small
+      // JSON body, which is the only thing that tells it apart.
+      if (xhr.status === 401 && userToken !== null && xhr.readyState < DONE) return false
       statusChecked = true
       statusOk = xhr.status === 200
-      if (!statusOk) {
+      if (statusOk) {
+        this._setConnectionIdentity({
+          userId: requestedUserId,
+          anonymousFallback: stage === 'anonymous' && requestedUserId !== null,
+        })
+        this._resetTokenStage()
+        if (userToken !== null) userTokenAccepted(this.userToken)
+      } else if (userToken !== null && xhr.status === 401 && this._refusedUserToken(xhr)) {
+        end(false)
+        void this._retryAfterRefusedToken(stage)
+      } else {
         // The SSE reconnect loop retries FOREVER on backoff — without this, a
         // stale cached attest/integrity credential (backend registration
         // changed underneath it) would keep 403ing on every single reconnect,
@@ -337,6 +401,10 @@ export class OneloEventStream {
         ...securityHeaders,
         Accept: 'text/event-stream',
         'Cache-Control': 'no-cache',
+        // ADR-0003: the Event Stream's credential. A header-authenticated
+        // connection carries no `Deprecation`/`Sunset` — unlike `?key=`.
+        'X-Publishable-Key': this.publishableKey,
+        ...bearerHeader(userToken),
       }
       for (const [k, v] of Object.entries(headers)) {
         try { xhr.setRequestHeader(k, v) } catch { /* ignore an invalid header name */ }
@@ -432,21 +500,72 @@ export class OneloEventStream {
     }
   }
 
-  private _buildUrl(instanceId: string): string {
+  /** True when a finished 401 answered `invalid_user_token`. */
+  private _refusedUserToken(xhr: XMLHttpRequest): boolean {
+    try {
+      const body = xhr.responseText
+      return !!body && isInvalidUserToken(xhr.status, JSON.parse(body))
+    } catch {
+      return false
+    }
+  }
+
+  /**
+   * The server refused the user's token. From `current`: refresh once and
+   * reconnect with the new token. From `refreshed` (or when the refresh yields
+   * no token): reconnect anonymous and warn. Reconnects immediately — each step
+   * happens at most once, so this cannot loop.
+   */
+  private async _retryAfterRefusedToken(stage: UserTokenStage): Promise<void> {
+    const gen = this.connGen
+    if (stage === 'current') {
+      // At most one refresh per refusal episode, shared with Features (#518 R1-1).
+      const fresh = await refreshAfterRefusal(this.userToken)
+      // Superseded (a newer connect / stop) while refreshing.
+      if (gen !== this.connGen || this.destroyed || !this.started) return
+      if (fresh !== null) {
+        this.tokenStage = 'refreshed'
+        this.refreshedToken = fresh
+        this._connect()
+        return
+      }
+    }
+    this.tokenStage = 'anonymous'
+    this.refreshedToken = null
+    this._warnUserTokenRefused()
+    this._connect()
+  }
+
+  private _resetTokenStage(): void {
+    this.tokenStage = 'current'
+    this.refreshedToken = null
+  }
+
+  private _warnUserTokenRefused(): void {
+    if (this.userTokenRefusedWarned) return
+    this.userTokenRefusedWarned = true
+    console.warn(
+      '[Onelo] The signed-in user\'s access token was refused by the Event Stream (invalid_user_token) ' +
+      'even after a refresh, so the stream was opened without a user.',
+    )
+  }
+
+  private _buildUrl(instanceId: string, anonymous: boolean): string {
     // Build the query string by hand: RN's URLSearchParams support is partial and
     // historically buggy (`.toString()`), so we avoid it entirely.
     const parts: string[] = []
     const add = (k: string, v: string): void => { parts.push(`${k}=${encodeURIComponent(v)}`) }
 
-    add('key', this.publishableKey)
+    // The key is NOT here — it travels as the `X-Publishable-Key` request
+    // header (ADR-0003), so it never reaches the reverse proxy's access.log.
     add('since_version', String(this.sinceVersion))
     if (instanceId) add('instance_id', instanceId)
     add('sdk_platform', 'react-native')
     if (this.sdkVersion) add('sdk_version', this.sdkVersion)
     if (this.appVersion) add('app_version', this.appVersion)
     if (this.featureEnvironment) add('environment', this.featureEnvironment)
-    if (this.userId) add('userId', this.userId)
-    if (this.userIdHash) add('userIdHash', this.userIdHash)
+    // A connection whose user token was refused is anonymous: no `userId`.
+    if (this.userId && !anonymous) add('userId', this.userId)
 
     return `${this.apiUrl}/api/sdk/features/stream?${parts.join('&')}`
   }

@@ -39,6 +39,7 @@ var require_types = __commonJS({
     "use strict";
     Object.defineProperty(exports2, "__esModule", { value: true });
     exports2.OneloError = void 0;
+    exports2.isSessionEndError = isSessionEndError2;
     exports2.extractErrorCode = extractErrorCode2;
     var OneloError7 = class _OneloError extends Error {
       constructor(code, message) {
@@ -87,11 +88,43 @@ var require_types = __commonJS({
       static revoked() {
         return new _OneloError("revoked", "This application has been revoked");
       }
+      /** The account was BANNED. Only a real ban may say "suspended" — never an
+       *  ended or replaced session (see sessionEnded). */
       static userRevoked() {
         return new _OneloError("user_revoked", "This user account has been suspended");
       }
+      /**
+       * The session is over — it expired, was replaced (`session_compromised`:
+       * the same refresh token was presented again outside the server's grace
+       * window) or is not recognised (`session_invalid`). NOT an account action:
+       * the user just signs in again. The SDK has already cleared the session and
+       * fired `onAuthStateChange(null)`.
+       */
+      static sessionEnded() {
+        return new _OneloError("session_ended", "Your session ended \u2014 please sign in again");
+      }
+      /** Email Verification (#819): at most 3 verification e-mails an hour. */
+      static verificationRateLimited() {
+        return new _OneloError("verification_rate_limited", "At most 3 verification emails an hour \u2014 try again later");
+      }
+      /** Email Verification is Off for this App (Auth → Sign-up on the parent App). */
+      static emailVerificationOff() {
+        return new _OneloError("email_verification_off", "Email verification is off for this app \u2014 turn it on in Auth \u2192 Sign-up");
+      }
+      /** The `redirectTo` given for the verification link is not one of the App's
+       *  allowed web origins, nor `<registered-scheme>://…`. */
+      static invalidVerifyRedirect() {
+        return new _OneloError("invalid_verify_redirect", "redirectTo must be one of this app's allowed web origins or <your-scheme>://\u2026");
+      }
+      /** The verification link was used, replaced by a newer one, or expired. */
+      static invalidVerificationToken() {
+        return new _OneloError("invalid_verification_token", "This verification link is invalid, already used, replaced by a newer one, or expired");
+      }
     };
     exports2.OneloError = OneloError7;
+    function isSessionEndError2(e) {
+      return e instanceof OneloError7 && (e.code === "session_ended" || e.code === "user_revoked" || e.code === "no_active_plan");
+    }
     function extractErrorCode2(json) {
       if (!json || typeof json !== "object")
         return void 0;
@@ -155,27 +188,31 @@ var require_http = __commonJS({
       } catch (e) {
         throw types_1.OneloError.network(e instanceof Error ? e.message : "fetch failed");
       }
-      const json = await parseJson(res);
-      return { status: res.status, json };
+      return readBody(res);
     }
-    async function httpPost5(url, body, headers) {
+    async function httpPost5(url, body, headers, signal) {
       let res;
       try {
         res = await fetch(url, {
           method: "POST",
           headers: { "Content-Type": "application/json", ...headers },
-          body: JSON.stringify(body)
+          body: JSON.stringify(body),
+          signal
         });
       } catch (e) {
         throw types_1.OneloError.network(e instanceof Error ? e.message : "fetch failed");
       }
-      const json = await parseJson(res);
-      return { status: res.status, json };
+      return readBody(res);
     }
-    async function parseJson(res) {
+    async function readBody(res) {
+      const refusal = res.status === 401 || res.status === 403;
       try {
-        return await res.json();
+        return { status: res.status, json: await res.json() };
       } catch {
+        if (refusal) {
+          console.warn(`[Onelo] ${res.status} carried an unreadable (non-JSON) body \u2014 treating it as a refusal. This is usually an edge, proxy or WAF page rather than the API itself.`);
+          return { status: res.status, json: {} };
+        }
         throw types_1.OneloError.network("Invalid JSON response");
       }
     }
@@ -199,6 +236,8 @@ var require_session = __commonJS({
     Object.defineProperty(exports2, "__esModule", { value: true });
     exports2.TOKEN_KEYS = void 0;
     exports2.mapSession = mapSession2;
+    exports2.verificationFields = verificationFields;
+    exports2.mergeAccessAnswer = mergeAccessAnswer2;
     function mapSession2(j) {
       const tokens = j["session"] ?? j;
       const user = j["user"];
@@ -220,8 +259,25 @@ var require_session = __commonJS({
           // Undefined (not false) when the backend did not send it: "the server did
           // not say" and "the server said no" are different, and only the first may
           // fall back to the old client-side derivation.
-          allowedIn: typeof user["allowed_in"] === "boolean" ? user["allowed_in"] : void 0
+          allowedIn: typeof user["allowed_in"] === "boolean" ? user["allowed_in"] : void 0,
+          ...verificationFields(user)
         }
+      };
+    }
+    function verificationFields(user) {
+      return {
+        emailVerified: typeof user["email_verified"] === "boolean" ? user["email_verified"] : void 0,
+        accessReason: typeof user["access_reason"] === "string" ? user["access_reason"] : void 0
+      };
+    }
+    function mergeAccessAnswer2(previous, body) {
+      const fresh = verificationFields(body);
+      const answered = typeof body["allowed_in"] === "boolean";
+      return {
+        ...previous,
+        allowedIn: answered ? body["allowed_in"] : previous.allowedIn,
+        emailVerified: fresh.emailVerified ?? previous.emailVerified,
+        accessReason: answered ? fresh.accessReason : previous.accessReason
       };
     }
     exports2.TOKEN_KEYS = {
@@ -283,6 +339,360 @@ var require_reason_enum = __commonJS({
   }
 });
 
+// ../onelo-core/dist/error-origin.js
+var require_error_origin = __commonJS({
+  "../onelo-core/dist/error-origin.js"(exports2) {
+    "use strict";
+    Object.defineProperty(exports2, "__esModule", { value: true });
+    exports2.classifyErrorOrigin = classifyErrorOrigin2;
+    var SDK_FRAME = /@onelo[/_](?:js|electron|react-native|core)\b|\/onelo-(?:js|electron|react-native|core)\/(?:src|dist)\//;
+    function topFrame(stack) {
+      for (const raw of stack.split("\n")) {
+        const line = raw.trim();
+        if (line.startsWith("at "))
+          return line;
+        if (/@\S+:\d+/.test(line) || /^\S+:\d+:\d+$/.test(line))
+          return line;
+      }
+      return void 0;
+    }
+    function classifyErrorOrigin2(error, stack) {
+      if (error instanceof Error && error.name === "OneloError")
+        return "onelo_sdk";
+      const s = stack ?? (error instanceof Error ? error.stack : void 0);
+      const frame = s ? topFrame(s) : void 0;
+      return frame && SDK_FRAME.test(frame) ? "onelo_sdk" : "app";
+    }
+  }
+});
+
+// ../onelo-core/dist/brand-tokens.js
+var require_brand_tokens = __commonJS({
+  "../onelo-core/dist/brand-tokens.js"(exports2) {
+    "use strict";
+    Object.defineProperty(exports2, "__esModule", { value: true });
+    exports2.BrandSource = exports2.NEUTRAL_BRAND_TOKENS = void 0;
+    exports2.brandColorValue = brandColorValue;
+    exports2.relativeLuminance = relativeLuminance;
+    exports2.brandTokensFromLegacy = brandTokensFromLegacy2;
+    exports2.parseBrandTokens = parseBrandTokens;
+    exports2.brandTokensFromResponse = brandTokensFromResponse2;
+    exports2.withAlpha = withAlpha;
+    exports2.statusColor = statusColor2;
+    exports2.skeletonCss = skeletonCss2;
+    exports2.spinnerCss = spinnerCss;
+    exports2.portalSkeletonHtml = portalSkeletonHtml2;
+    exports2.feedbackSkeletonHtml = feedbackSkeletonHtml2;
+    var SYSTEM_FONT = '-apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
+    var DARK = {
+      card_bg: "#1a1a1a",
+      text: "#ffffff",
+      text_muted: "rgba(255,255,255,0.6)",
+      border: "#2a2a2a",
+      spinner_track: "rgba(255,255,255,0.18)"
+    };
+    var LIGHT = {
+      card_bg: "#ffffff",
+      text: "#111111",
+      text_muted: "rgba(17,17,17,0.65)",
+      border: "#e4e4e7",
+      spinner_track: "rgba(0,0,0,0.12)"
+    };
+    exports2.NEUTRAL_BRAND_TOKENS = Object.freeze({
+      version: 1,
+      page_bg: "#111111",
+      brand: "#a1a1aa",
+      ...DARK,
+      button_bg: "#a1a1aa",
+      button_text: "#111111",
+      button_radius: 14,
+      field_radius: 14,
+      card_radius: 14,
+      body_font: SYSTEM_FONT,
+      heading_font: SYSTEM_FONT,
+      light_bg: false
+    });
+    var HEX = /^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$/;
+    var RGBA = /^rgba?\(\s*[0-9.]+\s*,\s*[0-9.]+\s*,\s*[0-9.]+\s*(?:,\s*[0-9.]+\s*)?\)$/;
+    var FONT = /^[A-Za-z0-9 ,'"_-]{1,200}$/;
+    function brandColorValue(raw) {
+      if (typeof raw !== "string")
+        return null;
+      const v = raw.trim();
+      return HEX.test(v) || RGBA.test(v) ? v : null;
+    }
+    function hexOnly(raw) {
+      const v = brandColorValue(raw);
+      return v && v.startsWith("#") ? v : null;
+    }
+    function radius(raw) {
+      return typeof raw === "number" && Number.isFinite(raw) && raw >= 0 && raw <= 100 ? raw : null;
+    }
+    function font(raw) {
+      if (typeof raw !== "string")
+        return null;
+      const v = raw.trim();
+      return FONT.test(v) ? v : null;
+    }
+    function relativeLuminance(hex) {
+      let h = hex.replace("#", "");
+      if (h.length === 3)
+        h = h.split("").map((c) => c + c).join("");
+      if (h.length !== 6 && h.length !== 8)
+        return null;
+      const ch = [0, 2, 4].map((i) => parseInt(h.slice(i, i + 2), 16) / 255);
+      if (ch.some((c) => Number.isNaN(c)))
+        return null;
+      const lin = ch.map((c) => c <= 0.03928 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4));
+      return 0.2126 * lin[0] + 0.7152 * lin[1] + 0.0722 * lin[2];
+    }
+    function brandTokensFromLegacy2(primaryColor, pageBg) {
+      const bg = hexOnly(pageBg) ?? exports2.NEUTRAL_BRAND_TOKENS.page_bg;
+      const lightBg = (relativeLuminance(bg) ?? 0) > 0.5;
+      const brand = hexOnly(primaryColor);
+      return {
+        ...exports2.NEUTRAL_BRAND_TOKENS,
+        ...lightBg ? LIGHT : DARK,
+        page_bg: bg,
+        light_bg: lightBg,
+        brand: brand ?? exports2.NEUTRAL_BRAND_TOKENS.brand,
+        button_bg: brand ?? exports2.NEUTRAL_BRAND_TOKENS.button_bg,
+        // The registry's button text default is white; the neutral grey takes dark.
+        button_text: brand ? "#ffffff" : exports2.NEUTRAL_BRAND_TOKENS.button_text
+      };
+    }
+    function parseBrandTokens(raw, fallback = exports2.NEUTRAL_BRAND_TOKENS) {
+      if (!raw || typeof raw !== "object" || Array.isArray(raw))
+        return null;
+      const o = raw;
+      const version = typeof o.version === "number" && Number.isFinite(o.version) ? o.version : 1;
+      const c = (k) => brandColorValue(o[k]) ?? fallback[k];
+      return {
+        version,
+        page_bg: c("page_bg"),
+        brand: c("brand"),
+        card_bg: c("card_bg"),
+        text: c("text"),
+        text_muted: c("text_muted"),
+        border: c("border"),
+        button_bg: c("button_bg"),
+        button_text: c("button_text"),
+        button_radius: radius(o.button_radius) ?? fallback.button_radius,
+        field_radius: radius(o.field_radius) ?? fallback.field_radius,
+        card_radius: radius(o.card_radius) ?? fallback.card_radius,
+        body_font: font(o.body_font) ?? fallback.body_font,
+        heading_font: font(o.heading_font) ?? fallback.heading_font,
+        spinner_track: c("spinner_track"),
+        light_bg: typeof o.light_bg === "boolean" ? o.light_bg : fallback.light_bg
+      };
+    }
+    function brandTokensFromResponse2(json) {
+      if (!json || typeof json !== "object")
+        return null;
+      const j = json;
+      const hasLegacy = hexOnly(j.primary_color) !== null || hexOnly(j.checkout_bg_color) !== null;
+      const legacy = brandTokensFromLegacy2(j.primary_color, j.checkout_bg_color);
+      return parseBrandTokens(j.brand_tokens, legacy) ?? (hasLegacy ? legacy : null);
+    }
+    function withAlpha(color, alpha) {
+      if (!color.startsWith("#"))
+        return color;
+      let h = color.slice(1);
+      if (h.length === 3)
+        h = h.split("").map((c) => c + c).join("");
+      const [r, g, b] = [0, 2, 4].map((i) => parseInt(h.slice(i, i + 2), 16));
+      return `rgba(${r},${g},${b},${alpha})`;
+    }
+    function statusColor2(t, tone) {
+      const STATUS = {
+        success: { dark: "#22c55e", light: "#15803d" },
+        danger: { dark: "#f87171", light: "#dc2626" },
+        warning: { dark: "#fbbf24", light: "#b45309" }
+      };
+      return STATUS[tone][t.light_bg ? "light" : "dark"];
+    }
+    var BrandSource5 = class {
+      constructor() {
+        this.tokens = exports2.NEUTRAL_BRAND_TOKENS;
+      }
+      current() {
+        return this.tokens;
+      }
+      set(tokens) {
+        if (tokens)
+          this.tokens = tokens;
+      }
+      /** Adopt the branding a config / initiate response carries (if any) and
+       *  return the tokens to paint with. */
+      adopt(json) {
+        this.set(brandTokensFromResponse2(json));
+        return this.tokens;
+      }
+    };
+    exports2.BrandSource = BrandSource5;
+    function skeletonCss2(t) {
+      const sweep = `background-image:linear-gradient(90deg,transparent 0%,${t.spinner_track} 50%,transparent 100%);background-size:60vw 100%;background-repeat:no-repeat;background-attachment:fixed;animation:onelo-shimmer 2.4s linear infinite`;
+      return [
+        "@keyframes onelo-shimmer{0%{background-position:-60vw 0}100%{background-position:100vw 0}}",
+        `.sk{background-color:${t.card_bg};${sweep};border-radius:${t.field_radius}px}`,
+        `.strong{background-color:${t.border};${sweep};border-radius:${t.field_radius}px}`
+      ].join("\n");
+    }
+    function spinnerCss(t, cls = "sp") {
+      return `@keyframes onelo-op-spin{to{transform:rotate(360deg)}}
+.${cls}{width:28px;height:28px;border-radius:9999px;border:3px solid ${t.spinner_track};border-top-color:${t.brand};animation:onelo-op-spin 0.8s linear infinite}`;
+    }
+    function portalSkeletonHtml2(t = exports2.NEUTRAL_BRAND_TOKENS) {
+      return `<!DOCTYPE html><html><head>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:${t.page_bg};font-family:${t.body_font};overflow:hidden}
+${skeletonCss2(t)}
+.wrap{display:flex;flex-direction:column;align-items:center;width:100%;padding:48px 24px 0}
+.col{width:100%;max-width:432px;display:flex;flex-direction:column;gap:14px}
+.icon{width:64px;height:64px;border-radius:${t.card_radius}px;margin-bottom:14px;border:1.5px solid ${t.border}}
+.title{width:200px;height:22px;margin-bottom:10px}
+.sub{width:80px;height:13px;opacity:0.7;margin-bottom:32px}
+.c1{height:240px;border-radius:${t.card_radius}px}
+.c2{height:80px;border-radius:${t.card_radius}px}
+.c3{height:140px;border-radius:${t.card_radius}px}
+</style></head><body>
+<div class="wrap">
+<div class="sk icon"></div>
+<div class="sk title"></div>
+<div class="sk sub"></div>
+<div class="col"><div class="strong c1"></div><div class="strong c2"></div><div class="strong c3"></div></div>
+</div>
+</body></html>`;
+    }
+    function feedbackSkeletonHtml2(t = exports2.NEUTRAL_BRAND_TOKENS) {
+      return `<!DOCTYPE html><html><head>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:${t.page_bg};font-family:${t.body_font};padding:40px 36px 32px;overflow:hidden}
+${skeletonCss2(t)}
+.icon{width:64px;height:64px;border-radius:${t.card_radius}px;margin:0 auto 16px}
+.title{width:220px;height:22px;margin:0 auto 40px}
+.cards{display:flex;gap:12px;margin-bottom:32px}
+.card{flex:1;height:76px;border-radius:${t.card_radius}px}
+.label{width:60px;height:13px;margin-bottom:8px}
+.input{width:100%;height:44px;margin-bottom:24px}
+.textarea{width:100%;height:110px;margin-bottom:32px}
+.btn{width:100%;height:48px;border-radius:${t.button_radius}px}
+</style></head><body>
+<div class="sk icon"></div>
+<div class="sk title"></div>
+<div class="cards"><div class="sk card"></div><div class="sk card"></div><div class="sk card"></div></div>
+<div class="sk label"></div>
+<div class="strong input"></div>
+<div class="sk label"></div>
+<div class="strong textarea"></div>
+<div class="strong btn"></div>
+</body></html>`;
+    }
+  }
+});
+
+// ../onelo-core/dist/verification.js
+var require_verification = __commonJS({
+  "../onelo-core/dist/verification.js"(exports2) {
+    "use strict";
+    Object.defineProperty(exports2, "__esModule", { value: true });
+    exports2.VERIFY_TOKEN_PARAM = void 0;
+    exports2.resendVerificationEmail = resendVerificationEmail;
+    exports2.confirmEmail = confirmEmail;
+    var http_1 = require_http();
+    var types_1 = require_types();
+    async function resendVerificationEmail(opts) {
+      const body = { publishableKey: opts.publishableKey };
+      if (opts.redirectTo)
+        body.verify_redirect_to = opts.redirectTo;
+      const { status, json } = await (opts.post ?? http_1.httpPost)(`${opts.apiUrl}/api/sdk/auth/verify-email/resend`, body, { ...opts.headers, Authorization: `Bearer ${opts.accessToken}` });
+      if (status === 200) {
+        const j = json;
+        return { sent: j["sent"] === true, emailVerified: j["email_verified"] === true };
+      }
+      const code = (0, types_1.extractErrorCode)(json);
+      if (status === 429 || code === "verification_rate_limited")
+        throw types_1.OneloError.verificationRateLimited();
+      if (status === 409 || code === "email_verification_off")
+        throw types_1.OneloError.emailVerificationOff();
+      if (status === 400 && code === "invalid_verify_redirect_to")
+        throw types_1.OneloError.invalidVerifyRedirect();
+      if (status === 401)
+        throw types_1.OneloError.notAuthenticated();
+      throw types_1.OneloError.server(`Verification email request failed: HTTP ${status}`);
+    }
+    async function confirmEmail(opts) {
+      const { status, json } = await (opts.post ?? http_1.httpPost)(`${opts.apiUrl}/api/sdk/auth/verify-email/confirm`, { publishableKey: opts.publishableKey, token: opts.token }, opts.headers);
+      if (status === 200)
+        return;
+      if (status === 400 && (0, types_1.extractErrorCode)(json) === "invalid_token")
+        throw types_1.OneloError.invalidVerificationToken();
+      throw types_1.OneloError.server(`Email confirmation failed: HTTP ${status}`);
+    }
+    exports2.VERIFY_TOKEN_PARAM = "onelo_verify_token";
+  }
+});
+
+// ../onelo-core/dist/marketing-consent.js
+var require_marketing_consent = __commonJS({
+  "../onelo-core/dist/marketing-consent.js"(exports2) {
+    "use strict";
+    Object.defineProperty(exports2, "__esModule", { value: true });
+    exports2.NO_SIGNUP_MARKETING_CONSENT = void 0;
+    exports2.signupMarketingConsentFromConfig = signupMarketingConsentFromConfig2;
+    exports2.deviceLanguage = deviceLanguage;
+    exports2.configLanguageParam = configLanguageParam2;
+    exports2.signUpConsentFields = signUpConsentFields2;
+    exports2.waitlistConsentField = waitlistConsentField2;
+    exports2.NO_SIGNUP_MARKETING_CONSENT = { asked: false, text: null, language: null };
+    function signupMarketingConsentFromConfig2(json) {
+      const raw = json["signup_marketing_consent"];
+      if (!raw || typeof raw !== "object")
+        return exports2.NO_SIGNUP_MARKETING_CONSENT;
+      return {
+        asked: raw["asked"] === true,
+        text: typeof raw["text"] === "string" ? raw["text"] : null,
+        language: typeof raw["language"] === "string" ? raw["language"] : null
+      };
+    }
+    function deviceLanguage() {
+      try {
+        const nav = globalThis.navigator;
+        if (nav?.language)
+          return nav.language;
+        const locale = Intl.DateTimeFormat().resolvedOptions().locale;
+        if (locale)
+          return locale;
+      } catch {
+      }
+      return "en";
+    }
+    function configLanguageParam2(language = deviceLanguage()) {
+      return `&lang=${encodeURIComponent(language)}`;
+    }
+    function signUpConsentFields2(options, question) {
+      if (options?.marketingConsent !== true)
+        return {};
+      return { marketing_consent: true, lang: question.language ?? deviceLanguage() };
+    }
+    function waitlistConsentField2(options) {
+      const consent = options?.consent;
+      if (!consent)
+        return {};
+      const out = {};
+      if (consent.marketing !== void 0)
+        out.marketing = consent.marketing === true;
+      if (consent.custom !== void 0)
+        out.custom = consent.custom === true;
+      return Object.keys(out).length > 0 ? { consent: out } : {};
+    }
+  }
+});
+
 // ../onelo-core/dist/index.js
 var require_dist = __commonJS({
   "../onelo-core/dist/index.js"(exports2) {
@@ -309,6 +719,10 @@ var require_dist = __commonJS({
     __exportStar(require_http(), exports2);
     __exportStar(require_session(), exports2);
     __exportStar(require_reason_enum(), exports2);
+    __exportStar(require_error_origin(), exports2);
+    __exportStar(require_brand_tokens(), exports2);
+    __exportStar(require_verification(), exports2);
+    __exportStar(require_marketing_consent(), exports2);
   }
 });
 
@@ -355,7 +769,7 @@ var init_storage = __esm({
         }
       }
       async clear() {
-        const keys = ["onelo_access_token", "onelo_refresh_token", "onelo_expires_at", "onelo_user"];
+        const keys = ["onelo_access_token", "onelo_refresh_token", "onelo_expires_at", "onelo_user", "onelo_magic_link_verifier"];
         await Promise.all(keys.map((k) => this.delete(k)));
       }
     };
@@ -367,7 +781,7 @@ var require_package = __commonJS({
   "package.json"(exports2, module2) {
     module2.exports = {
       name: "@onelo/react-native",
-      version: "0.38.3",
+      version: "0.53.1",
       description: "Onelo React Native SDK",
       main: "./dist/index.js",
       types: "./dist/index.d.ts",
@@ -1047,6 +1461,9 @@ async function sdkHeaders(bundleId, publishableKey, assertion) {
   const assertionHeaders = assertion ? await getAssertionHeaders(assertion.method, assertion.path, assertion.query ?? "", assertion.body ?? "") : null;
   return {
     "X-SDK-Version": import_package.version,
+    // WHICH SDK, by registry key (#122): the dashboard compares X-SDK-Version
+    // against LATEST_SDK_VERSIONS[this] instead of guessing from app_type.
+    "X-Onelo-Sdk-Name": "onelo-react-native",
     "X-Onelo-Instance-Id": instanceId,
     "X-Onelo-Sdk-Platform": "react-native",
     "X-Onelo-OS": currentOS(),
@@ -1082,7 +1499,7 @@ __export(index_exports, {
   OneloAuthGate: () => OneloAuthGate,
   OneloConsent: () => OneloConsent,
   OneloCustomerPortal: () => OneloCustomerPortal,
-  OneloError: () => import_core8.OneloError,
+  OneloError: () => import_core15.OneloError,
   OneloFeatures: () => OneloFeatures,
   OneloFeaturesError: () => OneloFeaturesError,
   OneloFeedback: () => OneloFeedback,
@@ -1090,8 +1507,8 @@ __export(index_exports, {
   OneloMonitor: () => OneloMonitor,
   OneloStore: () => OneloStore,
   OneloWaitlist: () => OneloWaitlist,
-  REASON_LABELS: () => import_core9.REASON_LABELS,
-  RESPONSE_REASON_CODES: () => import_core9.RESPONSE_REASON_CODES,
+  REASON_LABELS: () => import_core16.REASON_LABELS,
+  RESPONSE_REASON_CODES: () => import_core16.RESPONSE_REASON_CODES,
   StoreModal: () => StoreModal,
   StoreModalView: () => StoreModalView,
   parseConsentMessage: () => parseConsentMessage,
@@ -1102,8 +1519,73 @@ __export(index_exports, {
 });
 module.exports = __toCommonJS(index_exports);
 
+// src/core/plan-change.ts
+function planChangeOf(hb) {
+  if (hb.kind === "purchase") return { kind: "purchase" };
+  if (hb.kind === "switched") return { kind: "switched", reason: hb.reason ?? "" };
+  return void 0;
+}
+var PLAN_SWITCH_PENDING = "plan_switch_pending";
+var PENDING_RECHECK_DELAYS_MS = [1e3, 2e3, 4e3, 8e3, 15e3];
+var PlanChangeRefresher = class {
+  constructor(targets, delaysMs = PENDING_RECHECK_DELAYS_MS) {
+    this.targets = targets;
+    this.delaysMs = delaysMs;
+    this.generation = 0;
+    this.timer = null;
+  }
+  /** React to a finished hosted page. Resolves once the immediate refresh is
+   *  done; pending re-checks continue in the background. */
+  async handBack(change) {
+    if (change.kind !== "purchase" && change.kind !== "switched") return;
+    const generation = ++this.generation;
+    this.clearTimer();
+    const before = this.targets.snapshot();
+    await Promise.all([
+      this.targets.refreshFeatures().catch(() => {
+      }),
+      this.targets.revalidateEntitlement().catch(() => {
+      })
+    ]);
+    if (change.kind === "switched" && change.reason === PLAN_SWITCH_PENDING) {
+      this.scheduleRecheck(generation, before, 0);
+    }
+  }
+  /** Stop any pending re-checks (SDK teardown). */
+  cancel() {
+    this.generation++;
+    this.clearTimer();
+  }
+  scheduleRecheck(generation, before, step) {
+    if (generation !== this.generation || step >= this.delaysMs.length) return;
+    if (this.targets.snapshot() !== before) return;
+    this.timer = setTimeout(() => {
+      this.timer = null;
+      void this.recheck(generation, before, step);
+    }, this.delaysMs[step]);
+  }
+  async recheck(generation, before, step) {
+    if (generation !== this.generation) return;
+    await this.targets.refreshFeatures().catch(() => {
+    });
+    if (generation !== this.generation) return;
+    if (this.targets.snapshot() !== before) {
+      await this.targets.revalidateEntitlement().catch(() => {
+      });
+      return;
+    }
+    this.scheduleRecheck(generation, before, step + 1);
+  }
+  clearTimer() {
+    if (this.timer !== null) {
+      clearTimeout(this.timer);
+      this.timer = null;
+    }
+  }
+};
+
 // src/auth/auth.ts
-var import_core2 = __toESM(require_dist());
+var import_core3 = __toESM(require_dist());
 
 // src/core/pkce.ts
 var import_js_sha256 = require("js-sha256");
@@ -1239,8 +1721,11 @@ var OAUTH_RELAY_SCRIPT = `
       if (d && (
         d.type === 'onelo:native_oauth' ||
         d.type === 'onelo:native_oauth_url' ||
+        // The store's hand-back (#615 / #627): decoded on the native side by
+        // classifyHandBackMessage \u2014 the relay only forwards, it never decides.
         d.type === 'onelo:code' ||
-        d.type === 'onelo:cancelled' ||
+        d.type === 'onelo:done' ||
+        d.type === 'onelo:cancel' ||
         // #40 Phase 2 \u2014 the hosted page signals it has mounted so the host can hide
         // its native fail-safe \u2715 (used by the customer-portal modal; auth/store
         // ignore it). The canonical \u2715 is then owned by the hosted page.
@@ -1260,9 +1745,52 @@ function openInSystemBrowser(Linking, url, onError) {
 
 // src/auth/auth-skeleton.tsx
 var import_react = __toESM(require("react"));
-function authSkeletonHtml(socialCount, backgroundColor, redirectTo) {
+
+// src/core/brand.ts
+var import_core2 = __toESM(require_dist());
+function resolveModalTokens(tokens, backgroundColor) {
+  if (tokens) return tokens;
+  return backgroundColor ? (0, import_core2.brandTokensFromLegacy)(null, backgroundColor) : import_core2.NEUTRAL_BRAND_TOKENS;
+}
+function chromeStyles(t) {
+  return {
+    container: { flex: 1, backgroundColor: t.page_bg },
+    webview: { flex: 1, backgroundColor: t.page_bg },
+    errorContainer: { flex: 1, justifyContent: "center", alignItems: "center", gap: 16, padding: 32, backgroundColor: t.page_bg },
+    errorTitle: { color: t.text, fontSize: 17, fontWeight: "600", textAlign: "center" },
+    errorText: { color: (0, import_core2.statusColor)(t, "danger"), fontSize: 13, textAlign: "center" },
+    retryButton: { backgroundColor: t.button_bg, paddingHorizontal: 32, paddingVertical: 14, borderRadius: t.button_radius },
+    retryText: { color: t.button_text, fontSize: 16, fontWeight: "600" },
+    cancelButton: { paddingHorizontal: 32, paddingVertical: 14 },
+    cancelText: { color: t.text_muted, fontSize: 16 },
+    /** Round ✕ chip over a WebView. */
+    closeChip: {
+      width: 36,
+      height: 36,
+      borderRadius: 18,
+      backgroundColor: t.card_bg,
+      borderWidth: 1,
+      borderColor: t.border,
+      justifyContent: "center",
+      alignItems: "center"
+    },
+    closeText: { color: t.text, fontSize: 19, fontWeight: "600", lineHeight: 21 },
+    /** Native header bar above a hosted page (store / portal / feedback). */
+    header: { backgroundColor: t.page_bg, borderBottomColor: t.border },
+    headerText: { color: t.text },
+    /** Spinner (ActivityIndicator `color`). */
+    spinnerColor: t.brand
+  };
+}
+function skeletonBlockCss(t) {
+  const sweep = `background-image:linear-gradient(90deg,transparent 0%,${t.spinner_track} 50%,transparent 100%);background-size:60vw 100%;background-repeat:no-repeat;background-position:-100vw 0`;
+  return `.onelo-skel{background-color:${t.card_bg};${sweep};border-radius:${t.field_radius}px}
+.onelo-skel-strong{background-color:${t.border};${sweep};border-radius:${t.field_radius}px}`;
+}
+
+// src/auth/auth-skeleton.tsx
+function authSkeletonHtml(socialCount, t, redirectTo) {
   const n = Math.max(0, Math.min(4, Math.floor(socialCount || 0)));
-  const bg = backgroundColor || "#111111";
   const redirect = redirectTo ? `<script>requestAnimationFrame(function(){requestAnimationFrame(function(){location.replace(${JSON.stringify(redirectTo)})})})</script>` : "";
   const pills = Array.from({ length: n }).map(() => '<div class="onelo-skel-strong pill"></div>').join("");
   const divider = n > 0 ? '<div class="divider"><span class="dline"></span><span class="onelo-skel dtext"></span><span class="dline"></span></div>' : "";
@@ -1270,25 +1798,24 @@ function authSkeletonHtml(socialCount, backgroundColor, redirectTo) {
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 html,body{height:100%}
-body{background:${bg};font-family:-apple-system,BlinkMacSystemFont,sans-serif;overflow:hidden}
+body{background:${t.page_bg};font-family:${t.body_font};overflow:hidden}
 .wrap{display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:100vh;width:100%;padding:48px 24px}
 .col{width:100%;max-width:300px;display:flex;flex-direction:column;gap:10px}
-.onelo-skel{background-color:rgba(255,255,255,0.04);background-image:linear-gradient(90deg,rgba(255,255,255,0) 0%,rgba(255,255,255,0.14) 50%,rgba(255,255,255,0) 100%);background-size:60vw 100%;background-repeat:no-repeat;background-position:-100vw 0;border-radius:8px}
-.onelo-skel-strong{background-color:rgba(255,255,255,0.08);background-image:linear-gradient(90deg,rgba(255,255,255,0) 0%,rgba(255,255,255,0.20) 50%,rgba(255,255,255,0) 100%);background-size:60vw 100%;background-repeat:no-repeat;background-position:-100vw 0;border-radius:9px}
-.icon{width:64px;height:64px;border-radius:14px;margin-bottom:14px}
-.title{width:200px;height:22px;margin-bottom:10px;border-radius:6px}
-.sub{width:140px;height:13px;opacity:0.7;margin-bottom:28px;border-radius:4px}
-.pill{height:44px;border-radius:9px}
+${skeletonBlockCss(t)}
+.icon{width:64px;height:64px;border-radius:${t.card_radius}px;margin-bottom:14px}
+.title{width:200px;height:22px;margin-bottom:10px}
+.sub{width:140px;height:13px;opacity:0.7;margin-bottom:28px}
+.pill{height:44px;border-radius:${t.button_radius}px}
 .divider{display:flex;align-items:center;gap:12px;margin:16px 0 4px}
-.dline{flex:1;height:1px;background:rgba(255,255,255,0.1)}
+.dline{flex:1;height:1px;background:${t.border}}
 .dtext{width:14px;height:11px;opacity:0.5}
 .lbl{width:38px;height:11px}
 .input{height:44px}
 .lblrow{display:flex;justify-content:space-between;align-items:center}
 .lbl2{width:58px;height:11px}
 .forgot{width:90px;height:11px;opacity:0.7}
-.cta{height:48px;border-radius:10px;margin-top:6px}
-.signup{width:200px;height:12px;opacity:0.6;border-radius:4px;margin:6px auto 0}
+.cta{height:48px;border-radius:${t.button_radius}px;margin-top:6px}
+.signup{width:200px;height:12px;opacity:0.6;margin:6px auto 0}
 </style></head><body>
 <div class="wrap" aria-hidden="true">
 <div class="onelo-skel icon"></div>
@@ -1308,11 +1835,13 @@ ${pills}${divider}
 ${redirect}
 </body></html>`;
 }
-function AuthSkeleton({ socialCount = 0, backgroundColor = "#111111" }) {
+function AuthSkeleton({ socialCount = 0, tokens }) {
+  const t = resolveModalTokens(tokens);
+  const backgroundColor = t.page_bg;
   const RN = require("react-native");
   const { WebView } = require("react-native-webview");
   const { View } = RN;
-  const html = authSkeletonHtml(socialCount, backgroundColor);
+  const html = authSkeletonHtml(socialCount, t);
   return import_react.default.createElement(
     View,
     // pointerEvents none: it's a placeholder — never swallow touches (so the
@@ -1331,6 +1860,40 @@ function AuthSkeleton({ socialCount = 0, backgroundColor = "#111111" }) {
   );
 }
 
+// src/core/hand-back.ts
+function classifyHandBackMessage(data) {
+  let msg;
+  try {
+    const parsed = JSON.parse(data);
+    if (!parsed || typeof parsed !== "object") return null;
+    msg = parsed;
+  } catch {
+    return null;
+  }
+  switch (msg["type"]) {
+    case "onelo:code":
+      return typeof msg["code"] === "string" && msg["code"] ? { kind: "purchase", code: msg["code"] } : null;
+    case "onelo:done":
+      return { kind: "switched", reason: typeof msg["reason"] === "string" ? msg["reason"] : "" };
+    case "onelo:cancel":
+      return msg["reason"] === "expired" ? { kind: "expired" } : { kind: "cancelled" };
+    default:
+      return null;
+  }
+}
+function classifyHandBack(url, scheme) {
+  const parsed = parseCallbackDeepLink(url, scheme);
+  if (!parsed) return null;
+  if (parsed.host !== "callback") return { kind: "invalid" };
+  const p = parsed.params;
+  if (p["source"] === "store") return { kind: "switched", reason: p["event"] ?? "" };
+  if (p["source"] === "portal") return { kind: "portal_closed", event: p["event"] };
+  if (p["code"]) return { kind: "purchase", code: p["code"] };
+  if (p["preauth"]) return { kind: "preauth", preauth: p["preauth"] };
+  if (p["error"] === "token_expired" || p["error"] === "expired_token") return { kind: "expired" };
+  return { kind: "cancelled" };
+}
+
 // src/auth/auth-modal.tsx
 var CALLBACK_SCHEME = "onelorn";
 function isExpiredAuthError(err) {
@@ -1339,21 +1902,7 @@ function isExpiredAuthError(err) {
 function shouldShowNativeStoreClose(opts) {
   return opts.onStore && !opts.hostedReady && opts.failSafeArmed;
 }
-function parseModalMessage(data) {
-  try {
-    const msg = JSON.parse(data);
-    if (msg["type"] === "onelo:code" && typeof msg["code"] === "string") {
-      return { type: "code", code: msg["code"] };
-    }
-    if (msg["type"] === "onelo:cancelled") {
-      return { type: "cancelled" };
-    }
-    return null;
-  } catch {
-    return null;
-  }
-}
-function AuthModal({ visible, hostedUrl, onResult, apiUrl, backgroundColor, callbackScheme, socialCount = 0 }) {
+function AuthModal({ visible, hostedUrl, onResult, apiUrl, tokens, backgroundColor, callbackScheme, socialCount = 0 }) {
   const scheme = callbackScheme || CALLBACK_SCHEME;
   const RN = require("react-native");
   const { WebView } = require("react-native-webview");
@@ -1378,8 +1927,8 @@ function AuthModal({ visible, hostedUrl, onResult, apiUrl, backgroundColor, call
   }, [hostedUrl, visible]);
   (0, import_react2.useEffect)(() => {
     if (!visible) return;
-    const t = setTimeout(() => setFailSafeArmed(true), 3500);
-    return () => clearTimeout(t);
+    const t2 = setTimeout(() => setFailSafeArmed(true), 3500);
+    return () => clearTimeout(t2);
   }, [visible, hostedUrl]);
   const showNativeStoreClose = shouldShowNativeStoreClose({ onStore, hostedReady, failSafeArmed });
   const resolveOnce = (0, import_react2.useCallback)(
@@ -1447,10 +1996,17 @@ function AuthModal({ visible, hostedUrl, onResult, apiUrl, backgroundColor, call
   const handleMessage = (0, import_react2.useCallback)(
     (event) => {
       const data = event.nativeEvent.data;
-      const parsed = parseModalMessage(data);
-      if (parsed) {
-        if (parsed.type === "code") resolveOnce({ type: "code", code: parsed.code });
-        else resolveOnce({ type: "cancelled" });
+      const hb = classifyHandBackMessage(data);
+      if (hb?.kind === "purchase") {
+        resolveOnce({ type: "code", code: hb.code });
+        return;
+      }
+      if (hb?.kind === "cancelled") {
+        resolveOnce({ type: "cancelled" });
+        return;
+      }
+      if (hb?.kind === "expired") {
+        resolveOnce({ type: "expired" });
         return;
       }
       try {
@@ -1515,15 +2071,17 @@ function AuthModal({ visible, hostedUrl, onResult, apiUrl, backgroundColor, call
     if (!isStoreUrl(hostedUrl) && canGoBack) webViewRef.current?.goBack();
     else handleCancel();
   }, [hostedUrl, canGoBack, handleCancel]);
-  const bg = backgroundColor || "#111111";
+  const t = resolveModalTokens(tokens, backgroundColor);
+  const bg = t.page_bg;
+  const c = chromeStyles(t);
   const styles = StyleSheet.create({
     container: { flex: 1, backgroundColor: bg },
     webview: { flex: 1, backgroundColor: bg },
     errorContainer: { flex: 1, justifyContent: "center", alignItems: "center", gap: 16 },
-    retryButton: { backgroundColor: "#ffffff", paddingHorizontal: 32, paddingVertical: 14, borderRadius: 8 },
-    retryText: { color: "#000000", fontSize: 16, fontWeight: "600" },
+    retryButton: c.retryButton,
+    retryText: c.retryText,
     cancelButton: { paddingHorizontal: 32, paddingVertical: 14 },
-    cancelText: { color: "#ffffff", fontSize: 16 },
+    cancelText: c.cancelText,
     // #27 — persistent close affordance in the NORMAL flow (the hosted page,
     // e.g. the store, may not render its own cancel → user was trapped and had
     // to kill the app). Top-trailing, cleared past the notch/status bar.
@@ -1531,15 +2089,10 @@ function AuthModal({ visible, hostedUrl, onResult, apiUrl, backgroundColor, call
       position: "absolute",
       top: Platform.OS === "ios" ? 52 : (StatusBar.currentHeight ?? 24) + 8,
       right: 16,
-      width: 36,
-      height: 36,
-      borderRadius: 18,
-      backgroundColor: "rgba(0,0,0,0.4)",
-      justifyContent: "center",
-      alignItems: "center",
+      ...c.closeChip,
       zIndex: 10
     },
-    closeText: { color: "#ffffff", fontSize: 19, fontWeight: "600", lineHeight: 21 }
+    closeText: c.closeText
   });
   return import_react2.default.createElement(
     Modal,
@@ -1577,7 +2130,7 @@ function AuthModal({ visible, hostedUrl, onResult, apiUrl, backgroundColor, call
         // to the hosted URL after it paints. ONE WebView shows the skeleton then
         // the page — no separate overlay instance, no slide, no jump. The skeleton
         // stays visible during the network load until the hosted page paints.
-        source: { html: authSkeletonHtml(socialCount, bg, currentUrl) },
+        source: { html: authSkeletonHtml(socialCount, t, currentUrl) },
         onError: handleError,
         onMessage: handleMessage,
         injectedJavaScript: OAUTH_RELAY_SCRIPT,
@@ -1633,9 +2186,27 @@ var ATTEST_WAIT_CAP_MS = 5e3;
 var _OneloAuth = class _OneloAuth {
   constructor(config, attestReady) {
     this.pkceVerifier = null;
+    /**
+     * PKCE verifier of the latest hosted flow (#542). Its challenge goes to
+     * `/flow/init`, which binds every code that flow hands out, including one
+     * from a magic link opened on another device (#540). Kept separate from
+     * `pkceVerifier`, which belongs to the custom-UI `signIn`/`signUp` and is
+     * nulled after each of them. Persisted in the Keychain as well, because a
+     * link opened on THIS device returns through the OS, often after the app was
+     * killed while the user was in Mail.
+     */
+    this.flowVerifier = null;
+    /** The launch URL is handed over once per instance: `getInitialURL()`
+     *  keeps returning it for the whole process. */
+    this._launchUrlHandled = false;
     this.resolvedConfig = null;
+    /** The SDK's one brand-token model (#681), shared with every module. */
+    this.brand = new import_core3.BrandSource();
     this.heartbeatTimer = null;
     this.refreshTimer = null;
+    this.refreshRetryAttempt = 0;
+    /** Until this time (ms) getSession() does not start a refresh on its own. */
+    this.refreshBackoffUntil = 0;
     // Monotonic sign-out counter. signOut() bumps it; any in-flight entitlement
     // revalidation captures it BEFORE its network await and refuses to write tokens
     // back if it moved — prevents a proactive revalidate completing just after
@@ -1679,6 +2250,9 @@ var _OneloAuth = class _OneloAuth {
      *  Standard Integrity API's `setCloudProjectNumber`; `null` when unconfigured
      *  (the composition root then skips Play Integrity). Ignored on iOS. */
     this.cloudProjectNumber = null;
+    /** Told when the hosted flow this class presented ended in a code — which
+     *  can carry a purchase (#659). Set by `Onelo` to its plan-change refresher. */
+    this.onPlanChange = null;
     if (!config.apiUrl) throw new Error("[Onelo] apiUrl is required");
     if (!config.publishableKey) throw new Error("[Onelo] publishableKey is required");
     this._attestReady = attestReady;
@@ -1758,11 +2332,13 @@ var _OneloAuth = class _OneloAuth {
       const verifier = generateCodeVerifier();
       this.pkceVerifier = verifier;
       const challenge = generateCodeChallenge(verifier);
-      const url = `${this.apiUrl}/api/sdk/config?key=${encodeURIComponent(this.publishableKey)}&code_challenge=${encodeURIComponent(challenge)}`;
-      const { status, json } = await (0, import_core2.httpGet)(url, await this._secHeaders());
-      if (status === 401 || status === 404) throw import_core2.OneloError.invalidKey("Server rejected the key");
-      if (status !== 200) throw import_core2.OneloError.server(`Config request failed: HTTP ${status}`);
+      const url = `${this.apiUrl}/api/sdk/config?key=${encodeURIComponent(this.publishableKey)}&code_challenge=${encodeURIComponent(challenge)}${(0, import_core3.configLanguageParam)()}`;
+      const { status, json } = await (0, import_core3.httpGet)(url, await this._secHeaders());
+      if (status === 401 || status === 404) throw import_core3.OneloError.invalidKey("Server rejected the key");
+      if (status !== 200) throw import_core3.OneloError.server(`Config request failed: HTTP ${status}`);
       const j = json;
+      const brandTokens = (0, import_core3.brandTokensFromResponse)(j) ?? import_core3.NEUTRAL_BRAND_TOKENS;
+      this.brand.set(brandTokens);
       this.resolvedConfig = {
         supabaseUrl: j["supabase_url"],
         supabaseAnonKey: j["supabase_anon_key"],
@@ -1775,13 +2351,14 @@ var _OneloAuth = class _OneloAuth {
         sdkRedirectUrl: j["sdk_redirect_url"] ?? null,
         storeUrl: j["store_url"] ?? null,
         manageUrl: j["manage_url"] ?? null,
-        // Branding page background (--onelo-page-bg). Native WebViews paint this so
-        // there is no white flash before the hosted page renders. Default #111111.
-        pageBackgroundColor: j["checkout_bg_color"] || "#111111",
+        // Branding page background — the token's page_bg (#681).
+        pageBackgroundColor: brandTokens.page_bg,
+        brandTokens,
         // Plan-gated enabled OAuth providers (google/github/apple). Previously
         // unmapped — the field is surfaced via the `oauthProviders` getter and
         // consumed by the Round 2 OAuth entry point.
-        oauthProviders: Array.isArray(j["oauth_providers"]) ? j["oauth_providers"] : void 0
+        oauthProviders: Array.isArray(j["oauth_providers"]) ? j["oauth_providers"] : void 0,
+        signupMarketingConsent: (0, import_core3.signupMarketingConsentFromConfig)(j)
       };
       this.attestRequired = j["attest_required"] ?? false;
       const cpn = j["cloud_project_number"];
@@ -1797,7 +2374,7 @@ var _OneloAuth = class _OneloAuth {
       console.warn(
         "[Onelo] SDK initialization failed \u2014 auth, attestation and config-gated features are disabled until this is fixed: " + msg
       );
-      if (e instanceof import_core2.OneloError && e.code === "invalid_publishable_key") {
+      if (e instanceof import_core3.OneloError && e.code === "invalid_publishable_key") {
         this.isRevoked = true;
       }
     }
@@ -1808,7 +2385,7 @@ var _OneloAuth = class _OneloAuth {
   // ── Hosted flow ─────────────────────────────────────────────────────────────
   async loadAuthView() {
     await this.initPromise;
-    if (this.isRevoked) throw import_core2.OneloError.invalidKey("Application key has been revoked");
+    if (this.isRevoked) throw import_core3.OneloError.invalidKey("Application key has been revoked");
     let decision = null;
     const { status, json } = await this._flowInit();
     if (status !== 404 && status !== 405) decision = this._decisionFromFlow(status, json);
@@ -1828,7 +2405,7 @@ var _OneloAuth = class _OneloAuth {
           return;
         }
         if (result.type === "error") {
-          reject(import_core2.OneloError.server(result.message));
+          reject(import_core3.OneloError.server(result.message));
           return;
         }
         if (result.type === "expired") {
@@ -1840,7 +2417,9 @@ var _OneloAuth = class _OneloAuth {
           return;
         }
         try {
-          resolve(await this.exchangeHostedCode(result.code));
+          const session = await this.exchangeHostedCode(result.code);
+          this.onPlanChange?.({ kind: "purchase" });
+          resolve(session);
         } catch (e) {
           reject(e);
         }
@@ -1858,13 +2437,24 @@ var _OneloAuth = class _OneloAuth {
    * body `{publishableKey, code, code_verifier}` (PKCE snake even in a camel body).
    */
   async exchangeHostedCode(code) {
-    const { status, json } = await (0, import_core2.httpPost)(
+    const verifier = this.flowVerifier ?? await this.storage.get(import_core3.TOKEN_KEYS.MAGIC_LINK_VERIFIER);
+    const { status, json } = await (0, import_core3.httpPost)(
       `${this.apiUrl}/api/sdk/auth/hosted-callback`,
-      { publishableKey: this.publishableKey, code, code_verifier: this.pkceVerifier },
+      { publishableKey: this.publishableKey, code, code_verifier: verifier },
       await this._secHeaders()
     );
-    if (status !== 200) throw import_core2.OneloError.server("Hosted callback failed");
-    const session = (0, import_core2.mapSession)(json);
+    if (status !== 200) {
+      const detail = json?.["detail"];
+      if (detail === "code_verifier required" || detail === "PKCE verification failed") {
+        throw import_core3.OneloError.server(
+          "This sign-in link belongs to a different sign-in on this device. Open the sign-in again and request a new link."
+        );
+      }
+      throw import_core3.OneloError.server(`Hosted callback failed: ${typeof detail === "string" ? detail : `HTTP ${status}`}`);
+    }
+    this.flowVerifier = null;
+    await this.storage.delete(import_core3.TOKEN_KEYS.MAGIC_LINK_VERIFIER);
+    const session = (0, import_core3.mapSession)(json);
     await this.saveSession(session);
     return session;
   }
@@ -1884,14 +2474,14 @@ var _OneloAuth = class _OneloAuth {
     };
   }
   async getHostedUrl() {
-    const { status, json } = await (0, import_core2.httpGet)(
+    const { status, json } = await (0, import_core3.httpGet)(
       `${this.apiUrl}/api/sdk/auth/initiate?key=${encodeURIComponent(this.publishableKey)}&callback_scheme=${this._callbackScheme}`,
       await this._secHeaders()
     );
-    if (status !== 200) throw import_core2.OneloError.server("Failed to initiate hosted auth flow");
+    if (status !== 200) throw import_core3.OneloError.server("Failed to initiate hosted auth flow");
     const j = json;
     const hostedUrl = j["hosted_url"];
-    if (!hostedUrl) throw import_core2.OneloError.server("Invalid initiate response");
+    if (!hostedUrl) throw import_core3.OneloError.server("Invalid initiate response");
     if (j["app_name"]) this.appName = j["app_name"];
     if (j["app_logo_url"]) this.appLogoUrl = j["app_logo_url"];
     return hostedUrl;
@@ -1920,19 +2510,36 @@ var _OneloAuth = class _OneloAuth {
     const headers = await this._secHeaders();
     if (existing?.accessToken) headers["Authorization"] = `Bearer ${existing.accessToken}`;
     const langParam = lang ? `&lang=${encodeURIComponent(lang)}` : "";
-    const { status, json } = await (0, import_core2.httpGet)(
-      `${this.apiUrl}/api/sdk/flow/init?key=${encodeURIComponent(this.publishableKey)}&callback_scheme=${this._callbackScheme}${langParam}`,
+    const challenge = await this._beginFlowPkce();
+    const { status, json } = await (0, import_core3.httpGet)(
+      `${this.apiUrl}/api/sdk/flow/init?key=${encodeURIComponent(this.publishableKey)}&callback_scheme=${this._callbackScheme}&code_challenge=${encodeURIComponent(challenge)}${langParam}`,
       headers
     );
     if (status !== 200) maybeSelfHealFromError(json);
     return { status, json: json ?? {} };
+  }
+  /**
+   * Start a hosted flow's PKCE pair (#542): a fresh verifier, kept in memory
+   * and in the Keychain, and its S256 challenge for `/flow/init`. With the
+   * challenge on the flow token, the hosted page pairs a magic link opened on
+   * another device with a code, and every code the flow hands out can only be
+   * exchanged by this install. One slot, as in onelo-js (#535): a newer flow
+   * overwrites it, and a link from the older one then fails with a clear error
+   * without being spent. A failed Keychain write leaves the in-memory verifier,
+   * which still covers every return while the app keeps running.
+   */
+  async _beginFlowPkce() {
+    const verifier = generateCodeVerifier();
+    this.flowVerifier = verifier;
+    await this.storage.set(import_core3.TOKEN_KEYS.MAGIC_LINK_VERIFIER, verifier);
+    return generateCodeChallenge(verifier);
   }
   /** Map a `/flow/init` response to a FlowDecision, throwing on any non-200. */
   _decisionFromFlow(status, j) {
     if (status !== 200) {
       const detail = j["detail"];
       const reason = typeof detail === "string" ? detail : j["error"] ?? `HTTP ${status}`;
-      throw import_core2.OneloError.server(`Failed to resolve auth flow: ${reason}`);
+      throw import_core3.OneloError.server(`Failed to resolve auth flow: ${reason}`);
     }
     if (j["action"] === "authorized") return { action: "authorized" };
     if (j["action"] === "present" && typeof j["url"] === "string") {
@@ -1942,47 +2549,63 @@ var _OneloAuth = class _OneloAuth {
       if (appLogo) this.appLogoUrl = appLogo;
       return { action: "present", surface: String(j["surface"] ?? ""), url: j["url"], appName, appLogo };
     }
-    throw import_core2.OneloError.server("Invalid flow response");
+    throw import_core3.OneloError.server("Invalid flow response");
   }
   // ── Custom UI (paid plans only) ─────────────────────────────────────────────
   async signIn(email, password) {
     await this.initPromise;
     await this._awaitAttestReady();
-    if (!this.allowCustomBranding) throw import_core2.OneloError.planRequired();
+    if (!this.allowCustomBranding) throw import_core3.OneloError.planRequired();
     if (!this.pkceVerifier) this.pkceVerifier = generateCodeVerifier();
-    const { status, json } = await (0, import_core2.httpPost)(
+    const { status, json } = await (0, import_core3.httpPost)(
       `${this.apiUrl}/api/sdk/auth/signin`,
       { email, password, publishableKey: this.publishableKey, code_verifier: this.pkceVerifier },
       await this._secHeaders()
     );
-    (0, import_core2.checkHostedFlowRequired)(json);
+    (0, import_core3.checkHostedFlowRequired)(json);
     const j = json;
     if (status === 403) {
       const detail = j["detail"];
-      if (detail?.["error"] === "user_revoked") throw import_core2.OneloError.userRevoked();
-      throw import_core2.OneloError.server(detail?.["message"] ?? j["error"]);
+      if (detail?.["error"] === "user_revoked") throw import_core3.OneloError.userRevoked();
+      throw import_core3.OneloError.server(detail?.["message"] ?? j["error"]);
     }
-    if (status !== 200) throw import_core2.OneloError.server(`Sign in failed: HTTP ${status}`);
+    if (status !== 200) throw import_core3.OneloError.server(`Sign in failed: HTTP ${status}`);
     this.pkceVerifier = null;
-    const session = (0, import_core2.mapSession)(j);
+    const session = (0, import_core3.mapSession)(j);
     await this.saveSession(session);
     return session;
   }
-  async signUp(email, password) {
+  /**
+   * #818 — should your own sign-up screen show the optional Marketing Consent
+   * checkbox, and with what text? Set on the parent App in Auth → Sign-up; an
+   * App that sells asks at Checkout instead (`asked` false). Show `text`
+   * unticked and pass the person's choice to `signUp(..., { marketingConsent })`.
+   */
+  getSignupMarketingConsent() {
+    return this.resolvedConfig?.signupMarketingConsent ?? import_core3.NO_SIGNUP_MARKETING_CONSENT;
+  }
+  async signUp(email, password, options) {
     await this.initPromise;
     await this._awaitAttestReady();
-    if (!this.allowCustomBranding) throw import_core2.OneloError.planRequired();
+    if (!this.allowCustomBranding) throw import_core3.OneloError.planRequired();
     if (!this.pkceVerifier) this.pkceVerifier = generateCodeVerifier();
-    const { status, json } = await (0, import_core2.httpPost)(
+    const { status, json } = await (0, import_core3.httpPost)(
       `${this.apiUrl}/api/sdk/auth/signup`,
-      { email, password, publishableKey: this.publishableKey, code_verifier: this.pkceVerifier },
+      {
+        email,
+        password,
+        publishableKey: this.publishableKey,
+        code_verifier: this.pkceVerifier,
+        // #818: only when the person ticked it, in the language of the text shown.
+        ...(0, import_core3.signUpConsentFields)(options, this.getSignupMarketingConsent())
+      },
       await this._secHeaders()
     );
-    (0, import_core2.checkHostedFlowRequired)(json);
+    (0, import_core3.checkHostedFlowRequired)(json);
     const j = json;
-    if (status !== 200) throw import_core2.OneloError.server(`Sign up failed: HTTP ${status}`);
+    if (status !== 200) throw import_core3.OneloError.server(`Sign up failed: HTTP ${status}`);
     this.pkceVerifier = null;
-    const session = (0, import_core2.mapSession)(j);
+    const session = (0, import_core3.mapSession)(j);
     await this.saveSession(session);
     return session;
   }
@@ -1991,7 +2614,7 @@ var _OneloAuth = class _OneloAuth {
     this.signOutEpoch++;
     this.stopHeartbeat();
     this.clearRefreshTimer();
-    const accessToken = await this.storage.get(import_core2.TOKEN_KEYS.ACCESS_TOKEN);
+    const accessToken = await this.storage.get(import_core3.TOKEN_KEYS.ACCESS_TOKEN);
     await this.storage.clear();
     this.notifyListeners(null);
     if (accessToken) {
@@ -1999,7 +2622,7 @@ var _OneloAuth = class _OneloAuth {
         Authorization: `Bearer ${accessToken}`,
         "X-Publishable-Key": this.publishableKey
       });
-      void (0, import_core2.httpPost)(`${this.apiUrl}/api/sdk/auth/signout`, {}, headers).catch(() => {
+      void (0, import_core3.httpPost)(`${this.apiUrl}/api/sdk/auth/signout`, {}, headers).catch(() => {
       });
     }
   }
@@ -2017,6 +2640,13 @@ var _OneloAuth = class _OneloAuth {
     stream.on("session.revoked", (data) => {
       void this._handleSessionRevoked(data);
     });
+    stream.on("paywall.access_changed", () => {
+      void this.revalidateEntitlement().catch(() => {
+      });
+    });
+  }
+  setPlanChangeHandler(fn) {
+    this.onPlanChange = fn;
   }
   /**
    * Handle a `session.revoked` push. One app can multiplex multiple buyers on the
@@ -2028,7 +2658,7 @@ var _OneloAuth = class _OneloAuth {
    * revalidation can't resurrect the just-cleared session.
    */
   async _handleSessionRevoked(data) {
-    const userJson = await this.storage.get(import_core2.TOKEN_KEYS.USER_JSON);
+    const userJson = await this.storage.get(import_core3.TOKEN_KEYS.USER_JSON);
     if (!userJson) return;
     let currentUserId;
     try {
@@ -2061,9 +2691,9 @@ var _OneloAuth = class _OneloAuth {
   async hasStoredSession() {
     try {
       const [accessToken, refreshToken, userJson] = await Promise.all([
-        this.storage.get(import_core2.TOKEN_KEYS.ACCESS_TOKEN),
-        this.storage.get(import_core2.TOKEN_KEYS.REFRESH_TOKEN),
-        this.storage.get(import_core2.TOKEN_KEYS.USER_JSON)
+        this.storage.get(import_core3.TOKEN_KEYS.ACCESS_TOKEN),
+        this.storage.get(import_core3.TOKEN_KEYS.REFRESH_TOKEN),
+        this.storage.get(import_core3.TOKEN_KEYS.USER_JSON)
       ]);
       if (!accessToken || !refreshToken || !userJson) return false;
       const user = JSON.parse(userJson);
@@ -2074,15 +2704,19 @@ var _OneloAuth = class _OneloAuth {
   }
   async getSession() {
     const [accessToken, refreshToken, expiresAtStr, userJson] = await Promise.all([
-      this.storage.get(import_core2.TOKEN_KEYS.ACCESS_TOKEN),
-      this.storage.get(import_core2.TOKEN_KEYS.REFRESH_TOKEN),
-      this.storage.get(import_core2.TOKEN_KEYS.EXPIRES_AT),
-      this.storage.get(import_core2.TOKEN_KEYS.USER_JSON)
+      this.storage.get(import_core3.TOKEN_KEYS.ACCESS_TOKEN),
+      this.storage.get(import_core3.TOKEN_KEYS.REFRESH_TOKEN),
+      this.storage.get(import_core3.TOKEN_KEYS.EXPIRES_AT),
+      this.storage.get(import_core3.TOKEN_KEYS.USER_JSON)
     ]);
     if (!accessToken || !refreshToken || !userJson) return null;
     const expiresAt = parseInt(expiresAtStr ?? "0", 10);
     if (Date.now() / 1e3 > expiresAt - 60) {
-      return this.refreshSession();
+      if (Date.now() < this.refreshBackoffUntil) return this._storedSession();
+      return this.refreshSession().catch((e) => {
+        if ((0, import_core3.isSessionEndError)(e)) return null;
+        return this._storedSession();
+      });
     }
     const user = JSON.parse(userJson);
     if (!user.id) {
@@ -2104,18 +2738,29 @@ var _OneloAuth = class _OneloAuth {
   }
   async _doRefresh() {
     const epoch = this.signOutEpoch;
-    const refreshToken = await this.storage.get(import_core2.TOKEN_KEYS.REFRESH_TOKEN);
+    const refreshToken = await this.storage.get(import_core3.TOKEN_KEYS.REFRESH_TOKEN);
     if (!refreshToken) return null;
-    const { status, json } = await (0, import_core2.httpPost)(
-      `${this.apiUrl}/api/sdk/auth/refresh`,
-      // Wire key MUST be snake_case `refresh_token`: the backend
-      // RefreshRequest model (sdk_auth.py) requires it and rejects a
-      // camelCase `refreshToken` with a hard 422 (the handler never runs).
-      // Matches every response payload + the Swift SDK request.
-      { publishableKey: this.publishableKey, refresh_token: refreshToken },
-      await this._secHeaders()
-    );
-    (0, import_core2.checkHostedFlowRequired)(json);
+    let res;
+    try {
+      res = await (0, import_core3.httpPost)(
+        `${this.apiUrl}/api/sdk/auth/refresh`,
+        // Wire key MUST be snake_case `refresh_token`: the backend
+        // RefreshRequest model (sdk_auth.py) requires it and rejects a
+        // camelCase `refreshToken` with a hard 422 (the handler never runs).
+        // Matches every response payload + the Swift SDK request.
+        { publishableKey: this.publishableKey, refresh_token: refreshToken },
+        await this._secHeaders()
+      );
+    } catch (e) {
+      if (epoch === this.signOutEpoch) this._scheduleRefreshRetry();
+      throw e;
+    }
+    const { status, json } = res;
+    (0, import_core3.checkHostedFlowRequired)(json);
+    if (status === 429 || status >= 500) {
+      if (epoch === this.signOutEpoch) this._scheduleRefreshRetry();
+      throw import_core3.OneloError.server(`Session refresh is temporarily unavailable (HTTP ${status})`);
+    }
     const j = json;
     const teardown = async () => {
       if (epoch !== this.signOutEpoch) return;
@@ -2126,19 +2771,28 @@ var _OneloAuth = class _OneloAuth {
     if (j["error"] === "user_revoked") {
       if (epoch === this.signOutEpoch) this.isUserRevoked = true;
       await teardown();
-      throw import_core2.OneloError.userRevoked();
+      throw import_core3.OneloError.userRevoked();
     }
     if (j["error"] === "app_revoked") {
       if (epoch === this.signOutEpoch) this.isRevoked = true;
       await teardown();
-      throw import_core2.OneloError.revoked();
+      throw import_core3.OneloError.revoked();
     }
     if (status !== 200) {
+      if (epoch !== this.signOutEpoch) return null;
+      const detail = j["detail"];
+      const reason = detail?.["error"] ?? detail?.["error_code"];
+      if (reason === "banned") {
+        this.isUserRevoked = true;
+        await teardown();
+        throw import_core3.OneloError.userRevoked();
+      }
       await teardown();
-      return null;
+      if (reason === "no_plan_available") throw import_core3.OneloError.noActivePlan();
+      throw import_core3.OneloError.sessionEnded();
     }
     if (epoch !== this.signOutEpoch) return null;
-    const session = (0, import_core2.mapSession)(j);
+    const session = (0, import_core3.mapSession)(j);
     await this.saveSession(session);
     return session;
   }
@@ -2181,7 +2835,7 @@ var _OneloAuth = class _OneloAuth {
   async _verifySession(accessToken) {
     const epoch = this.signOutEpoch;
     try {
-      const { status, json } = await (0, import_core2.httpGet)(
+      const { status, json } = await (0, import_core3.httpGet)(
         `${this.apiUrl}/api/sdk/auth/verify`,
         await this._secHeaders({ Authorization: `Bearer ${accessToken}` })
       );
@@ -2259,7 +2913,7 @@ var _OneloAuth = class _OneloAuth {
     const session = await this.getSession();
     if (!session) return "none";
     try {
-      const { status, json } = await (0, import_core2.httpGet)(
+      const { status, json } = await (0, import_core3.httpGet)(
         `${this.apiUrl}/api/sdk/auth/user`,
         await this._secHeaders({
           Authorization: `Bearer ${session.accessToken}`,
@@ -2269,13 +2923,10 @@ var _OneloAuth = class _OneloAuth {
       if (status !== 200) return session.user.entitlement;
       const body = json;
       const next = body["entitlement"] === "active" ? "active" : "none";
-      const nextAllowedIn = typeof body["allowed_in"] === "boolean" ? body["allowed_in"] : session.user.allowedIn;
-      const changed = next !== session.user.entitlement || nextAllowedIn !== session.user.allowedIn;
+      const nextUser = (0, import_core3.mergeAccessAnswer)({ ...session.user, entitlement: next }, body);
+      const changed = next !== session.user.entitlement || nextUser.allowedIn !== session.user.allowedIn || nextUser.emailVerified !== session.user.emailVerified || nextUser.accessReason !== session.user.accessReason;
       if (changed && epoch === this.signOutEpoch) {
-        await this.saveSession({
-          ...session,
-          user: { ...session.user, entitlement: next, allowedIn: nextAllowedIn }
-        });
+        await this.saveSession({ ...session, user: nextUser });
       }
       return next;
     } catch {
@@ -2288,12 +2939,16 @@ var _OneloAuth = class _OneloAuth {
   isPaywallEnabled() {
     return this.resolvedConfig?.paywallEnabled ?? false;
   }
-  /** Branding "Page background" color (`checkout_bg_color`, --onelo-page-bg) from
-   *  `/api/sdk/config`. Native modals paint their WebView + container with this so
-   *  there is no white flash before the hosted page's own background renders.
-   *  Defaults to #111111 (the hosted-page default) before config resolves. */
+  /** The app's brand tokens (#681) from `/api/sdk/config` (refreshed by store /
+   *  portal / upgrade initiate responses). Every native modal paints its chrome
+   *  from these; the NEUTRAL set before config resolves — never Onelo orange. */
+  brandTokens() {
+    return this.brand.current();
+  }
+  /** Branding "Page background" color — `brandTokens().page_bg`. Native modals
+   *  paint their WebView + container with it so there is no white flash. */
   pageBackgroundColor() {
-    return this.resolvedConfig?.pageBackgroundColor ?? "#111111";
+    return this.brand.current().page_bg;
   }
   /** Plan-gated enabled OAuth providers (google/github/apple) from
    *  `/api/sdk/config`; empty when social is disabled. Consumed by the Round 2
@@ -2354,6 +3009,7 @@ var _OneloAuth = class _OneloAuth {
    * an idle app would carry a stale token past its TTL and the next request would 401.
    */
   scheduleRefresh(session) {
+    if (Date.now() < this.refreshBackoffUntil) return;
     this.clearRefreshTimer();
     const nowSec = Date.now() / 1e3;
     const delaySec = session.expiresAt - nowSec - _OneloAuth.REFRESH_LEAD_SECONDS;
@@ -2370,12 +3026,49 @@ var _OneloAuth = class _OneloAuth {
       this.refreshTimer = null;
     }
   }
+  /** The complete session in storage (read fresh — a sign-out may have
+   *  cleared it meanwhile), or null. */
+  async _storedSession() {
+    const [accessToken, refreshToken, expiresAtStr, userJson] = await Promise.all([
+      this.storage.get(import_core3.TOKEN_KEYS.ACCESS_TOKEN),
+      this.storage.get(import_core3.TOKEN_KEYS.REFRESH_TOKEN),
+      this.storage.get(import_core3.TOKEN_KEYS.EXPIRES_AT),
+      this.storage.get(import_core3.TOKEN_KEYS.USER_JSON)
+    ]);
+    if (!accessToken || !refreshToken || !userJson) return null;
+    try {
+      const user = JSON.parse(userJson);
+      if (!user.id) return null;
+      return { accessToken, refreshToken, expiresAt: parseInt(expiresAtStr ?? "0", 10), user };
+    } catch {
+      return null;
+    }
+  }
+  /** Re-arm the refresh after a transient failure, with backoff. Reset by the
+   *  next saved session. */
+  _scheduleRefreshRetry() {
+    const delay = Math.min(
+      _OneloAuth.REFRESH_RETRY_BASE_MS * 2 ** this.refreshRetryAttempt,
+      _OneloAuth.REFRESH_RETRY_MAX_MS
+    );
+    this.refreshRetryAttempt++;
+    this.refreshBackoffUntil = Date.now() + delay;
+    this.clearRefreshTimer();
+    this.refreshTimer = setTimeout(() => {
+      this.refreshTimer = null;
+      this.refreshBackoffUntil = 0;
+      void this.refreshSession().catch(() => {
+      });
+    }, delay);
+  }
   async saveSession(session) {
+    this.refreshRetryAttempt = 0;
+    this.refreshBackoffUntil = 0;
     await Promise.all([
-      this.storage.set(import_core2.TOKEN_KEYS.ACCESS_TOKEN, session.accessToken),
-      this.storage.set(import_core2.TOKEN_KEYS.REFRESH_TOKEN, session.refreshToken),
-      this.storage.set(import_core2.TOKEN_KEYS.EXPIRES_AT, String(session.expiresAt)),
-      this.storage.set(import_core2.TOKEN_KEYS.USER_JSON, JSON.stringify(session.user))
+      this.storage.set(import_core3.TOKEN_KEYS.ACCESS_TOKEN, session.accessToken),
+      this.storage.set(import_core3.TOKEN_KEYS.REFRESH_TOKEN, session.refreshToken),
+      this.storage.set(import_core3.TOKEN_KEYS.EXPIRES_AT, String(session.expiresAt)),
+      this.storage.set(import_core3.TOKEN_KEYS.USER_JSON, JSON.stringify(session.user))
     ]);
     this.isUserRevoked = false;
     this.notifyListeners(session);
@@ -2391,7 +3084,7 @@ var _OneloAuth = class _OneloAuth {
   // ── Magic link & password reset ─────────────────────────────────────────────
   async sendMagicLink(email) {
     await this.initPromise;
-    const { status } = await (0, import_core2.httpPost)(
+    const { status } = await (0, import_core3.httpPost)(
       `${this.apiUrl}/api/sdk/auth/magic-link`,
       {
         email,
@@ -2399,16 +3092,65 @@ var _OneloAuth = class _OneloAuth {
       },
       await this._secHeaders()
     );
-    if (status !== 200) throw import_core2.OneloError.server(`sendMagicLink failed: HTTP ${status}`);
+    if (status !== 200) throw import_core3.OneloError.server(`sendMagicLink failed: HTTP ${status}`);
+  }
+  /**
+   * Send the signed-in user a fresh Email Verification link (#819).
+   *
+   * Only for Apps with their own screen: when the parent App requires Email
+   * Verification, Onelo's hosted flow already shows "check your inbox" with a
+   * resend button and hands the session back by itself. The previous link
+   * stops working; at most 3 e-mails an hour (`verification_rate_limited`).
+   * Throws `email_verification_off` when the App has Email verification Off.
+   *
+   * `redirectTo` — your own landing page (an allowed web origin) or
+   * `<your-scheme>://…`; the link then carries `onelo_verify_token` for
+   * `confirmEmail`. Omitted, the link opens Onelo's hosted page.
+   */
+  async resendVerificationEmail(options = {}) {
+    await this.initPromise;
+    const session = await this.getSession();
+    if (!session) throw import_core3.OneloError.notAuthenticated();
+    return (0, import_core3.resendVerificationEmail)({
+      apiUrl: this.apiUrl,
+      publishableKey: this.publishableKey,
+      post: import_core3.httpPost,
+      accessToken: session.accessToken,
+      headers: await this._secHeaders(),
+      redirectTo: options.redirectTo
+    });
+  }
+  /**
+   * Confirm the user's address with the `onelo_verify_token` your own landing
+   * page received from the verification link (#819). Single use. When a
+   * session is signed in on this device, it is refreshed so `isAllowedIn()`
+   * opens the app without waiting for the next scheduled refresh.
+   */
+  async confirmEmail(token) {
+    await this.initPromise;
+    await (0, import_core3.confirmEmail)({
+      apiUrl: this.apiUrl,
+      publishableKey: this.publishableKey,
+      post: import_core3.httpPost,
+      token,
+      headers: await this._secHeaders()
+    });
+    if (await this.getSession()) {
+      try {
+        await this.refreshSession();
+      } catch (e) {
+        console.warn("[onelo] confirmEmail: session refresh after confirming failed", e);
+      }
+    }
   }
   async sendPasswordReset(email) {
     await this.initPromise;
-    const { status } = await (0, import_core2.httpPost)(
+    const { status } = await (0, import_core3.httpPost)(
       `${this.apiUrl}/api/sdk/auth/reset-password/request`,
       { email, publishableKey: this.publishableKey },
       await this._secHeaders()
     );
-    if (status !== 200) throw import_core2.OneloError.server(`sendPasswordReset failed: HTTP ${status}`);
+    if (status !== 200) throw import_core3.OneloError.server(`sendPasswordReset failed: HTTP ${status}`);
   }
   /**
    * Complete a hosted-auth flow that finished OUTSIDE this app's own UI — a
@@ -2437,9 +3179,9 @@ var _OneloAuth = class _OneloAuth {
    *    developer-built "Check your inbox" screen, not the hosted modal.
    *    Exchanges the code directly and returns the session.
    *
-   * Does NOT recover a flow whose PROCESS was killed and relaunched — the
-   * in-memory `_modalResolve`/`pkceVerifier` are gone either way, the same
-   * limitation every other Onelo SDK's live-process shortcut has.
+   * After a relaunch there is no pending flow, so the code is exchanged
+   * directly with the hosted flow's verifier kept in the Keychain (#542). For
+   * the URL that LAUNCHED the app, use `handleLaunchUrl`.
    *
    * Returns the session when this call itself completed the exchange (the
    * no-pending-flow case); `null` when the URL wasn't ours, or when a pending
@@ -2471,14 +3213,110 @@ var _OneloAuth = class _OneloAuth {
     if (code) return this.exchangeHostedCode(code);
     return null;
   }
+  /**
+   * Complete a sign-in from the URL that launched the app, i.e.
+   * `await Linking.getInitialURL()` (#542). A magic link opened on this device
+   * after the app was killed arrives only there, never as a `'url'` event.
+   * `OneloAuthGate` calls this on mount; a host app with its own root should
+   * call it BEFORE `loadAuthView()`, because a new hosted flow replaces the
+   * stored verifier the link needs.
+   *
+   * Handled once per instance, since `getInitialURL()` keeps returning the
+   * same URL for the whole process. Same result as `handleAuthCallback`.
+   */
+  async handleLaunchUrl(url) {
+    if (this._launchUrlHandled || !url) return null;
+    this._launchUrlHandled = true;
+    return this.handleAuthCallback(url);
+  }
 };
 _OneloAuth.HEARTBEAT_MS = 13 * 60 * 1e3;
 /** Refresh this many seconds before the access token expires. */
 _OneloAuth.REFRESH_LEAD_SECONDS = 60;
+/** Retry a TRANSIENT refresh failure (offline, a lost response, 429, 5xx —
+ *  incl. `503 refresh_unavailable`) with backoff: 5 s, 10 s, 20 s, 40 s,
+ *  then every 60 s, keeping the session. The first retry lands inside the
+ *  server's 30 s refresh-token grace window. Parity with onelo-js. */
+_OneloAuth.REFRESH_RETRY_BASE_MS = 5e3;
+_OneloAuth.REFRESH_RETRY_MAX_MS = 6e4;
 var OneloAuth = _OneloAuth;
 
 // src/features/features.ts
-var import_core3 = __toESM(require_dist());
+var import_core4 = __toESM(require_dist());
+
+// src/core/user-token.ts
+var INVALID_USER_TOKEN = "invalid_user_token";
+function bearerHeader(token) {
+  return token ? { Authorization: `Bearer ${token}` } : {};
+}
+function isInvalidUserToken(status, json) {
+  if (status !== 401 || json === null || typeof json !== "object") return false;
+  const j = json;
+  const detail = j.detail;
+  const code = detail !== null && typeof detail === "object" ? detail.error : j.error;
+  return code === INVALID_USER_TOKEN;
+}
+async function readUserToken(fn) {
+  if (!fn) return null;
+  try {
+    const token = await fn();
+    return typeof token === "string" && token.length > 0 ? token : null;
+  } catch {
+    return null;
+  }
+}
+var refusalStates = /* @__PURE__ */ new WeakMap();
+function refusalState(source) {
+  let state = refusalStates.get(source);
+  if (!state) {
+    state = { spent: false, inFlight: null };
+    refusalStates.set(source, state);
+  }
+  return state;
+}
+function refreshAfterRefusal(source) {
+  if (!source) return Promise.resolve(null);
+  const state = refusalState(source);
+  if (state.inFlight) return state.inFlight;
+  if (state.spent) return Promise.resolve(null);
+  state.spent = true;
+  const run = readUserToken(() => source.refresh());
+  state.inFlight = run;
+  void run.finally(() => {
+    if (state.inFlight === run) state.inFlight = null;
+  });
+  return run;
+}
+function userTokenAccepted(source) {
+  if (source) refusalState(source).spent = false;
+}
+function resetUserTokenRefusal(source) {
+  if (source) refusalState(source).spent = false;
+}
+function accepted(status) {
+  return status >= 200 && status < 300;
+}
+async function sendWithUserToken(source, send, onRefused, anonymousFallback = true, provesAcceptance = true) {
+  const token = await readUserToken(source ? () => source.current() : void 0);
+  const first = await send({ token, anonymous: false });
+  if (token === null) return first;
+  if (!isInvalidUserToken(first.status, first.json)) {
+    if (provesAcceptance && accepted(first.status)) userTokenAccepted(source);
+    return first;
+  }
+  let last = first;
+  const fresh = await refreshAfterRefusal(source);
+  if (fresh !== null) {
+    last = await send({ token: fresh, anonymous: false });
+    if (!isInvalidUserToken(last.status, last.json)) {
+      if (provesAcceptance && accepted(last.status)) userTokenAccepted(source);
+      return last;
+    }
+  }
+  onRefused();
+  if (!anonymousFallback) return last;
+  return send({ token: null, anonymous: true });
+}
 
 // src/features/feature-cache.ts
 async function loadFeatureCache(key) {
@@ -2623,10 +3461,7 @@ var OneloFeatures = class {
     this.monitor = null;
     this.anonymousWarningLogged = false;
     this.currentUserId = null;
-    // Secure-mode targeting hash (HMAC of userId, computed on the DEV's server and
-    // forwarded here — the SDK never holds the secret). Threaded into
-    // resolve / batch-ping / module-token.
-    this.currentUserIdHash = null;
+    this.userTokenRefusedWarned = false;
     // Shared multiplexed SSE stream — INJECTED by Onelo (composition root) via
     // attachEventStream(). Features NEVER calls start()/stop() on it: auth owns the
     // lifecycle (starts it on sign-in, stops on sign-out). Null in standalone use /
@@ -2635,6 +3470,17 @@ var OneloFeatures = class {
     // ready() cold-start sync — resolved on the first applied snapshot or timeout
     // (parity with Swift firstEventReceived + readyWaiters).
     this.firstEventReceived = false;
+    // Identity-bound readiness (#736, parity with Swift/JS/Electron). A persisted
+    // snapshot renders instantly, but only a response confirmed for THIS load
+    // generation + identity releases `ready()` or a non-zero `since_version`.
+    this.loadGeneration = 0;
+    this.identityLoaded = false;
+    this.confirmedGeneration = -1;
+    this.confirmedVersion = 0;
+    this.snapshotConfirmed = false;
+    // Identity the open SSE connection actually authenticated (null = none).
+    this.streamConnection = null;
+    this.streamConnectionGeneration = -1;
     this.readyWaiters = /* @__PURE__ */ new Set();
     // refresh() debounce cursor (parity with Swift lastRefreshAt).
     this.lastRefreshAt = 0;
@@ -2645,6 +3491,7 @@ var OneloFeatures = class {
     this.suppressIdentifyWarning = options?.suppressIdentifyWarning ?? false;
     this.featureEnvironment = options?.featureEnvironment;
     this.defaultStatus = options?.featureDefaultStatus ?? "hidden";
+    this.userToken = options?.userToken ?? null;
   }
   /**
    * Wire the shared multiplexed SSE stream (called once by Onelo). Registers the
@@ -2655,22 +3502,33 @@ var OneloFeatures = class {
   attachEventStream(stream) {
     this.stream = stream;
     if (this.featureEnvironment) stream.featureEnvironment = this.featureEnvironment;
+    stream.onConnectionIdentity((identity) => {
+      this.streamConnection = identity;
+      this.streamConnectionGeneration = identity === null ? -1 : this.loadGeneration;
+    });
+    const streamIsBound = () => {
+      const c = this.streamConnection;
+      return c !== null && this.streamConnectionGeneration === this.loadGeneration && c.userId === this.currentUserId && !c.anonymousFallback;
+    };
     const applyIfSnapshot = (data) => {
+      if (!streamIsBound()) return;
       const features = data["features"];
-      if (features) {
-        const v = typeof data["config_version"] === "number" ? data["config_version"] : this.configVersion;
-        this._applySnapshot(v, features);
-      }
+      if (!features) return;
+      const v = typeof data["config_version"] === "number" ? data["config_version"] : this.configVersion;
+      this._applySnapshot(v, features, this.loadGeneration, this.currentUserId);
+      this._signalFirstEvent(this.loadGeneration, this.currentUserId);
     };
     stream.on("connected", (data) => {
       applyIfSnapshot(data);
-      this._maybeWarnAnonymous(data);
-      this._signalFirstEvent();
+      if (streamIsBound()) this._maybeWarnAnonymous(data);
     });
     stream.on("features_updated", applyIfSnapshot);
     stream.on("up_to_date", (data) => {
-      if (typeof data["config_version"] === "number") this.configVersion = data["config_version"];
-      this._signalFirstEvent();
+      if (!streamIsBound() || typeof data["config_version"] !== "number") return;
+      this.configVersion = data["config_version"];
+      this.confirmedVersion = this.configVersion;
+      this.stream?.updateSinceVersion(this.confirmedVersion);
+      this._signalFirstEvent(this.loadGeneration, this.currentUserId);
     });
     stream.on("discovery_requested", () => this._scheduleBatchPing());
   }
@@ -2726,19 +3584,39 @@ var OneloFeatures = class {
    * for instant UI, sends a (sampled) batch-ping, then either relies on the
    * shared SSE stream (signed-in) or falls back to a one-shot REST resolve + 60s
    * poll (anonymous / standalone).
+   *
+   * @param _userIdHash Deprecated and ignored: Secure Mode is retired, and the
+   *   signed-in Onelo user is proven with their access token automatically.
    */
-  async load(userId, userIdHash) {
+  async load(userId, _userIdHash) {
+    const generation = ++this.loadGeneration;
+    this.identityLoaded = true;
+    const c = this.streamConnection;
+    if (c !== null && c.userId === userId && userId === this.currentUserId) {
+      this.streamConnectionGeneration = generation;
+    } else {
+      this.streamConnection = null;
+      this.streamConnectionGeneration = -1;
+    }
     this.currentUserId = userId;
-    this.currentUserIdHash = userIdHash ?? null;
-    await this._loadCache(userId);
+    this.firstEventReceived = false;
+    this.snapshotConfirmed = false;
+    this.confirmedGeneration = -1;
+    this.confirmedVersion = 0;
+    this.cache.clear();
+    this.configVersion = 0;
+    this.stream?.updateSinceVersion(0);
+    this._emitChange();
+    await this._loadCache(userId, generation);
+    if (generation !== this.loadGeneration) return;
     if (this._shouldBatchPingOnLoad()) await this._batchPing();
     this._stopPollTimer();
     if (this.stream && userId != null) {
-      this.stream.updateSinceVersion(this.configVersion);
-      await this.refresh();
+      this.lastRefreshAt = Date.now();
+      await this._resolve(userId, generation);
     } else {
-      await this._resolve(userId);
-      this._startPolling(userId);
+      await this._resolve(userId, generation);
+      if (generation === this.loadGeneration) this._startPolling(userId);
     }
   }
   /** Returns names of all features with an active status (enabled, new, or beta). */
@@ -2759,7 +3637,7 @@ var OneloFeatures = class {
    * resolve together on the first event (or each on its own timeout).
    */
   ready(timeoutMs = 1500) {
-    if (this.firstEventReceived) return Promise.resolve();
+    if (this.firstEventReceived && this.confirmedGeneration === this.loadGeneration) return Promise.resolve();
     return new Promise((resolve) => {
       let settled = false;
       const finish = () => {
@@ -2772,6 +3650,11 @@ var OneloFeatures = class {
       setTimeout(finish, Math.max(0, timeoutMs));
     });
   }
+  /** A comparable picture of the current snapshot — the plan-change refresher
+   *  (#659) re-checks until it differs. @internal */
+  snapshotKey() {
+    return JSON.stringify([...this.cache.entries()].sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0));
+  }
   /**
    * Force-reconcile the snapshot from the server via REST (does NOT touch the SSE
    * stream). Debounced to one call/sec unless `force` (use force from a
@@ -2783,7 +3666,7 @@ var OneloFeatures = class {
     const now = Date.now();
     if (!force && now - this.lastRefreshAt < REFRESH_DEBOUNCE_MS) return;
     this.lastRefreshAt = now;
-    await this._resolve(this.currentUserId);
+    await this._resolve(this.currentUserId, this.loadGeneration);
   }
   /**
    * Requests a short-lived (60s) per-feature JWT from
@@ -2793,29 +3676,33 @@ var OneloFeatures = class {
    * `moduleToken(for:)`.
    *
    * Throws {@link OneloFeaturesError}:
-   * - `not_authenticated` — no user identified yet (NO network call is made)
+   * - `not_authenticated` — no user identified yet (NO network call is made), or
+   *   the signed-in user's access token was refused even after a refresh
    * - `not_entitled` (403) — the user lacks access to `slug`
-   * - `secure_mode_required` (401) — app requires `userIdHash`, none supplied
-   * - `invalid_user_hash` (401) — supplied `userIdHash` failed backend HMAC
    * - `network_error` — transport failure or malformed response
    *
-   * @param slug        Feature/module slug to mint a token for.
-   * @param userIdHash  Optional secure-mode HMAC; overrides the one from load().
+   * @param slug         Feature/module slug to mint a token for.
+   * @param _userIdHash  Deprecated and ignored: Secure Mode is retired, and the
+   *   signed-in Onelo user is proven with their access token automatically.
    */
-  async moduleToken(slug, userIdHash) {
-    if (!this.currentUserId) throw new OneloFeaturesError("not_authenticated");
-    const body = {
-      publishableKey: this.publishableKey,
-      userId: this.currentUserId,
-      slug
-    };
-    const hash = userIdHash ?? this.currentUserIdHash;
-    if (hash) body["userIdHash"] = hash;
+  async moduleToken(slug, _userIdHash) {
+    const userId = this.currentUserId;
+    if (!userId) throw new OneloFeaturesError("not_authenticated");
     let status;
     let json;
     try {
       const { sdkHeaders: sdkHeaders2 } = await Promise.resolve().then(() => (init_sdk_headers(), sdk_headers_exports));
-      const res = await (0, import_core3.httpPost)(`${this.apiUrl}/api/sdk/features/module-token`, body, await sdkHeaders2(this.bundleId));
+      const headers = await sdkHeaders2(this.bundleId);
+      const res = await sendWithUserToken(
+        this.userToken,
+        ({ token }) => (0, import_core4.httpPost)(
+          `${this.apiUrl}/api/sdk/features/module-token`,
+          { publishableKey: this.publishableKey, userId, slug },
+          { ...headers, ...bearerHeader(token) }
+        ),
+        () => this._warnUserTokenRefused(),
+        false
+      );
       status = res.status;
       json = res.json ?? {};
     } catch {
@@ -2851,15 +3738,23 @@ var OneloFeatures = class {
   invalidateCache() {
     this.cache.clear();
     this.configVersion = 0;
+    this.confirmedVersion = 0;
+    this.snapshotConfirmed = false;
+    this.firstEventReceived = false;
+    this.confirmedGeneration = -1;
+    this.stream?.updateSinceVersion(0);
     void saveFeatureCache(this._cacheKey(this.currentUserId), this._snapshotForDisk());
     this._emitChange();
   }
   // ── Private ──────────────────────────────────────────────────────────────────
   /** Signals all pending ready() callers that the first snapshot arrived.
    *  Idempotent (parity with Swift `_signalFirstEvent`). */
-  _signalFirstEvent() {
-    if (this.firstEventReceived) return;
+  _signalFirstEvent(generation, userId) {
+    if (!this.identityLoaded || generation !== this.loadGeneration || userId !== this.currentUserId) return;
+    if (this.firstEventReceived && this.confirmedGeneration === generation) return;
     this.firstEventReceived = true;
+    this.snapshotConfirmed = true;
+    this.confirmedGeneration = generation;
     const waiters = Array.from(this.readyWaiters);
     this.readyWaiters.clear();
     for (const w of waiters) w();
@@ -2889,45 +3784,59 @@ var OneloFeatures = class {
   async _batchPing() {
     const names = Array.from(this.discoveredNames);
     if (names.length === 0) return;
+    const userId = this.currentUserId;
     try {
       const { sdkHeaders: sdkHeaders2 } = await Promise.resolve().then(() => (init_sdk_headers(), sdk_headers_exports));
-      await (0, import_core3.httpPost)(`${this.apiUrl}/api/sdk/features/batch-ping`, {
+      const headers = await sdkHeaders2(this.bundleId);
+      await sendWithUserToken(this.userToken, ({ token, anonymous }) => (0, import_core4.httpPost)(`${this.apiUrl}/api/sdk/features/batch-ping`, {
         publishableKey: this.publishableKey,
         features: names,
-        ...this.currentUserId ? { userId: this.currentUserId } : {},
-        ...this.currentUserIdHash ? { userIdHash: this.currentUserIdHash } : {},
+        ...userId && !anonymous ? { userId } : {},
         ...this.featureEnvironment ? { environment: this.featureEnvironment } : {}
-      }, await sdkHeaders2(this.bundleId));
+      }, { ...headers, ...bearerHeader(token) }), () => this._warnUserTokenRefused(), true, false);
     } catch {
     }
   }
-  async _resolve(userId) {
+  async _resolve(userId, generation) {
+    if (!this.identityLoaded) return;
     try {
-      const body = { publishableKey: this.publishableKey };
-      if (userId) body["userId"] = userId;
-      if (this.currentUserIdHash) body["userIdHash"] = this.currentUserIdHash;
-      if (this.featureEnvironment) body["environment"] = this.featureEnvironment;
       const { sdkHeaders: sdkHeaders2 } = await Promise.resolve().then(() => (init_sdk_headers(), sdk_headers_exports));
-      const headers = await sdkHeaders2(this.bundleId, void 0, {
-        method: "POST",
-        path: "/api/sdk/features/resolve",
-        body: JSON.stringify(body)
-      });
-      const { status, json } = await (0, import_core3.httpPost)(`${this.apiUrl}/api/sdk/features/resolve`, body, headers);
+      const { status, json } = await sendWithUserToken(this.userToken, async ({ token, anonymous }) => {
+        const body = { publishableKey: this.publishableKey };
+        if (userId && !anonymous) body["userId"] = userId;
+        if (this.featureEnvironment) body["environment"] = this.featureEnvironment;
+        const headers = await sdkHeaders2(this.bundleId, void 0, {
+          method: "POST",
+          path: "/api/sdk/features/resolve",
+          body: JSON.stringify(body)
+        });
+        return (0, import_core4.httpPost)(`${this.apiUrl}/api/sdk/features/resolve`, body, { ...headers, ...bearerHeader(token) });
+      }, () => this._warnUserTokenRefused(), userId === null);
       if (status !== 200) {
         const { maybeSelfHealFromError: maybeSelfHealFromError2 } = await Promise.resolve().then(() => (init_attest(), attest_exports));
         maybeSelfHealFromError2(json);
         return;
       }
+      if (generation !== this.loadGeneration || userId !== this.currentUserId) return;
       const j = json;
+      if (userId !== null && j["anonymous"] === true) return;
       const features = j["features"];
-      if (features) {
-        this._applySnapshot(typeof j["config_version"] === "number" ? j["config_version"] : this.configVersion, features);
-      }
+      if (!features) return;
+      this._applySnapshot(typeof j["config_version"] === "number" ? j["config_version"] : this.configVersion, features, generation, userId);
       this._maybeWarnAnonymous(j);
-      this._signalFirstEvent();
+      this._signalFirstEvent(generation, userId);
     } catch {
     }
+  }
+  /** The server refused the signed-in user's access token even after a refresh,
+   *  so the call went out anonymous. Features has no error callback; this
+   *  one-time warning is its error channel (like the anonymous-mode warning). */
+  _warnUserTokenRefused() {
+    if (this.userTokenRefusedWarned) return;
+    this.userTokenRefusedWarned = true;
+    console.warn(
+      "[Onelo] The signed-in user's access token was refused by Features (invalid_user_token) even after a refresh, so the request was made without a user. Check that the publishableKey belongs to the app the user signed in to."
+    );
   }
   /**
    * Logs a one-time warning when the backend reports anonymous mode (no userId)
@@ -2946,27 +3855,37 @@ If you handle auth yourself, call onelo.identify(userId) after login so per-user
 If your app is intentionally anonymous, pass suppressIdentifyWarning: true in OneloConfig to silence this.`
     );
   }
-  async _poll(userId) {
+  async _poll(userId, generation = this.loadGeneration) {
+    if (!this.identityLoaded) return;
     try {
       const params = new URLSearchParams({
-        key: this.publishableKey,
-        since_version: String(this.configVersion)
+        // Only a version confirmed for the CURRENT identity.
+        since_version: String(this.snapshotConfirmed ? this.confirmedVersion : 0)
       });
       if (this.featureEnvironment) params.set("environment", this.featureEnvironment);
-      if (userId) params.set("userId", userId);
       const { sdkHeaders: sdkHeaders2 } = await Promise.resolve().then(() => (init_sdk_headers(), sdk_headers_exports));
-      const { status, json } = await (0, import_core3.httpGet)(
-        `${this.apiUrl}/api/sdk/features/poll?${params.toString()}`,
-        await sdkHeaders2(this.bundleId)
-      );
+      const headers = await sdkHeaders2(this.bundleId);
+      const { status, json } = await sendWithUserToken(this.userToken, ({ token, anonymous }) => {
+        const query = params.toString() + (userId && !anonymous ? `&userId=${encodeURIComponent(userId)}` : "");
+        return (0, import_core4.httpGet)(
+          `${this.apiUrl}/api/sdk/features/poll?${query}`,
+          { ...headers, "X-Publishable-Key": this.publishableKey, ...bearerHeader(token) }
+        );
+      }, () => this._warnUserTokenRefused(), userId === null);
       if (status !== 200) return;
+      if (generation !== this.loadGeneration || userId !== this.currentUserId) return;
       const j = json;
+      if (userId !== null && j["anonymous"] === true) return;
       if (j["up_to_date"] === true) {
-        if (typeof j["config_version"] === "number") this.configVersion = j["config_version"];
+        if (this.snapshotConfirmed && typeof j["config_version"] === "number") {
+          this.configVersion = j["config_version"];
+          this.confirmedVersion = this.configVersion;
+        }
       } else {
         const features = j["features"];
         if (features) {
-          this._applySnapshot(typeof j["config_version"] === "number" ? j["config_version"] : this.configVersion, features);
+          this._applySnapshot(typeof j["config_version"] === "number" ? j["config_version"] : this.configVersion, features, generation, userId);
+          this._signalFirstEvent(generation, userId);
         }
       }
       if (j["discovery_requested"] === true) {
@@ -2977,8 +3896,9 @@ If your app is intentionally anonymous, pass suppressIdentifyWarning: true in On
   }
   _startPolling(userId) {
     this._stopPollTimer();
+    const generation = this.loadGeneration;
     this.pollTimer = setInterval(() => {
-      void this._poll(userId);
+      void this._poll(userId, generation);
     }, POLL_INTERVAL_MS);
   }
   _stopPollTimer() {
@@ -2988,7 +3908,10 @@ If your app is intentionally anonymous, pass suppressIdentifyWarning: true in On
     }
   }
   // ── Snapshot + disk cache ────────────────────────────────────────────────────
-  _applySnapshot(version, features) {
+  _applySnapshot(version, features, generation, userId) {
+    if (!this.identityLoaded || generation !== this.loadGeneration || userId !== this.currentUserId) return;
+    this.confirmedVersion = version;
+    this.snapshotConfirmed = true;
     this.configVersion = version;
     this.cache.clear();
     for (const [name, wire] of Object.entries(features)) {
@@ -3015,8 +3938,9 @@ If your app is intentionally anonymous, pass suppressIdentifyWarning: true in On
     }
     return { config_version: this.configVersion, features };
   }
-  async _loadCache(userId) {
+  async _loadCache(userId, generation) {
     const parsed = await loadFeatureCache(this._cacheKey(userId));
+    if (generation !== this.loadGeneration || this.snapshotConfirmed) return;
     if (!parsed || typeof parsed.config_version !== "number" || !parsed.features) return;
     this.configVersion = parsed.config_version;
     this.cache.clear();
@@ -3145,6 +4069,7 @@ function scrubMeta(meta) {
 }
 
 // src/monitor/monitor.ts
+var import_core5 = __toESM(require_dist());
 var SDK_NAME = "@onelo/react-native";
 var MAX_BUFFER_SIZE = 200;
 var MAX_FLAGS = 100;
@@ -3506,7 +4431,14 @@ var OneloMonitor = class {
         const handler = (err, isFatal) => {
           try {
             const { message, stack, errorType } = _extractError(err);
-            this._push("unhandled", false, void 0, message, this._withError(void 0, stack, errorType), "global_error");
+            this._push(
+              "unhandled",
+              false,
+              void 0,
+              message,
+              { ...this._withError(void 0, stack, errorType), origin: (0, import_core5.classifyErrorOrigin)(err) },
+              "global_error"
+            );
           } catch {
           }
           prev?.(err, isFatal);
@@ -3549,18 +4481,23 @@ var OneloMonitor = class {
 };
 
 // src/feedback/feedback.ts
+var import_core6 = __toESM(require_dist());
 var OneloFeedback = class {
-  constructor(apiUrl, publishableKey, getActiveFeatures, bundleId, pageBackgroundColor = () => "#111111") {
+  constructor(apiUrl, publishableKey, getActiveFeatures, bundleId, brand = new import_core6.BrandSource(), userToken) {
     this.apiUrl = apiUrl;
     this.publishableKey = publishableKey;
     this.getActiveFeatures = getActiveFeatures;
     this.bundleId = bundleId;
-    this.pageBackgroundColor = pageBackgroundColor;
+    this.brand = brand;
+    this.userToken = userToken;
     this._url = null;
+    /** The options of the open form, re-initiated to renew its `ft` (#622). */
+    this._options = {};
     this._visible = false;
     this._listeners = [];
   }
   open(options = {}) {
+    this._options = options;
     this._notify(null, true);
     void this._fetchAndLoad(options);
   }
@@ -3569,23 +4506,54 @@ var OneloFeedback = class {
   }
   async _fetchAndLoad(options) {
     try {
-      const params = new URLSearchParams({ key: this.publishableKey });
-      if (options.type) params.set("type", options.type);
-      if (options.area) params.set("area", options.area);
-      const active = this.getActiveFeatures();
-      if (active.length > 0) params.set("session", JSON.stringify(active));
-      const { sdkHeaders: sdkHeaders2 } = await Promise.resolve().then(() => (init_sdk_headers(), sdk_headers_exports));
-      const headers = { ...await sdkHeaders2(this.bundleId), ...options.userId ? { "X-Onelo-User-Id": options.userId } : {} };
-      const res = await fetch(`${this.apiUrl}/api/sdk/feedback/initiate?${params}`, { headers });
-      if (!res.ok) {
+      const hostedUrl = await this._initiate(options);
+      if (!hostedUrl) {
         this.close();
         return;
       }
-      const { hosted_url } = await res.json();
-      if (this._visible) this._notify(hosted_url, true);
+      if (this._visible) this._notify(hostedUrl, true);
     } catch {
       this.close();
     }
+  }
+  /** Mint a hosted feedback URL (and with it a fresh reporter token `ft`), or
+   *  null when initiate refused. */
+  async _initiate(options) {
+    const params = new URLSearchParams({ key: this.publishableKey });
+    if (options.type) params.set("type", options.type);
+    if (options.area) params.set("area", options.area);
+    const active = this.getActiveFeatures();
+    if (active.length > 0) params.set("session", JSON.stringify(active));
+    const { sdkHeaders: sdkHeaders2 } = await Promise.resolve().then(() => (init_sdk_headers(), sdk_headers_exports));
+    const base = await sdkHeaders2(this.bundleId);
+    const url = `${this.apiUrl}/api/sdk/feedback/initiate?${params}`;
+    const { status, json } = await sendWithUserToken(this.userToken, async ({ token }) => {
+      const headers = { ...base, ...bearerHeader(token), ...options.userId ? { "X-Onelo-User-Id": options.userId } : {} };
+      const res = await fetch(url, { headers });
+      let body = null;
+      try {
+        body = await res.json();
+      } catch {
+      }
+      return { status: res.status, json: body };
+    }, () => {
+    });
+    if (status < 200 || status >= 300) return null;
+    return json?.hosted_url || null;
+  }
+  /**
+   * Answer the hosted form's `onelo:renew_request` (kind `feedback`, #622). The
+   * form's reporter token `ft` lives 30 minutes; a form left open longer asks
+   * for a fresh one on submit. The open form's options are initiated again, so
+   * the report keeps its reporter, type, area and session.
+   */
+  async renewReply(requestId) {
+    try {
+      const hostedUrl = await this._initiate(this._options);
+      if (hostedUrl) return { type: "onelo:renewed", request_id: requestId, hosted_url: hostedUrl };
+    } catch {
+    }
+    return { type: "onelo:renew_failed", request_id: requestId, reason: "renew_failed" };
   }
   _notify(url, visible) {
     this._url = url;
@@ -3604,10 +4572,13 @@ var OneloFeedback = class {
   isVisible() {
     return this._visible;
   }
-  /** Branding page background (--onelo-page-bg) so the feedback WebView never
-   *  flashes white before the hosted feedback page paints. */
+  /** The app's brand tokens (#681) the feedback modal paints its chrome with. */
+  brandTokens() {
+    return this.brand.current();
+  }
+  /** @deprecated Use `brandTokens().page_bg`. */
   getPageBackgroundColor() {
-    return this.pageBackgroundColor();
+    return this.brand.current().page_bg;
   }
 };
 
@@ -3648,17 +4619,22 @@ var OneloForms = class {
 };
 
 // src/waitlist/waitlist.ts
+var import_core7 = __toESM(require_dist());
 var OneloWaitlist = class {
   constructor(apiUrl, publishableKey, bundleId) {
     this.apiUrl = apiUrl;
     this.publishableKey = publishableKey;
     this.bundleId = bundleId;
   }
-  async join(slug, email) {
+  async join(slug, email, options) {
     try {
       const { sdkHeaders: sdkHeaders2 } = await Promise.resolve().then(() => (init_sdk_headers(), sdk_headers_exports));
       const { maybeSelfHealFromError: _maybeSelfHeal } = await Promise.resolve().then(() => (init_attest(), attest_exports));
-      const body = { publishableKey: this.publishableKey, email };
+      const body = {
+        publishableKey: this.publishableKey,
+        email,
+        ...(0, import_core7.waitlistConsentField)(options)
+      };
       if (slug !== void 0) body.slug = slug;
       const bodyStr = JSON.stringify(body);
       const res = await fetch(`${this.apiUrl}/api/sdk/waitlist/join`, {
@@ -3684,7 +4660,7 @@ var OneloWaitlist = class {
 };
 
 // src/customer-portal/customer-portal.ts
-var import_core4 = __toESM(require_dist());
+var import_core8 = __toESM(require_dist());
 init_sdk_headers();
 var SDK_VERSION4 = require_package().version;
 var CALLBACK_SCHEME3 = "onelorn";
@@ -3693,6 +4669,16 @@ var PORTAL_REVOKE_EVENTS = /* @__PURE__ */ new Set([
   "account_revoked",
   "session_compromised"
 ]);
+function withPortalIntent(hostedUrl, intent) {
+  if (!intent) return hostedUrl;
+  try {
+    const u = new URL(hostedUrl);
+    u.searchParams.set("intent", intent);
+    return u.toString();
+  } catch {
+    return hostedUrl;
+  }
+}
 var OneloCustomerPortal = class {
   /**
    * @param bundleId Threaded into `sdkHeaders` so portal-initiate sends
@@ -3703,10 +4689,13 @@ var OneloCustomerPortal = class {
    *   account revoked, session compromised) so `auth.isUserRevoked` is set.
    *   Parity with Swift `portalRevokeEvents` + guard #9.
    */
-  constructor(apiUrl, publishableKey, bundleId, getAccessToken, signOut, onRevoked, pageBackgroundColor = () => "#111111", callbackScheme = CALLBACK_SCHEME3) {
+  constructor(apiUrl, publishableKey, bundleId, getAccessToken, signOut, onRevoked, brand = new import_core8.BrandSource(), callbackScheme = CALLBACK_SCHEME3, onClosed) {
     this._modalVisible = false;
     this._modalUrl = "";
     this._modalResolve = null;
+    /** Told when the store opened in the portal modal ended in a purchase or a
+     *  plan switch (#659). Set by `Onelo` to its plan-change refresher. */
+    this.onPlanChange = null;
     this.portalStateListeners = [];
     if (!apiUrl) throw new Error("[Onelo] apiUrl is required");
     this.apiUrl = apiUrl;
@@ -3715,23 +4704,74 @@ var OneloCustomerPortal = class {
     this.getAccessToken = getAccessToken;
     this.signOut = signOut;
     this.onRevoked = onRevoked;
-    this.pageBg = pageBackgroundColor;
+    this.brand = brand;
     this.callbackScheme = callbackScheme;
+    this.onClosed = onClosed;
   }
-  /** Open the hosted customer portal in a fullscreen WebView modal. */
-  async open() {
+  setPlanChangeHandler(fn) {
+    this.onPlanChange = fn;
+  }
+  /**
+   * Open the hosted customer portal in a fullscreen WebView modal. Requires
+   * `<CustomerPortalModal onelo={onelo} />` mounted near your app root.
+   *
+   * @param opts.intent `'change_plan'` opens the portal straight into the plan
+   *   picker (parity with `@onelo/js` `customerPortal.open({ intent })`). The
+   *   hosted portal asks the backend where the change goes.
+   */
+  async open(opts) {
+    const hostedUrl = await this.initiate();
+    return this.presentUrl(withPortalIntent(hostedUrl, opts?.intent));
+  }
+  /** True while a `<CustomerPortalModal>` is mounted to present the portal. */
+  get hasModalHost() {
+    return this.portalStateListeners.length > 0;
+  }
+  /**
+   * Present an already-minted hosted URL (portal, or a store / plan-switch URL
+   * from `/upgrade-initiate`) in the portal modal. Handles every hand-back the
+   * portal does and re-reads the entitlement when the modal closes.
+   * @internal Used by `OneloStore.openUpgrade`.
+   */
+  async presentUrl(url) {
+    await this.presentModal(url);
+    if (this.onClosed) await this.onClosed().catch(() => {
+    });
+  }
+  /**
+   * Answer the hosted portal's `onelo:renew_request` (#613 / #614): mint a fresh
+   * portal with the signed-in user's access token. Signed out or revoked →
+   * `renew_failed` with `not_authenticated`, and the page shows its branded
+   * "signed out" screen.
+   */
+  async renewReply(requestId) {
+    try {
+      const hostedUrl = await this.initiate();
+      return { type: "onelo:renewed", request_id: requestId, hosted_url: hostedUrl };
+    } catch (e) {
+      const reason = e instanceof import_core8.OneloError && e.code === "not_authenticated" ? "not_authenticated" : "renew_failed";
+      return { type: "onelo:renew_failed", request_id: requestId, reason };
+    }
+  }
+  /** GET portal-initiate with the user's access token → the hosted URL. */
+  async initiate() {
     const token = await this.getAccessToken();
-    if (!token) throw new import_core4.OneloError("not_authenticated", "Sign in before opening the customer portal");
+    if (!token) throw new import_core8.OneloError("not_authenticated", "Sign in before opening the customer portal");
     const url = `${this.apiUrl}/api/sdk/paywall/portal-initiate?key=${encodeURIComponent(this.publishableKey)}&callback_scheme=${encodeURIComponent(this.callbackScheme)}`;
-    const { status, json } = await (0, import_core4.httpGet)(url, {
+    const { status, json } = await (0, import_core8.httpGet)(url, {
       ...await sdkHeaders(this.bundleId),
       "X-SDK-Version": SDK_VERSION4,
       Authorization: `Bearer ${token}`
     });
-    if (status !== 200) throw import_core4.OneloError.server("Failed to initiate customer portal");
+    if (status === 401) throw new import_core8.OneloError("not_authenticated", "The session can no longer open the customer portal");
+    if (status !== 200) throw import_core8.OneloError.server("Failed to initiate customer portal");
     const j = json;
+    this.brand.adopt(j);
     const hostedUrl = j["hosted_url"];
-    if (!hostedUrl) throw import_core4.OneloError.server("Invalid portal-initiate response");
+    if (!hostedUrl) throw import_core8.OneloError.server("Invalid portal-initiate response");
+    return hostedUrl;
+  }
+  presentModal(hostedUrl) {
     return new Promise((resolve) => {
       this._modalUrl = hostedUrl;
       this._modalResolve = async (result) => {
@@ -3742,6 +4782,7 @@ var OneloCustomerPortal = class {
           resolve();
           return;
         }
+        if (result.planChange) this.onPlanChange?.(result.planChange);
         if (result.event && PORTAL_REVOKE_EVENTS.has(result.event)) {
           try {
             this.onRevoked?.();
@@ -3765,8 +4806,10 @@ var OneloCustomerPortal = class {
       hostedUrl: this._modalUrl,
       callbackScheme: this.callbackScheme,
       apiUrl: this.apiUrl,
-      backgroundColor: this.pageBg(),
-      onResult: this._modalResolve
+      tokens: this.brand.current(),
+      backgroundColor: this.brand.current().page_bg,
+      onResult: this._modalResolve,
+      onRenewRequest: (requestId) => this.renewReply(requestId)
     };
   }
   /** Subscribe to portal modal state changes. Returns an unsubscribe function. */
@@ -3782,7 +4825,7 @@ var OneloCustomerPortal = class {
 };
 
 // src/consent/consent.ts
-var import_core5 = __toESM(require_dist());
+var import_core9 = __toESM(require_dist());
 init_sdk_headers();
 function _mapRequirement(j) {
   const versionId = j["version_id"];
@@ -3872,7 +4915,7 @@ var OneloConsent = class {
     const session = await this.auth.getSession();
     if (!session) return [];
     try {
-      const { status, json } = await (0, import_core5.httpGet)(`${this.apiUrl}/v1/sdk/consent/required`, {
+      const { status, json } = await (0, import_core9.httpGet)(`${this.apiUrl}/v1/sdk/consent/required`, {
         ...await sdkHeaders(this.bundleId, this.publishableKey),
         Authorization: `Bearer ${session.accessToken}`
       });
@@ -3890,8 +4933,8 @@ var OneloConsent = class {
    */
   async acceptConsent(versionId) {
     const session = await this.auth.getSession();
-    if (!session) throw import_core5.OneloError.notAuthenticated();
-    const { status } = await (0, import_core5.httpPost)(
+    if (!session) throw import_core9.OneloError.notAuthenticated();
+    const { status } = await (0, import_core9.httpPost)(
       `${this.apiUrl}/v1/sdk/consent/accept`,
       // snake_case `document_version_id` — the backend ConsentActionIn model.
       { document_version_id: versionId },
@@ -3900,8 +4943,8 @@ var OneloConsent = class {
         Authorization: `Bearer ${session.accessToken}`
       }
     );
-    if (status === 401) throw import_core5.OneloError.notAuthenticated();
-    if (status < 200 || status >= 300) throw import_core5.OneloError.server(`Failed to record consent: HTTP ${status}`);
+    if (status === 401) throw import_core9.OneloError.notAuthenticated();
+    if (status < 200 || status >= 300) throw import_core9.OneloError.server(`Failed to record consent: HTTP ${status}`);
   }
   // ── Gate presentation ────────────────────────────────────────────────────────
   /**
@@ -3956,7 +4999,8 @@ var OneloConsent = class {
       visible: this._modalVisible,
       hostedUrl: this._modalUrl,
       onResult: this._modalResolve,
-      backgroundColor: this.auth.pageBackgroundColor()
+      tokens: this.auth.brandTokens(),
+      backgroundColor: this.auth.brandTokens().page_bg
     };
   }
   /** Subscribe to consent modal state changes. Returns an unsubscribe function. */
@@ -3979,7 +5023,7 @@ var OneloConsent = class {
 };
 
 // src/store/store.ts
-var import_core6 = __toESM(require_dist());
+var import_core10 = __toESM(require_dist());
 init_sdk_headers();
 var SDK_VERSION5 = require_package().version;
 var CALLBACK_SCHEME4 = "onelorn";
@@ -3990,7 +5034,10 @@ var OneloStore = class {
    *   auth-state listeners fire). Delegates to the auth module's hosted-callback
    *   exchange. Required for `open()` to complete a purchase.
    */
-  constructor(apiUrl, publishableKey, bundleId, getAccessToken, exchangeCode, pageBackgroundColor = () => "#111111", callbackScheme = CALLBACK_SCHEME4) {
+  constructor(apiUrl, publishableKey, bundleId, getAccessToken, exchangeCode, brand = new import_core10.BrandSource(), callbackScheme = CALLBACK_SCHEME4, getSession = async () => null, upgradeHost) {
+    /** Told when the store ended in a purchase or a plan switch (#659). Set by
+     *  `Onelo` to its plan-change refresher. */
+    this.onPlanChange = null;
     this._modalVisible = false;
     this._modalUrl = "";
     this._modalResolve = null;
@@ -4001,8 +5048,13 @@ var OneloStore = class {
     this.bundleId = bundleId;
     this.getAccessToken = getAccessToken;
     this.exchangeCode = exchangeCode;
-    this.pageBg = pageBackgroundColor;
+    this.brand = brand;
     this.callbackScheme = callbackScheme;
+    this.getSession = getSession;
+    this.upgradeHost = upgradeHost;
+  }
+  setPlanChangeHandler(fn) {
+    this.onPlanChange = fn;
   }
   /** Security headers for every store request (`sdkHeaders`) plus per-request extras. */
   async _secHeaders(extra = {}) {
@@ -4022,17 +5074,18 @@ var OneloStore = class {
   async initiateStoreFlow(lang = "en") {
     const token = await this.getAccessToken();
     const url = `${this.apiUrl}/api/sdk/paywall/store-initiate?key=${encodeURIComponent(this.publishableKey)}&callback_scheme=${encodeURIComponent(this.callbackScheme)}&lang=${encodeURIComponent(lang)}`;
-    const { status, json } = await (0, import_core6.httpGet)(
+    const { status, json } = await (0, import_core10.httpGet)(
       url,
       await this._secHeaders(token ? { Authorization: `Bearer ${token}` } : {})
     );
-    if (status === 401) throw import_core6.OneloError.invalidKey("Store rejected the publishable key");
+    if (status === 401) throw import_core10.OneloError.invalidKey("Store rejected the publishable key");
     if (status !== 200) {
-      const code = (0, import_core6.extractErrorCode)(json);
-      throw import_core6.OneloError.server(`Failed to initiate store flow: HTTP ${status}${code ? ` (${code})` : ""}`);
+      const code = (0, import_core10.extractErrorCode)(json);
+      throw import_core10.OneloError.server(`Failed to initiate store flow: HTTP ${status}${code ? ` (${code})` : ""}`);
     }
+    this.brand.adopt(json);
     const storeUrl = json["store_url"];
-    if (!storeUrl) throw import_core6.OneloError.server("Invalid store-initiate response: missing store_url");
+    if (!storeUrl) throw import_core10.OneloError.server("Invalid store-initiate response: missing store_url");
     return storeUrl;
   }
   /**
@@ -4048,6 +5101,17 @@ var OneloStore = class {
     return new Promise((resolve, reject) => {
       this._modalUrl = hostedUrl;
       this._modalResolve = async (result) => {
+        if (result.type === "expired") {
+          const resolver = this._modalResolve;
+          try {
+            this._modalUrl = await this.initiateStoreFlow(lang);
+            this._modalResolve = resolver;
+            this.notifyStoreListeners();
+            return;
+          } catch {
+            result = { type: "cancelled" };
+          }
+        }
         this._modalVisible = false;
         this._modalResolve = null;
         this.notifyStoreListeners();
@@ -4055,12 +5119,18 @@ var OneloStore = class {
           resolve(null);
           return;
         }
+        if (result.type === "done") {
+          this.onPlanChange?.({ kind: "switched", reason: result.reason });
+          this.getSession().then(resolve, reject);
+          return;
+        }
         if (!this.exchangeCode) {
-          reject(import_core6.OneloError.server("Store exchange not wired: missing exchangeCode dependency"));
+          reject(import_core10.OneloError.server("Store exchange not wired: missing exchangeCode dependency"));
           return;
         }
         try {
           const session = await this.exchangeCode(result.code);
+          this.onPlanChange?.({ kind: "purchase" });
           resolve(session);
         } catch (e) {
           reject(e);
@@ -4074,9 +5144,13 @@ var OneloStore = class {
    * Act on an upsell (a feature's `upgradeCta`/`upgradeHint`, an "Available in
    * <plan>" tap). Requires a signed-in session. The backend is the single source
    * of truth for billing: an active subscriber is routed to a hosted plan-switch
-   * checkout, a user with no subscription to the hosted store. The resulting URL
-   * opens in the SYSTEM BROWSER via `Linking.openURL` (mirrors Swift
-   * `openUpgrade(forPlan:)` / `NSWorkspace.open`) — never an in-app WebView.
+   * checkout, a user with no subscription to the hosted store, and a subscriber
+   * whose plan changes are switched off to the portal, which explains it. The
+   * URL opens in the SDK's customer-portal modal (#606), so the store's
+   * hand-back (purchase, plan switch, expired link) closes it and the app sees
+   * the new plan; resolves when the modal closes. Requires
+   * `<CustomerPortalModal onelo={onelo} />` mounted — without one the URL opens
+   * in the system browser (`Linking.openURL`) and a warning is logged.
    *
    * @throws OneloError('not_authenticated') when signed out (401) or
    *   `OneloError('server_error')` on `plan_not_purchasable` (404) /
@@ -4084,16 +5158,22 @@ var OneloStore = class {
    */
   async openUpgrade(plan, lang = "en") {
     const token = await this.getAccessToken();
-    if (!token) throw import_core6.OneloError.notAuthenticated();
+    if (!token) throw import_core10.OneloError.notAuthenticated();
     const url = `${this.apiUrl}/api/sdk/paywall/upgrade-initiate?key=${encodeURIComponent(this.publishableKey)}&plan=${encodeURIComponent(plan)}&callback_scheme=${encodeURIComponent(this.callbackScheme)}&lang=${encodeURIComponent(lang)}`;
-    const { status, json } = await (0, import_core6.httpGet)(url, await this._secHeaders({ Authorization: `Bearer ${token}` }));
-    if (status === 401) throw import_core6.OneloError.notAuthenticated();
+    const { status, json } = await (0, import_core10.httpGet)(url, await this._secHeaders({ Authorization: `Bearer ${token}` }));
+    if (status === 401) throw import_core10.OneloError.notAuthenticated();
     if (status !== 200) {
-      const code = (0, import_core6.extractErrorCode)(json);
-      throw import_core6.OneloError.server(`Failed to initiate upgrade: HTTP ${status}${code ? ` (${code})` : ""}`);
+      const code = (0, import_core10.extractErrorCode)(json);
+      throw import_core10.OneloError.server(`Failed to initiate upgrade: HTTP ${status}${code ? ` (${code})` : ""}`);
     }
+    this.brand.adopt(json);
     const upgradeUrl = json["upgrade_url"];
-    if (!upgradeUrl) throw import_core6.OneloError.server("Invalid upgrade-initiate response: missing upgrade_url");
+    if (!upgradeUrl) throw import_core10.OneloError.server("Invalid upgrade-initiate response: missing upgrade_url");
+    if (this.upgradeHost?.hasModalHost) {
+      await this.upgradeHost.presentUrl(upgradeUrl);
+      return;
+    }
+    console.warn("[Onelo] openUpgrade: no <CustomerPortalModal> is mounted \u2014 opening the upgrade in the system browser, where its completion cannot reach the app.");
     const { Linking } = require("react-native");
     await Linking.openURL(upgradeUrl);
   }
@@ -4104,7 +5184,8 @@ var OneloStore = class {
       hostedUrl: this._modalUrl,
       callbackScheme: this.callbackScheme,
       apiUrl: this.apiUrl,
-      backgroundColor: this.pageBg(),
+      tokens: this.brand.current(),
+      backgroundColor: this.brand.current().page_bg,
       onResult: this._modalResolve
     };
   }
@@ -4132,7 +5213,7 @@ var DONE = 4;
 var OneloEventStream = class {
   /**
    * @param apiUrl          Base API URL (no trailing slash), e.g. `https://st.backend.onelo.tools`.
-   * @param publishableKey  `onelo_pk_...` — authenticates the stream via the `key` query param.
+   * @param publishableKey  `onelo_pk_...` — authenticates the stream via the `X-Publishable-Key` header (ADR-0003).
    * @param sdkVersion      SDK version string, forwarded as `sdk_version`.
    * @param bundleId        Host app bundle id, forwarded via `sdkHeaders()` as `X-Bundle-Id`.
    *
@@ -4140,12 +5221,14 @@ var OneloEventStream = class {
    * internally from `getInstanceId()` (Keychain-backed, cached) — no wiring
    * needed from the caller.
    */
-  constructor(apiUrl, publishableKey, sdkVersion, bundleId) {
+  constructor(apiUrl, publishableKey, sdkVersion, bundleId, userToken) {
     this.apiUrl = apiUrl;
     this.publishableKey = publishableKey;
     this.sdkVersion = sdkVersion;
     this.bundleId = bundleId;
+    this.userToken = userToken;
     this.handlers = /* @__PURE__ */ new Map();
+    this.connectionListeners = [];
     // Connection state.
     this.xhr = null;
     this.started = false;
@@ -4157,8 +5240,13 @@ var OneloEventStream = class {
     this.reconnectTimer = null;
     // Query identity — the current values sent on the NEXT (re)connect.
     this.userId = null;
-    this.userIdHash = void 0;
     this.sinceVersion = 0;
+    // #518: `current` reads the session's token; `refreshed` sends the token a
+    // refresh just returned; `anonymous` sends neither token nor userId. Back to
+    // `current` once a connection is accepted.
+    this.tokenStage = "current";
+    this.refreshedToken = null;
+    this.userTokenRefusedWarned = false;
     this.appVersion = void 0;
     /**
      * Explicit feature environment ('test' | 'live') forwarded as the
@@ -4200,7 +5288,7 @@ var OneloEventStream = class {
    * Open (or re-open) the connection.
    *
    * Idempotent: a repeat call with identical params while already connected is a
-   * no-op (no needless reconnect). A changed userId / userIdHash / sinceVersion /
+   * no-op (no needless reconnect). A changed userId / sinceVersion /
    * appVersion reconnects so per-user routing stays correct.
    *
    * Downgrade refusal: once bound to a non-null userId, a `start({userId: null})`
@@ -4217,14 +5305,29 @@ var OneloEventStream = class {
     }
     const nextSinceVersion = params.sinceVersion ?? this.sinceVersion;
     const nextAppVersion = params.appVersion ?? this.appVersion;
-    const nextUserIdHash = params.userIdHash ?? this.userIdHash;
-    const changed = !this.started || nextUserId !== this.userId || nextUserIdHash !== this.userIdHash || nextSinceVersion !== this.sinceVersion || nextAppVersion !== this.appVersion;
+    const changed = !this.started || nextUserId !== this.userId || nextSinceVersion !== this.sinceVersion || nextAppVersion !== this.appVersion;
+    if (nextUserId !== this.userId) this._resetTokenStage();
     this.userId = nextUserId;
-    this.userIdHash = nextUserIdHash;
     this.sinceVersion = nextSinceVersion;
     this.appVersion = nextAppVersion;
     this.started = true;
     if (changed) this._connect();
+  }
+  /**
+   * Observe which identity the open connection actually authenticated — distinct
+   * from the requested user: a refused token opens an anonymous-fallback
+   * connection. `null` while no connection is open.
+   */
+  onConnectionIdentity(fn) {
+    this.connectionListeners.push(fn);
+  }
+  _setConnectionIdentity(identity) {
+    for (const fn of this.connectionListeners) {
+      try {
+        fn(identity);
+      } catch {
+      }
+    }
   }
   /**
    * Update the `since_version` cursor used on the NEXT reconnect. Does NOT force
@@ -4241,7 +5344,9 @@ var OneloEventStream = class {
    * resumes delivery.
    */
   stop() {
+    this._setConnectionIdentity(null);
     this.started = false;
+    this._resetTokenStage();
     this._clearReconnect();
     this._closeXhr();
   }
@@ -4258,6 +5363,7 @@ var OneloEventStream = class {
     if (this.destroyed || !this.started) return;
     this._clearReconnect();
     this._closeXhr();
+    this._setConnectionIdentity(null);
     this.offset = 0;
     this.currentEvent = "";
     this.dataLines = [];
@@ -4276,8 +5382,11 @@ var OneloEventStream = class {
     } catch {
       securityHeaders = {};
     }
+    const stage = this.tokenStage;
+    const requestedUserId = this.userId;
+    const userToken = stage === "current" ? await readUserToken(this.userToken ? () => this.userToken.current() : void 0) : stage === "refreshed" ? this.refreshedToken : null;
     if (gen !== this.connGen || this.destroyed || !this.started) return;
-    const url = this._buildUrl(instanceId);
+    const url = this._buildUrl(instanceId, stage === "anonymous");
     const xhr = new XMLHttpRequest();
     this.xhr = xhr;
     let ended = false;
@@ -4297,9 +5406,20 @@ var OneloEventStream = class {
     const checkStatus = () => {
       if (statusChecked) return statusOk;
       if (xhr.readyState < HEADERS_RECEIVED) return false;
+      if (xhr.status === 401 && userToken !== null && xhr.readyState < DONE) return false;
       statusChecked = true;
       statusOk = xhr.status === 200;
-      if (!statusOk) {
+      if (statusOk) {
+        this._setConnectionIdentity({
+          userId: requestedUserId,
+          anonymousFallback: stage === "anonymous" && requestedUserId !== null
+        });
+        this._resetTokenStage();
+        if (userToken !== null) userTokenAccepted(this.userToken);
+      } else if (userToken !== null && xhr.status === 401 && this._refusedUserToken(xhr)) {
+        end(false);
+        void this._retryAfterRefusedToken(stage);
+      } else {
         try {
           const body = xhr.responseText;
           if (body) maybeSelfHealFromError(JSON.parse(body));
@@ -4342,7 +5462,11 @@ var OneloEventStream = class {
       const headers = {
         ...securityHeaders,
         Accept: "text/event-stream",
-        "Cache-Control": "no-cache"
+        "Cache-Control": "no-cache",
+        // ADR-0003: the Event Stream's credential. A header-authenticated
+        // connection carries no `Deprecation`/`Sunset` — unlike `?key=`.
+        "X-Publishable-Key": this.publishableKey,
+        ...bearerHeader(userToken)
       };
       for (const [k, v] of Object.entries(headers)) {
         try {
@@ -4431,20 +5555,61 @@ var OneloEventStream = class {
       }
     }
   }
-  _buildUrl(instanceId) {
+  /** True when a finished 401 answered `invalid_user_token`. */
+  _refusedUserToken(xhr) {
+    try {
+      const body = xhr.responseText;
+      return !!body && isInvalidUserToken(xhr.status, JSON.parse(body));
+    } catch {
+      return false;
+    }
+  }
+  /**
+   * The server refused the user's token. From `current`: refresh once and
+   * reconnect with the new token. From `refreshed` (or when the refresh yields
+   * no token): reconnect anonymous and warn. Reconnects immediately — each step
+   * happens at most once, so this cannot loop.
+   */
+  async _retryAfterRefusedToken(stage) {
+    const gen = this.connGen;
+    if (stage === "current") {
+      const fresh = await refreshAfterRefusal(this.userToken);
+      if (gen !== this.connGen || this.destroyed || !this.started) return;
+      if (fresh !== null) {
+        this.tokenStage = "refreshed";
+        this.refreshedToken = fresh;
+        this._connect();
+        return;
+      }
+    }
+    this.tokenStage = "anonymous";
+    this.refreshedToken = null;
+    this._warnUserTokenRefused();
+    this._connect();
+  }
+  _resetTokenStage() {
+    this.tokenStage = "current";
+    this.refreshedToken = null;
+  }
+  _warnUserTokenRefused() {
+    if (this.userTokenRefusedWarned) return;
+    this.userTokenRefusedWarned = true;
+    console.warn(
+      "[Onelo] The signed-in user's access token was refused by the Event Stream (invalid_user_token) even after a refresh, so the stream was opened without a user."
+    );
+  }
+  _buildUrl(instanceId, anonymous) {
     const parts = [];
     const add = (k, v) => {
       parts.push(`${k}=${encodeURIComponent(v)}`);
     };
-    add("key", this.publishableKey);
     add("since_version", String(this.sinceVersion));
     if (instanceId) add("instance_id", instanceId);
     add("sdk_platform", "react-native");
     if (this.sdkVersion) add("sdk_version", this.sdkVersion);
     if (this.appVersion) add("app_version", this.appVersion);
     if (this.featureEnvironment) add("environment", this.featureEnvironment);
-    if (this.userId) add("userId", this.userId);
-    if (this.userIdHash) add("userIdHash", this.userIdHash);
+    if (this.userId && !anonymous) add("userId", this.userId);
     return `${this.apiUrl}/api/sdk/features/stream?${parts.join("&")}`;
   }
   _scheduleReconnect() {
@@ -4499,6 +5664,9 @@ var Onelo = class {
     /** RN AppState 'change' subscription, removed in destroy() so a torn-down SDK
      *  can't leak a foreground callback that fires against dead state. */
     this.appStateSubscription = null;
+    /** True once features loaded an identity (auth bridge or identify()), so the
+     *  cold-start restore never loads over it. */
+    this.featuresBound = false;
     /** iOS App Attest lifecycle. Created lazily in `_initAttest` ONLY when the app
      *  is iOS AND config reports `attest_required`; null otherwise (Android, or
      *  attest not required). Its token rides every request via `sdkHeaders`. */
@@ -4510,6 +5678,10 @@ var Onelo = class {
      *  always awaitable even before `_initAttest` is assigned below. */
     this._attestReady = Promise.resolve();
     this.auth = new OneloAuth(config, () => this._attestReady);
+    const userToken = {
+      current: async () => (await this.auth.getSession())?.accessToken ?? null,
+      refresh: async () => (await this.auth.refreshSession())?.accessToken ?? null
+    };
     this.monitor = new OneloMonitor(
       config.publishableKey,
       config.apiUrl,
@@ -4522,9 +5694,10 @@ var Onelo = class {
     this.features = new OneloFeatures(config.apiUrl, config.publishableKey, this.monitor, config.bundleId, {
       suppressIdentifyWarning: config.suppressIdentifyWarning ?? false,
       featureEnvironment,
-      featureDefaultStatus: config.featureDefaultStatus
+      featureDefaultStatus: config.featureDefaultStatus,
+      userToken
     });
-    this.feedback = new OneloFeedback(config.apiUrl, config.publishableKey, () => this.features.getActiveFeatures(), config.bundleId, () => this.auth.pageBackgroundColor());
+    this.feedback = new OneloFeedback(config.apiUrl, config.publishableKey, () => this.features.getActiveFeatures(), config.bundleId, this.auth.brand, userToken);
     this.forms = new OneloForms(config.apiUrl, config.publishableKey, config.bundleId);
     this.waitlist = new OneloWaitlist(config.apiUrl, config.publishableKey, config.bundleId);
     this.customerPortal = new OneloCustomerPortal(
@@ -4536,8 +5709,10 @@ var Onelo = class {
       () => {
         this.auth.isUserRevoked = true;
       },
-      () => this.auth.pageBackgroundColor(),
-      this.auth.callbackScheme
+      this.auth.brand,
+      // #681: the one brand-token model
+      this.auth.callbackScheme,
+      () => this.auth.revalidateEntitlement()
     );
     this.autoPresentConsent = config.autoPresentConsentGate ?? true;
     this.autoLifecycleRefresh = config.autoLifecycleRefresh ?? true;
@@ -4548,17 +5723,35 @@ var Onelo = class {
       config.bundleId,
       async () => (await this.auth.getSession())?.accessToken ?? null,
       (code) => this.auth.exchangeHostedCode(code),
-      () => this.auth.pageBackgroundColor(),
-      this.auth.callbackScheme
+      this.auth.brand,
+      // #681: the one brand-token model
+      this.auth.callbackScheme,
+      () => this.auth.getSession(),
+      this.customerPortal
     );
-    this.eventStream = new OneloEventStream(config.apiUrl, config.publishableKey, SDK_VERSION6, config.bundleId);
+    this.eventStream = new OneloEventStream(config.apiUrl, config.publishableKey, SDK_VERSION6, config.bundleId, userToken);
     this.eventStream.featureEnvironment = featureEnvironment;
     this.auth.attachEventStream(this.eventStream);
     this.consent.attachEventStream(this.eventStream);
     this.features.attachEventStream(this.eventStream);
+    this.planChange = new PlanChangeRefresher({
+      refreshFeatures: () => this.features.refresh(true),
+      revalidateEntitlement: () => this.auth.revalidateEntitlement(),
+      snapshot: () => this.features.snapshotKey()
+    });
+    const onPlanChange = (change) => {
+      void this.planChange.handBack(change);
+    };
+    this.auth.setPlanChangeHandler(onPlanChange);
+    this.store.setPlanChangeHandler(onPlanChange);
+    this.customerPortal.setPlanChangeHandler(onPlanChange);
+    let boundUserId = null;
     this.authUnsubscribe = this.auth.onAuthStateChange((session) => {
       const userId = session?.user.id ?? null;
+      if (userId !== boundUserId) resetUserTokenRefusal(userToken);
+      boundUserId = userId;
       this.monitor.setUserId(userId);
+      this.featuresBound = true;
       void this.features.load(userId);
       if (session != null && userId != null) {
         this.eventStream.start({ userId });
@@ -4568,8 +5761,11 @@ var Onelo = class {
       }
     });
     this.monitor.setUserId(null);
-    void this.features.load(null);
-    void this.auth.restoreSession();
+    void this.auth.restoreSession().then((session) => {
+      if (!this.featuresBound) void this.features.load(session?.user.id ?? null);
+    }).catch(() => {
+      if (!this.featuresBound) void this.features.load(null);
+    });
     this._attestReady = this._initAttest(config);
     this._wireForeground();
   }
@@ -4632,15 +5828,17 @@ var Onelo = class {
       })();
     });
   }
-  /** Only needed when NOT using Onelo Auth (own auth system). `userIdHash` is the
-   *  host-supplied HMAC for Features secure mode (threaded into resolve / batch-ping
-   *  / module-token); omit it when not using secure mode. */
+  /** @deprecated The signed-in Onelo user is used automatically: Features calls
+   *  prove them with their access token. `userIdHash` is ignored (Secure Mode is
+   *  retired). Kept so existing code compiles. */
   async identify(userId, userIdHash) {
+    this.featuresBound = true;
     await this.features.load(userId, userIdHash);
   }
   /**
-   * Opens the hosted upgrade flow for `plan` in the SYSTEM BROWSER and returns.
-   * The backend decides the destination: an active subscriber lands on "Change
+   * Opens the hosted upgrade flow for `plan` in the SDK's customer-portal modal
+   * (`<CustomerPortalModal>` must be mounted) and resolves when it closes. The
+   * backend decides the destination: an active subscriber lands on "Change
    * plan" (target pinned; one click to confirm), a non-subscriber on the store.
    * Requires a signed-in session (throws `OneloError('not_authenticated')` otherwise).
    *
@@ -4658,6 +5856,7 @@ var Onelo = class {
     this.authUnsubscribe?.();
     this.appStateSubscription?.remove();
     this.appStateSubscription = null;
+    this.planChange.cancel();
     this.eventStream.destroy();
     this.features.stopPolling();
     this.monitor.destroy();
@@ -4667,7 +5866,7 @@ var Onelo = class {
 
 // src/auth/OneloAuthGate.tsx
 var import_react4 = __toESM(require("react"));
-var import_core7 = __toESM(require_dist());
+var import_core11 = __toESM(require_dist());
 
 // src/auth/hooks.ts
 var import_react3 = require("react");
@@ -4682,9 +5881,33 @@ function useModalState(auth) {
   return state;
 }
 
+// src/auth/launch-url.ts
+async function completeLaunchUrl(auth, linking, onError) {
+  let url = null;
+  try {
+    if (linking && typeof linking.getInitialURL === "function") url = await linking.getInitialURL();
+  } catch {
+    url = null;
+  }
+  try {
+    await auth.handleLaunchUrl(url);
+  } catch (e) {
+    onError(e);
+  }
+}
+
+// src/auth/gate-state.ts
+async function resolveGateState(auth) {
+  await auth.whenReady();
+  const session = await auth.getSession();
+  const signedIn = session != null;
+  const allowedIn = signedIn && await auth.isAllowedIn();
+  return { signedIn, allowedIn };
+}
+
 // src/auth/OneloAuthGate.tsx
 function errorMessage(e) {
-  if (e instanceof import_core7.OneloError) return e.message;
+  if (e instanceof import_core11.OneloError) return e.message;
   if (e instanceof Error) return e.message;
   return void 0;
 }
@@ -4698,12 +5921,7 @@ function OneloAuthGate({ onelo, children, fallback }) {
   const flowInFlight = (0, import_react4.useRef)(false);
   const mountedRef = (0, import_react4.useRef)(true);
   const recompute = (0, import_react4.useCallback)(async () => {
-    await onelo.auth.whenReady();
-    const session = await onelo.auth.getSession();
-    const signedIn = session != null;
-    const paywallEnabled = onelo.auth.isPaywallEnabled();
-    const entitled = session?.user.entitlement === "active";
-    const allowedIn = signedIn && (!paywallEnabled || entitled);
+    const { signedIn, allowedIn } = await resolveGateState(onelo.auth);
     if (!mountedRef.current) return;
     setState({ resolved: true, allowedIn, signedIn });
     setRestoring(false);
@@ -4728,8 +5946,11 @@ function OneloAuthGate({ onelo, children, fallback }) {
     }).catch(() => {
       if (mountedRef.current) setRestoring(false);
     });
-    void recompute();
-    void onelo.auth.revalidateEntitlement().then(recompute).catch(() => {
+    const launchHandled = completeLaunchUrl(onelo.auth, Linking, (e) => {
+      if (mountedRef.current) setRetry({ message: errorMessage(e) });
+    });
+    void launchHandled.then(recompute);
+    void launchHandled.then(() => onelo.auth.revalidateEntitlement()).then(recompute).catch(() => {
     });
     const unsubAuth = onelo.auth.onAuthStateChange(() => {
       void recompute();
@@ -4765,16 +5986,18 @@ function OneloAuthGate({ onelo, children, fallback }) {
     if (retry) return;
     void driveFlow();
   }, [state.resolved, state.allowedIn, retry, driveFlow]);
-  const bg = onelo.auth.pageBackgroundColor();
+  const t = onelo.auth.brandTokens();
+  const bg = t.page_bg;
+  const c = chromeStyles(t);
   const styles = StyleSheet.create({
     // #36 — the cold-start restore splash: the branding page background ONLY, no
     // form, no skeleton, no spinner. Reads as "opening…" for an auto-login rather
     // than flashing the sign-in form. Mirrors Swift's neutral branded background.
     restoringContainer: { flex: 1, backgroundColor: bg },
     retryContainer: { flex: 1, backgroundColor: bg, justifyContent: "center", alignItems: "center", gap: 16, padding: 32 },
-    errorText: { color: "#ff6b6b", fontSize: 13, textAlign: "center" },
-    retryButton: { backgroundColor: "#ffffff", paddingHorizontal: 32, paddingVertical: 14, borderRadius: 8 },
-    retryText: { color: "#000000", fontSize: 16, fontWeight: "600" }
+    errorText: c.errorText,
+    retryButton: c.retryButton,
+    retryText: c.retryText
   });
   const handleRetry = (0, import_react4.useCallback)(() => setRetry(null), []);
   const preAuth = restoring && !state.resolved || state.signedIn && !state.allowedIn && !retry ? import_react4.default.createElement(View, { style: styles.restoringContainer }) : retry ? import_react4.default.createElement(
@@ -4790,7 +6013,7 @@ function OneloAuthGate({ onelo, children, fallback }) {
   // the hosted page's own skeleton so the transition has no jump. social-aware.
   import_react4.default.createElement(AuthSkeleton, {
     socialCount: onelo.auth.oauthProviders.length,
-    backgroundColor: bg
+    tokens: t
   });
   return import_react4.default.createElement(
     import_react4.default.Fragment,
@@ -4805,10 +6028,9 @@ function OneloAuthGate({ onelo, children, fallback }) {
       // system-browser OAuth URL from the backend base). Nav-diversion works without
       // it, but this activates the full OAuth path inside the gate.
       apiUrl: onelo.auth.baseUrl,
-      // Branding page background — the hosted auth page paints this behind its card,
-      // so the WebView shows it (not white) while loading. Resolved from config,
-      // which is ready before loadAuthView() opens the modal.
-      backgroundColor: onelo.auth.pageBackgroundColor(),
+      // Brand tokens (#681) — the modal's ground, skeleton and ✕ chip. Resolved
+      // from config, which is ready before loadAuthView() opens the modal.
+      tokens: onelo.auth.brandTokens(),
       // #26 part B — social-pill count for the loading skeleton so it matches
       // what the hosted form will render.
       socialCount: onelo.auth.oauthProviders.length,
@@ -4821,28 +6043,35 @@ function OneloAuthGate({ onelo, children, fallback }) {
 
 // src/feedback/FeedbackModal.tsx
 var import_react5 = __toESM(require("react"));
-var SKELETON_HTML = `<!DOCTYPE html><html><head>
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<style>
-*{box-sizing:border-box;margin:0;padding:0}
-body{background:#111;font-family:-apple-system,sans-serif;padding:40px 36px 32px;overflow:hidden}
-@keyframes shimmer{0%{background-position:-600px 0}100%{background-position:600px 0}}
-.sk{border-radius:10px;background:linear-gradient(90deg,#1e1e1e 25%,#2a2a2a 50%,#1e1e1e 75%);background-size:600px 100%;animation:shimmer 1.4s infinite linear}
-.icon{width:64px;height:64px;border-radius:14px;margin:0 auto 16px}
-.title{width:220px;height:22px;margin:0 auto 40px;border-radius:6px}
-.cards{display:flex;gap:12px;margin-bottom:32px}
-.card{flex:1;height:76px;border-radius:12px}
-.label{width:60px;height:13px;border-radius:4px;margin-bottom:8px}
-.input{width:100%;height:44px;border-radius:10px;margin-bottom:24px}
-.textarea{width:100%;height:110px;border-radius:10px;margin-bottom:32px}
-.btn{width:100%;height:48px;border-radius:12px}
-</style></head><body>
-<div class="sk icon"></div><div class="sk title"></div>
-<div class="cards"><div class="sk card"></div><div class="sk card"></div><div class="sk card"></div></div>
-<div class="sk label"></div><div class="sk input"></div>
-<div class="sk label"></div><div class="sk textarea"></div>
-<div class="sk btn"></div>
-</body></html>`;
+
+// src/customer-portal/portal-renewal.ts
+function parseRenewRequest(raw, kind = "portal") {
+  let data = raw;
+  if (typeof raw === "string") {
+    try {
+      data = JSON.parse(raw);
+    } catch {
+      return null;
+    }
+  }
+  const d = data;
+  if (!d || d["type"] !== "onelo:renew_request" || d["kind"] !== kind) return null;
+  return typeof d["request_id"] === "string" && d["request_id"] ? d["request_id"] : null;
+}
+function renewReplyScript(reply) {
+  return `window.postMessage(${JSON.stringify(reply)}, '*'); true;`;
+}
+function sameOrigin(a, b) {
+  const origin = (u) => {
+    const m = /^([a-z][a-z0-9+.-]*):\/\/([^/?#]+)/i.exec(u ?? "");
+    return m ? `${m[1].toLowerCase()}://${m[2].toLowerCase()}` : null;
+  };
+  const oa = origin(a);
+  return oa !== null && oa === origin(b);
+}
+
+// src/feedback/FeedbackModal.tsx
+var import_core12 = __toESM(require_dist());
 var RELAY_JS = `
 (function() {
   window.addEventListener('message', function(e) {
@@ -4865,6 +6094,7 @@ function FeedbackModal({ feedback }) {
   const [hostedReady, setHostedReady] = (0, import_react5.useState)(false);
   const [failSafeArmed, setFailSafeArmed] = (0, import_react5.useState)(false);
   const [loadError, setLoadError] = (0, import_react5.useState)(false);
+  const webviewRef = (0, import_react5.useRef)(null);
   (0, import_react5.useEffect)(() => {
     const unsub = feedback.subscribe((nextUrl, nextVisible) => {
       setUrl(nextUrl);
@@ -4877,10 +6107,18 @@ function FeedbackModal({ feedback }) {
     setHostedReady(false);
     setFailSafeArmed(false);
     setLoadError(false);
-    const t = setTimeout(() => setFailSafeArmed(true), 3500);
-    return () => clearTimeout(t);
+    const t2 = setTimeout(() => setFailSafeArmed(true), 3500);
+    return () => clearTimeout(t2);
   }, [visible, url]);
   const handleMessage = (0, import_react5.useCallback)((event) => {
+    const renewId = parseRenewRequest(event.nativeEvent.data, "feedback");
+    if (renewId) {
+      if (!sameOrigin(event.nativeEvent.url, url)) return;
+      void feedback.renewReply(renewId).then((reply) => {
+        webviewRef.current?.injectJavaScript?.(renewReplyScript(reply));
+      });
+      return;
+    }
     try {
       const msg = JSON.parse(event.nativeEvent.data);
       const type = msg["type"];
@@ -4888,10 +6126,12 @@ function FeedbackModal({ feedback }) {
       else if (type === "onelo:ready") setHostedReady(true);
     } catch {
     }
-  }, [feedback]);
+  }, [feedback, url]);
   const showNativeClose = !hostedReady && (failSafeArmed || loadError);
   const topInset = Platform.OS === "android" ? StatusBar.currentHeight ?? 0 : 8;
-  const bg = feedback.getPageBackgroundColor();
+  const t = feedback.brandTokens();
+  const bg = t.page_bg;
+  const c = chromeStyles(t);
   const styles = StyleSheet.create({
     container: { flex: 1, backgroundColor: bg },
     // Visible, always-present close affordance — parity with Swift's toolbar
@@ -4909,10 +6149,10 @@ function FeedbackModal({ feedback }) {
       height: 48 + topInset,
       backgroundColor: bg,
       borderBottomWidth: StyleSheet.hairlineWidth,
-      borderBottomColor: "#262626"
+      borderBottomColor: c.header.borderBottomColor
     },
     closeBtn: { width: 44, height: 44, alignItems: "center", justifyContent: "center" },
-    closeIcon: { color: "#ffffff", fontSize: 22, fontWeight: "400", lineHeight: 24 },
+    closeIcon: { color: c.headerText.color, fontSize: 22, fontWeight: "400", lineHeight: 24 },
     webview: { flex: 1, backgroundColor: bg }
   });
   return import_react5.default.createElement(
@@ -4950,7 +6190,8 @@ function FeedbackModal({ feedback }) {
       ),
       // Always render WebView: shows skeleton HTML until real URL loads
       import_react5.default.createElement(WebView, {
-        source: url ? { uri: url } : { html: SKELETON_HTML },
+        ref: webviewRef,
+        source: url ? { uri: url } : { html: (0, import_core12.feedbackSkeletonHtml)(t) },
         onMessage: handleMessage,
         // #44 — a load error reveals the native fail-safe ✕ immediately (no grace
         // wait) so the user is never trapped with no way out on a failed hosted page.
@@ -4964,35 +6205,12 @@ function FeedbackModal({ feedback }) {
 }
 
 // src/index.ts
-var import_core8 = __toESM(require_dist());
-var import_core9 = __toESM(require_dist());
+var import_core15 = __toESM(require_dist());
+var import_core16 = __toESM(require_dist());
 
 // src/customer-portal/customer-portal-modal.tsx
 var import_react6 = __toESM(require("react"));
-var portalSkeletonHtml = (bg) => `<!DOCTYPE html><html><head>
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<style>
-*{box-sizing:border-box;margin:0;padding:0}
-body{background:${bg};font-family:-apple-system,sans-serif;overflow:hidden}
-@keyframes onelo-shimmer{0%{background-position:-60vw 0}100%{background-position:100vw 0}}
-.wrap{display:flex;flex-direction:column;align-items:center;width:100%;padding:48px 24px 0}
-.col{width:100%;max-width:432px;display:flex;flex-direction:column;gap:14px}
-.sk{background-color:rgba(255,255,255,0.04);background-image:linear-gradient(90deg,rgba(255,255,255,0) 0%,rgba(255,255,255,0.12) 50%,rgba(255,255,255,0) 100%);background-size:60vw 100%;background-repeat:no-repeat;background-attachment:fixed;animation:onelo-shimmer 2.4s linear infinite;border-radius:8px}
-.strong{background-color:rgba(255,255,255,0.08);background-image:linear-gradient(90deg,rgba(255,255,255,0) 0%,rgba(255,255,255,0.18) 50%,rgba(255,255,255,0) 100%);background-size:60vw 100%;background-repeat:no-repeat;background-attachment:fixed;animation:onelo-shimmer 2.4s linear infinite;border-radius:9px}
-.icon{width:64px;height:64px;border-radius:14px;margin-bottom:14px;background:rgba(255,255,255,0.06);border:1.5px solid rgba(255,255,255,0.1)}
-.title{width:200px;height:22px;margin-bottom:10px;border-radius:6px}
-.sub{width:80px;height:13px;opacity:0.7;margin-bottom:32px;border-radius:4px}
-.c1{height:240px;border-radius:14px}
-.c2{height:80px;border-radius:14px}
-.c3{height:140px;border-radius:14px}
-</style></head><body>
-<div class="wrap">
-<div class="sk icon"></div>
-<div class="sk title"></div>
-<div class="sk sub"></div>
-<div class="col"><div class="strong c1"></div><div class="strong c2"></div><div class="strong c3"></div></div>
-</div>
-</body></html>`;
+var import_core13 = __toESM(require_dist());
 function usePortalModalState(portal) {
   const [state, setState] = (0, import_react6.useState)(() => portal.getModalState());
   (0, import_react6.useEffect)(() => {
@@ -5015,12 +6233,15 @@ function CustomerPortalModal({ onelo }) {
     hostedUrl: state.hostedUrl,
     callbackScheme: state.callbackScheme,
     apiUrl: state.apiUrl,
-    backgroundColor: state.backgroundColor,
-    onResult: handleResult
+    tokens: state.tokens,
+    onResult: handleResult,
+    onRenewRequest: state.onRenewRequest
   });
 }
-function CustomerPortalModalView({ visible, hostedUrl, callbackScheme, apiUrl, onResult, backgroundColor }) {
-  const bg = backgroundColor || "#111111";
+function CustomerPortalModalView({ visible, hostedUrl, callbackScheme, apiUrl, onResult, tokens, backgroundColor, onRenewRequest }) {
+  const t = resolveModalTokens(tokens, backgroundColor);
+  const bg = t.page_bg;
+  const c = chromeStyles(t);
   const RN = require("react-native");
   const { WebView } = require("react-native-webview");
   const { Modal, View, StyleSheet, TouchableOpacity, Text, Linking, Platform, StatusBar } = RN;
@@ -5040,8 +6261,8 @@ function CustomerPortalModalView({ visible, hostedUrl, callbackScheme, apiUrl, o
     if (!visible) return;
     setHostedReady(false);
     setFailSafeArmed(false);
-    const t = setTimeout(() => setFailSafeArmed(true), 3500);
-    return () => clearTimeout(t);
+    const t2 = setTimeout(() => setFailSafeArmed(true), 3500);
+    return () => clearTimeout(t2);
   }, [visible, hostedUrl, retryKey]);
   const resolveOnce = (0, import_react6.useCallback)(
     (result) => {
@@ -5053,13 +6274,11 @@ function CustomerPortalModalView({ visible, hostedUrl, callbackScheme, apiUrl, o
   );
   const handleCallbackUrl = (0, import_react6.useCallback)(
     (url) => {
-      const parsed = parseCallbackDeepLink(url, callbackScheme);
-      if (!parsed) return false;
-      if (parsed.host !== "callback" || parsed.params["source"] !== "portal") {
-        resolveOnce({ type: "cancelled" });
-        return true;
-      }
-      resolveOnce({ type: "done", event: parsed.params["event"] });
+      const hb = classifyHandBack(url, callbackScheme);
+      if (!hb) return false;
+      if (hb.kind === "portal_closed") resolveOnce({ type: "done", event: hb.event });
+      else if (hb.kind === "purchase" || hb.kind === "switched") resolveOnce({ type: "done", planChange: planChangeOf(hb) });
+      else resolveOnce({ type: "cancelled" });
       return true;
     },
     [callbackScheme, resolveOnce]
@@ -5084,6 +6303,21 @@ function CustomerPortalModalView({ visible, hostedUrl, callbackScheme, apiUrl, o
   const handleMessage = (0, import_react6.useCallback)(
     (event) => {
       const data = event.nativeEvent.data;
+      const renewId = parseRenewRequest(data);
+      if (renewId) {
+        if (!onRenewRequest) return;
+        if (!sameOrigin(event.nativeEvent.url, hostedUrl)) return;
+        void onRenewRequest(renewId).then((reply) => {
+          webviewRef.current?.injectJavaScript?.(renewReplyScript(reply));
+        });
+        return;
+      }
+      const hb = classifyHandBackMessage(data);
+      if (hb) {
+        if (hb.kind === "purchase" || hb.kind === "switched") resolveOnce({ type: "done", planChange: planChangeOf(hb) });
+        else resolveOnce({ type: "cancelled" });
+        return;
+      }
       try {
         const m = JSON.parse(data);
         if (m && m["type"] === "onelo:ready") {
@@ -5095,7 +6329,7 @@ function CustomerPortalModalView({ visible, hostedUrl, callbackScheme, apiUrl, o
       const oauth = parseOAuthMessage(data);
       if (oauth) openOAuth(oauth);
     },
-    [openOAuth]
+    [openOAuth, onRenewRequest, hostedUrl, resolveOnce]
   );
   const handleShouldStartLoad = (0, import_react6.useCallback)(
     (request) => {
@@ -5176,26 +6410,26 @@ function CustomerPortalModalView({ visible, hostedUrl, callbackScheme, apiUrl, o
       height: headerHeight,
       backgroundColor: bg,
       borderBottomWidth: StyleSheet.hairlineWidth,
-      borderBottomColor: "#262626",
+      borderBottomColor: c.header.borderBottomColor,
       // Stay above the absolute loading overlay so "Done" is tappable even while
       // the portal is loading (or if a load hangs) — the exit must never be covered.
       zIndex: 1,
       elevation: 1
     },
     headerBtn: { minWidth: 44, height: 44, paddingHorizontal: 8, alignItems: "center", justifyContent: "center", flexDirection: "row" },
-    backText: { color: "#ffffff", fontSize: 17, fontWeight: "400" },
-    // Close (✕) — same neutral white icon (22px/400) as the Feedback modal, so the
+    backText: { color: c.headerText.color, fontSize: 17, fontWeight: "400" },
+    // Close (✕) — the brand text colour (22px/400) as the Feedback modal, so the
     // close control is identical across every Onelo modal + SDK.
-    doneText: { color: "#ffffff", fontSize: 22, fontWeight: "400", lineHeight: 24 },
+    doneText: { color: c.headerText.color, fontSize: 22, fontWeight: "400", lineHeight: 24 },
     webview: { flex: 1, backgroundColor: bg },
     // Skeleton sits BELOW the header (top: headerHeight) so its 48px top padding
     // aligns with where the real hosted content paints — zero shift on cross-fade.
     skeletonOverlay: { position: "absolute", top: headerHeight, left: 0, right: 0, bottom: 0, backgroundColor: bg },
     errorContainer: { flex: 1, justifyContent: "center", alignItems: "center", gap: 16 },
-    retryButton: { backgroundColor: "#ffffff", paddingHorizontal: 32, paddingVertical: 14, borderRadius: 8 },
-    retryText: { color: "#000000", fontSize: 16, fontWeight: "600" },
+    retryButton: c.retryButton,
+    retryText: c.retryText,
     cancelButton: { paddingHorizontal: 32, paddingVertical: 14 },
-    cancelText: { color: "#ffffff", fontSize: 16 }
+    cancelText: c.cancelText
   });
   return import_react6.default.createElement(
     Modal,
@@ -5255,7 +6489,7 @@ function CustomerPortalModalView({ visible, hostedUrl, callbackScheme, apiUrl, o
         View,
         { style: styles.skeletonOverlay, pointerEvents: "none" },
         import_react6.default.createElement(WebView, {
-          source: { html: portalSkeletonHtml(bg) },
+          source: { html: (0, import_core13.portalSkeletonHtml)(t) },
           style: styles.webview,
           backgroundColor: bg,
           scrollEnabled: false,
@@ -5282,26 +6516,26 @@ function CustomerPortalModalView({ visible, hostedUrl, callbackScheme, apiUrl, o
 
 // src/store/store-modal.tsx
 var import_react7 = __toESM(require("react"));
-var storeSkeletonHtml = (bg) => `<!DOCTYPE html><html><head>
+var import_core14 = __toESM(require_dist());
+var storeSkeletonHtml = (t) => `<!DOCTYPE html><html><head>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
-body{background:${bg};font-family:-apple-system,sans-serif;overflow:hidden}
-@keyframes onelo-shimmer{0%{background-position:-60vw 0}100%{background-position:100vw 0}}
+body{background:${t.page_bg};font-family:${t.body_font};overflow:hidden}
+${(0, import_core14.skeletonCss)(t)}
 .wrap{width:100%;max-width:896px;margin:0 auto;padding:48px 24px 0;display:flex;flex-direction:column;align-items:center}
 .head{width:100%;display:flex;flex-direction:column;align-items:center;margin-bottom:32px}
-.sk{background-color:rgba(255,255,255,0.04);background-image:linear-gradient(90deg,rgba(255,255,255,0) 0%,rgba(255,255,255,0.14) 50%,rgba(255,255,255,0) 100%);background-size:60vw 100%;background-repeat:no-repeat;background-attachment:fixed;animation:onelo-shimmer 2.4s linear infinite;border-radius:8px}
-.logo{width:64px;height:64px;border-radius:12px;margin-bottom:14px;background:rgba(255,255,255,0.06);border:1.5px solid rgba(255,255,255,0.1)}
-.h{width:220px;height:22px;margin-bottom:10px;border-radius:6px}
-.sub{width:140px;height:13px;opacity:0.7;border-radius:4px}
+.logo{width:64px;height:64px;border-radius:${t.card_radius}px;margin-bottom:14px;border:1.5px solid ${t.border}}
+.h{width:220px;height:22px;margin-bottom:10px}
+.sub{width:140px;height:13px;opacity:0.7}
 .grid{width:100%;display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px}
-.card{border-radius:14px;padding:18px;min-height:180px;display:flex;flex-direction:column;gap:12px;background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.06)}
+.card{border-radius:${t.card_radius}px;padding:18px;min-height:180px;display:flex;flex-direction:column;gap:12px;background:${t.card_bg};border:1px solid ${t.border}}
 .name{width:60%;height:14px}
 .price{width:40%;height:22px}
 .desc{width:90%;height:10px;opacity:0.7}
 .desc2{width:75%;height:10px;opacity:0.7}
 .spacer{flex:1}
-.cta{width:100%;height:40px;border-radius:10px}
+.cta{width:100%;height:40px;border-radius:${t.button_radius}px}
 .foot{width:110px;height:14px;opacity:0.5;margin-top:36px}
 </style></head><body>
 <div class="wrap">
@@ -5336,12 +6570,14 @@ function StoreModal({ onelo }) {
     hostedUrl: state.hostedUrl,
     callbackScheme: state.callbackScheme,
     apiUrl: state.apiUrl,
-    backgroundColor: state.backgroundColor,
+    tokens: state.tokens,
     onResult: handleResult
   });
 }
-function StoreModalView({ visible, hostedUrl, callbackScheme, apiUrl, onResult, backgroundColor }) {
-  const bg = backgroundColor || "#111111";
+function StoreModalView({ visible, hostedUrl, callbackScheme, apiUrl, onResult, tokens, backgroundColor }) {
+  const t = resolveModalTokens(tokens, backgroundColor);
+  const bg = t.page_bg;
+  const c = chromeStyles(t);
   const RN = require("react-native");
   const { WebView } = require("react-native-webview");
   const { Modal, View, StyleSheet, TouchableOpacity, Text, Linking, Platform, StatusBar } = RN;
@@ -5367,17 +6603,16 @@ function StoreModalView({ visible, hostedUrl, callbackScheme, apiUrl, onResult, 
   );
   const handleCallbackUrl = (0, import_react7.useCallback)(
     (url) => {
-      const parsed = parseCallbackDeepLink(url, callbackScheme);
-      if (!parsed) return false;
-      if (parsed.host !== "callback") {
-        resolveOnce({ type: "cancelled" });
-        return true;
-      }
-      const { code, preauth } = parsed.params;
-      if (code) {
-        resolveOnce({ type: "success", code });
-      } else if (preauth) {
-        setCurrentUrl((prev) => withOAuthPreauth(prev || hostedUrl, preauth));
+      const hb = classifyHandBack(url, callbackScheme);
+      if (!hb) return false;
+      if (hb.kind === "purchase") {
+        resolveOnce({ type: "success", code: hb.code });
+      } else if (hb.kind === "switched") {
+        resolveOnce({ type: "done", reason: hb.reason });
+      } else if (hb.kind === "preauth") {
+        setCurrentUrl((prev) => withOAuthPreauth(prev || hostedUrl, hb.preauth));
+      } else if (hb.kind === "expired") {
+        resolveOnce({ type: "expired" });
       } else {
         resolveOnce({ type: "cancelled" });
       }
@@ -5413,9 +6648,11 @@ function StoreModalView({ visible, hostedUrl, callbackScheme, apiUrl, onResult, 
   const handleMessage = (0, import_react7.useCallback)(
     (event) => {
       const data = event.nativeEvent.data;
-      const parsed = parseModalMessage(data);
-      if (parsed) {
-        if (parsed.type === "code") resolveOnce({ type: "success", code: parsed.code });
+      const hb = classifyHandBackMessage(data);
+      if (hb) {
+        if (hb.kind === "purchase") resolveOnce({ type: "success", code: hb.code });
+        else if (hb.kind === "switched") resolveOnce({ type: "done", reason: hb.reason });
+        else if (hb.kind === "expired") resolveOnce({ type: "expired" });
         else resolveOnce({ type: "cancelled" });
         return;
       }
@@ -5495,25 +6732,25 @@ function StoreModalView({ visible, hostedUrl, callbackScheme, apiUrl, onResult, 
       height: headerHeight,
       backgroundColor: bg,
       borderBottomWidth: StyleSheet.hairlineWidth,
-      borderBottomColor: "#262626",
+      borderBottomColor: c.header.borderBottomColor,
       // Stay above the absolute loading overlay so "✕" is tappable even while the
       // checkout is loading (or if a load hangs) — the exit must never be covered.
       zIndex: 1,
       elevation: 1
     },
     headerBtn: { minWidth: 44, height: 44, paddingHorizontal: 8, alignItems: "center", justifyContent: "center", flexDirection: "row" },
-    backText: { color: "#ffffff", fontSize: 17, fontWeight: "400" },
-    // Close (✕) — same neutral white icon as every other Onelo modal + SDK.
-    closeText: { color: "#ffffff", fontSize: 22, fontWeight: "400", lineHeight: 24 },
+    backText: { color: c.headerText.color, fontSize: 17, fontWeight: "400" },
+    // Close (✕) — the brand text colour, like every other Onelo modal + SDK.
+    closeText: { color: c.headerText.color, fontSize: 22, fontWeight: "400", lineHeight: 24 },
     webview: { flex: 1, backgroundColor: bg },
     // Skeleton sits BELOW the header (top: headerHeight) so its 48px top padding
     // aligns with where the real hosted content paints — zero shift on cross-fade.
     skeletonOverlay: { position: "absolute", top: headerHeight, left: 0, right: 0, bottom: 0, backgroundColor: bg },
     errorContainer: { flex: 1, justifyContent: "center", alignItems: "center", gap: 16 },
-    retryButton: { backgroundColor: "#ffffff", paddingHorizontal: 32, paddingVertical: 14, borderRadius: 8 },
-    retryText: { color: "#000000", fontSize: 16, fontWeight: "600" },
+    retryButton: c.retryButton,
+    retryText: c.retryText,
     cancelButton: { paddingHorizontal: 32, paddingVertical: 14 },
-    cancelText: { color: "#ffffff", fontSize: 16 }
+    cancelText: c.cancelText
   });
   return import_react7.default.createElement(
     Modal,
@@ -5572,7 +6809,7 @@ function StoreModalView({ visible, hostedUrl, callbackScheme, apiUrl, onResult, 
         View,
         { style: styles.skeletonOverlay, pointerEvents: "none" },
         import_react7.default.createElement(WebView, {
-          source: { html: storeSkeletonHtml(bg) },
+          source: { html: storeSkeletonHtml(t) },
           style: styles.webview,
           backgroundColor: bg,
           scrollEnabled: false,
@@ -5645,11 +6882,13 @@ function ConsentGateModal({ onelo }) {
     visible: state.visible,
     hostedUrl: state.hostedUrl,
     onResult: handleResult,
-    backgroundColor: state.backgroundColor
+    tokens: state.tokens
   });
 }
-function ConsentGateModalView({ visible, hostedUrl, onResult, backgroundColor }) {
-  const bg = backgroundColor || "#111111";
+function ConsentGateModalView({ visible, hostedUrl, onResult, tokens, backgroundColor }) {
+  const t = resolveModalTokens(tokens, backgroundColor);
+  const bg = t.page_bg;
+  const c = chromeStyles(t);
   const RN = require("react-native");
   const { WebView } = require("react-native-webview");
   const { Modal, View, StyleSheet, ActivityIndicator, TouchableOpacity, Text, BackHandler } = RN;
@@ -5684,8 +6923,8 @@ function ConsentGateModalView({ visible, hostedUrl, onResult, backgroundColor })
     webview: { flex: 1, backgroundColor: bg },
     overlay: { position: "absolute", top: 0, left: 0, right: 0, bottom: 0, backgroundColor: bg, justifyContent: "center", alignItems: "center" },
     errorContainer: { flex: 1, justifyContent: "center", alignItems: "center", gap: 16 },
-    retryButton: { backgroundColor: "#ffffff", paddingHorizontal: 32, paddingVertical: 14, borderRadius: 8 },
-    retryText: { color: "#000000", fontSize: 16, fontWeight: "600" }
+    retryButton: c.retryButton,
+    retryText: c.retryText
   });
   return import_react8.default.createElement(
     Modal,
@@ -5706,7 +6945,7 @@ function ConsentGateModalView({ visible, hostedUrl, onResult, backgroundColor })
       loading && !error && import_react8.default.createElement(
         View,
         { style: styles.overlay },
-        import_react8.default.createElement(ActivityIndicator, { size: "large", color: "#ffffff" })
+        import_react8.default.createElement(ActivityIndicator, { size: "large", color: c.spinnerColor })
       ),
       // On a load failure allow a Retry (still no Cancel — the gate stays a hard
       // block, but a network blip must not trap the user behind a blank screen).

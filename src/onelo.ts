@@ -1,4 +1,5 @@
 import type { OneloConfig } from '@onelo/core'
+import { PlanChangeRefresher, type PlanChange } from './core/plan-change'
 import { OneloAuth } from './auth/auth'
 import { OneloFeatures } from './features/features'
 import { OneloMonitor } from './monitor/monitor'
@@ -9,6 +10,7 @@ import { OneloCustomerPortal } from './customer-portal/customer-portal'
 import { OneloConsent } from './consent/consent'
 import { OneloStore } from './store/store'
 import { OneloEventStream } from './core/event-stream'
+import { resetUserTokenRefusal, type UserTokenSource } from './core/user-token'
 import type { OneloAttest } from './attest'
 
 const SDK_VERSION: string = require('../package.json').version
@@ -35,6 +37,7 @@ export class Onelo {
   // auth (session.revoked) + consent (legal.consent_required) only register
   // handlers on it. Features is wired in Round 3 — not yet.
   private readonly eventStream: OneloEventStream
+  private readonly planChange: PlanChangeRefresher
   /** Whether the auth-state bridge + foreground re-check auto-open the consent
    *  gate (config.autoPresentConsentGate, default true). */
   private readonly autoPresentConsent: boolean
@@ -44,6 +47,9 @@ export class Onelo {
   /** RN AppState 'change' subscription, removed in destroy() so a torn-down SDK
    *  can't leak a foreground callback that fires against dead state. */
   private appStateSubscription: AppStateSubscription | null = null
+  /** True once features loaded an identity (auth bridge or identify()), so the
+   *  cold-start restore never loads over it. */
+  private featuresBound = false
   /** iOS App Attest lifecycle. Created lazily in `_initAttest` ONLY when the app
    *  is iOS AND config reports `attest_required`; null otherwise (Android, or
    *  attest not required). Its token rides every request via `sdkHeaders`. */
@@ -61,6 +67,13 @@ export class Onelo {
     // auth only reads it at request time (well after construction), so the
     // thunk always sees the live value.
     this.auth = new OneloAuth(config, () => this._attestReady)
+    // The signed-in user's access token, proving the user on every Features call
+    // and on the Event Stream (#518). getSession() refreshes a token near expiry,
+    // so a stale one is never sent.
+    const userToken: UserTokenSource = {
+      current: async () => (await this.auth.getSession())?.accessToken ?? null,
+      refresh: async () => (await this.auth.refreshSession())?.accessToken ?? null,
+    }
     this.monitor = new OneloMonitor(
       config.publishableKey, config.apiUrl, config.bundleId,
       config.appVersion, config.appBuild, config.environment,
@@ -76,8 +89,9 @@ export class Onelo {
       suppressIdentifyWarning: config.suppressIdentifyWarning ?? false,
       featureEnvironment,
       featureDefaultStatus: config.featureDefaultStatus,
+      userToken,
     })
-    this.feedback = new OneloFeedback(config.apiUrl, config.publishableKey, () => this.features.getActiveFeatures(), config.bundleId, () => this.auth.pageBackgroundColor())
+    this.feedback = new OneloFeedback(config.apiUrl, config.publishableKey, () => this.features.getActiveFeatures(), config.bundleId, this.auth.brand, userToken)
     this.forms = new OneloForms(config.apiUrl, config.publishableKey, config.bundleId)
     this.waitlist = new OneloWaitlist(config.apiUrl, config.publishableKey, config.bundleId)
     this.customerPortal = new OneloCustomerPortal(
@@ -87,8 +101,9 @@ export class Onelo {
       async () => (await this.auth.getSession())?.accessToken ?? null,
       () => this.auth.signOut(),
       () => { this.auth.isUserRevoked = true },
-      () => this.auth.pageBackgroundColor(),
+      this.auth.brand, // #681: the one brand-token model
       this.auth.callbackScheme,
+      () => this.auth.revalidateEntitlement(),
     )
 
     this.autoPresentConsent = config.autoPresentConsentGate ?? true
@@ -100,15 +115,17 @@ export class Onelo {
       config.bundleId,
       async () => (await this.auth.getSession())?.accessToken ?? null,
       (code) => this.auth.exchangeHostedCode(code),
-      () => this.auth.pageBackgroundColor(),
+      this.auth.brand, // #681: the one brand-token model
       this.auth.callbackScheme,
+      () => this.auth.getSession(),
+      this.customerPortal,
     )
 
     // The shared SSE connection. Register auth + consent handlers BEFORE the
     // stream is ever started (below in the bridge) so no server push is missed
     // between connect and sign-in. `featureEnvironment` is a constant for the
     // stream's lifetime, so it's set as a property (not a start() param).
-    this.eventStream = new OneloEventStream(config.apiUrl, config.publishableKey, SDK_VERSION, config.bundleId)
+    this.eventStream = new OneloEventStream(config.apiUrl, config.publishableKey, SDK_VERSION, config.bundleId, userToken)
     this.eventStream.featureEnvironment = featureEnvironment
     this.auth.attachEventStream(this.eventStream)
     this.consent.attachEventStream(this.eventStream)
@@ -117,15 +134,35 @@ export class Onelo {
     // start()/stop()s the stream — auth owns the lifecycle (avoids racing session.revoked).
     this.features.attachEventStream(this.eventStream)
 
+    // #659: a purchase / plan switch handed back by any hosted modal
+    // reconciles features + entitlement at once, instead of waiting for the
+    // stream. One refresher, so the modals cannot drift.
+    this.planChange = new PlanChangeRefresher({
+      refreshFeatures: () => this.features.refresh(true),
+      revalidateEntitlement: () => this.auth.revalidateEntitlement(),
+      snapshot: () => this.features.snapshotKey(),
+    })
+    const onPlanChange = (change: PlanChange): void => { void this.planChange.handBack(change) }
+    this.auth.setPlanChangeHandler(onPlanChange)
+    this.store.setPlanChangeHandler(onPlanChange)
+    this.customerPortal.setPlanChangeHandler(onPlanChange)
+
     // Auth → identity bridge: on sign-in start the user-bound stream (so
     // session.revoked routes to this user) + reload features; on sign-out stop
     // it. NEVER start({userId:null}) — the stream's downgrade guard would ignore
     // it and leave a stale user bound; stop() is the explicit teardown. Also
     // drive the legal-consent gate on sign-in (a fresh session may carry an
     // outstanding blocking Terms/Privacy update) unless the dev opted out.
+    let boundUserId: string | null = null
     this.authUnsubscribe = this.auth.onAuthStateChange((session) => {
       const userId = session?.user.id ?? null
+      // A different user starts a new token-refusal episode. The same user
+      // (a refresh re-publishing the session) does not: that is what keeps a
+      // persistently refused token from looping refresh → load → refresh.
+      if (userId !== boundUserId) resetUserTokenRefusal(userToken)
+      boundUserId = userId
       this.monitor.setUserId(userId)
+      this.featuresBound = true
       void this.features.load(userId)
       if (session != null && userId != null) {
         this.eventStream.start({ userId })
@@ -136,14 +173,20 @@ export class Onelo {
     })
 
     this.monitor.setUserId(null)
-    void this.features.load(null)
     // Cold-start: if a valid session is already in the keychain, publish it so the
     // bridge above runs for a RETURNING signed-in user — starts the SSE stream
     // (incl. session.revoked), loads per-user features, sets monitor identity, and
     // presents any pending consent gate. Without this, none of that fires on launch
     // until a token refresh eventually happens. Supersedes the anonymous baseline
     // set just above. Best-effort; never throws.
+    // Features load only AFTER the restore settles (#736): an anonymous load
+    // started first would race it and could overwrite a returning user's
+    // snapshot. A restored user usually loads through the bridge above; a
+    // stored session kept through a transient refresh failure may announce no
+    // change, so it is loaded here; no session → anonymous.
     void this.auth.restoreSession()
+      .then((session) => { if (!this.featuresBound) void this.features.load(session?.user.id ?? null) })
+      .catch(() => { if (!this.featuresBound) void this.features.load(null) })
     // iOS App Attest: gated on config.attest_required (read after auth resolves
     // config) + Platform.OS === 'ios'. Best-effort, fully in the background — it
     // must never block SDK construction. Once it completes the token is cached
@@ -211,7 +254,7 @@ export class Onelo {
         // module — set by the auth bridge or identify()). We do NOT re-derive the
         // identity from the Onelo session here: a CUSTOM-auth app has no Onelo
         // session, so `load(session?.user.id ?? null)` would reset it to anonymous
-        // and wipe the secure-mode userIdHash on EVERY foreground. refresh(true)
+        // on EVERY foreground. refresh(true)
         // keeps the identity + bypasses the 1s debounce, matching Swift/Android/
         // Flutter's forced foreground resync. Gated on autoLifecycleRefresh.
         if (this.autoLifecycleRefresh) void this.features.refresh(true)
@@ -227,16 +270,18 @@ export class Onelo {
     })
   }
 
-  /** Only needed when NOT using Onelo Auth (own auth system). `userIdHash` is the
-   *  host-supplied HMAC for Features secure mode (threaded into resolve / batch-ping
-   *  / module-token); omit it when not using secure mode. */
+  /** @deprecated The signed-in Onelo user is used automatically: Features calls
+   *  prove them with their access token. `userIdHash` is ignored (Secure Mode is
+   *  retired). Kept so existing code compiles. */
   async identify(userId: string, userIdHash?: string): Promise<void> {
+    this.featuresBound = true
     await this.features.load(userId, userIdHash)
   }
 
   /**
-   * Opens the hosted upgrade flow for `plan` in the SYSTEM BROWSER and returns.
-   * The backend decides the destination: an active subscriber lands on "Change
+   * Opens the hosted upgrade flow for `plan` in the SDK's customer-portal modal
+   * (`<CustomerPortalModal>` must be mounted) and resolves when it closes. The
+   * backend decides the destination: an active subscriber lands on "Change
    * plan" (target pinned; one click to confirm), a non-subscriber on the store.
    * Requires a signed-in session (throws `OneloError('not_authenticated')` otherwise).
    *
@@ -255,6 +300,7 @@ export class Onelo {
     this.authUnsubscribe?.()
     this.appStateSubscription?.remove()
     this.appStateSubscription = null
+    this.planChange.cancel()
     this.eventStream.destroy()
     this.features.stopPolling()
     this.monitor.destroy()

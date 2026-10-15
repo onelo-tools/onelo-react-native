@@ -106,10 +106,28 @@ describe('OneloEventStream — incremental (per-packet) parse', () => {
     expect(handler).toHaveBeenCalledTimes(2)
     expect(handler).toHaveBeenLastCalledWith({ v: 2 })
 
-    // The query string carries the bound identity.
+    // The query string carries the bound identity — but never the credential.
     expect(xhr.url).toContain('userId=u1')
     expect(xhr.url).toContain('instance_id=iid-abc')
-    expect(xhr.url).toContain('key=pk_test')
+
+    stream.stop()
+  })
+
+  // ADR-0003: the Event Stream's credential is a request header for every SDK
+  // but browser JS. A key in the query string lands in the reverse proxy's
+  // access.log on every connect, so it must not appear in the URL at all.
+  it('sends the key as the X-Publishable-Key header, never in the stream URL', async () => {
+    const stream = newStream()
+    stream.start({ userId: 'u1' })
+    await flushMicrotasks()
+
+    const xhr = FakeXHR.instances[0]
+    expect(xhr.headers['X-Publishable-Key']).toBe('pk_test')
+    // The security headers the stream already sent are untouched.
+    expect(xhr.headers['X-SDK-Version']).toBe('9.9.9')
+    expect(xhr.headers.Accept).toBe('text/event-stream')
+    expect(xhr.url).not.toContain('key=')
+    expect(xhr.url).not.toContain('pk_test')
 
     stream.stop()
   })

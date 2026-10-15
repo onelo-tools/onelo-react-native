@@ -61,7 +61,8 @@ export class KeychainStorage {
   }
 
   async clear(): Promise<void> {
-    const keys = ['onelo_access_token', 'onelo_refresh_token', 'onelo_expires_at', 'onelo_user']
+    // Includes the hosted flow's PKCE verifier (TOKEN_KEYS.MAGIC_LINK_VERIFIER, #542).
+    const keys = ['onelo_access_token', 'onelo_refresh_token', 'onelo_expires_at', 'onelo_user', 'onelo_magic_link_verifier']
     await Promise.all(keys.map(k => this.delete(k)))
   }
 }

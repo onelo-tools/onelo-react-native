@@ -1,3 +1,5 @@
+import { waitlistConsentField, type WaitlistJoinOptions } from '@onelo/core'
+
 export class OneloWaitlist {
   constructor(
     private readonly apiUrl: string,
@@ -8,11 +10,15 @@ export class OneloWaitlist {
   async join(
     slug: string | undefined,
     email: string,
+    /** #818: the checkboxes your form showed — `{ consent: { marketing, custom } }`. */
+    options?: WaitlistJoinOptions,
   ): Promise<{ success: boolean; position?: number; alreadyJoined: boolean; message?: string }> {
     try {
       const { sdkHeaders } = await import('../sdk-headers')
       const { maybeSelfHealFromError: _maybeSelfHeal } = await import('../attest')
-      const body: Record<string, unknown> = { publishableKey: this.publishableKey, email }
+      const body: Record<string, unknown> = {
+        publishableKey: this.publishableKey, email, ...waitlistConsentField(options),
+      }
       if (slug !== undefined) body.slug = slug
       // FAZA 3 — replay_guard path: hash the exact bytes we send.
       const bodyStr = JSON.stringify(body)

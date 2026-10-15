@@ -1,4 +1,6 @@
 import React from 'react'
+import type { BrandTokens } from '@onelo/core'
+import { resolveModalTokens, skeletonBlockCss } from '../core/brand'
 
 /**
  * Auth loading skeleton — the React Native SDK's pre-auth placeholder, shown
@@ -28,14 +30,13 @@ import React from 'react'
 
 /** Self-contained HTML for the auth loading skeleton.
  *  @param socialCount number of OAuth provider pills (0 = social disabled → none)
- *  @param backgroundColor branding page background (checkout_bg_color, default #111111)
+ *  @param t the app's brand tokens (#681): ground, block colours, radii, font
  *  @param redirectTo when set, the skeleton `location.replace()`s to this URL after
  *    it paints — the single-WebView hand-off (#28): the ONE WebView shows the
  *    skeleton, then navigates to the hosted page (kept visible until it paints),
  *    with NO extra history entry (replace, not push) so `goBack` still works (#27). */
-export function authSkeletonHtml(socialCount: number, backgroundColor: string, redirectTo?: string): string {
+export function authSkeletonHtml(socialCount: number, t: BrandTokens, redirectTo?: string): string {
   const n = Math.max(0, Math.min(4, Math.floor(socialCount || 0)))
-  const bg = backgroundColor || '#111111'
   // Redirect after two frames so the skeleton is actually painted first; the
   // current page stays rendered during the load, so there's no flash.
   const redirect = redirectTo
@@ -52,25 +53,24 @@ export function authSkeletonHtml(socialCount: number, backgroundColor: string, r
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 html,body{height:100%}
-body{background:${bg};font-family:-apple-system,BlinkMacSystemFont,sans-serif;overflow:hidden}
+body{background:${t.page_bg};font-family:${t.body_font};overflow:hidden}
 .wrap{display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:100vh;width:100%;padding:48px 24px}
 .col{width:100%;max-width:300px;display:flex;flex-direction:column;gap:10px}
-.onelo-skel{background-color:rgba(255,255,255,0.04);background-image:linear-gradient(90deg,rgba(255,255,255,0) 0%,rgba(255,255,255,0.14) 50%,rgba(255,255,255,0) 100%);background-size:60vw 100%;background-repeat:no-repeat;background-position:-100vw 0;border-radius:8px}
-.onelo-skel-strong{background-color:rgba(255,255,255,0.08);background-image:linear-gradient(90deg,rgba(255,255,255,0) 0%,rgba(255,255,255,0.20) 50%,rgba(255,255,255,0) 100%);background-size:60vw 100%;background-repeat:no-repeat;background-position:-100vw 0;border-radius:9px}
-.icon{width:64px;height:64px;border-radius:14px;margin-bottom:14px}
-.title{width:200px;height:22px;margin-bottom:10px;border-radius:6px}
-.sub{width:140px;height:13px;opacity:0.7;margin-bottom:28px;border-radius:4px}
-.pill{height:44px;border-radius:9px}
+${skeletonBlockCss(t)}
+.icon{width:64px;height:64px;border-radius:${t.card_radius}px;margin-bottom:14px}
+.title{width:200px;height:22px;margin-bottom:10px}
+.sub{width:140px;height:13px;opacity:0.7;margin-bottom:28px}
+.pill{height:44px;border-radius:${t.button_radius}px}
 .divider{display:flex;align-items:center;gap:12px;margin:16px 0 4px}
-.dline{flex:1;height:1px;background:rgba(255,255,255,0.1)}
+.dline{flex:1;height:1px;background:${t.border}}
 .dtext{width:14px;height:11px;opacity:0.5}
 .lbl{width:38px;height:11px}
 .input{height:44px}
 .lblrow{display:flex;justify-content:space-between;align-items:center}
 .lbl2{width:58px;height:11px}
 .forgot{width:90px;height:11px;opacity:0.7}
-.cta{height:48px;border-radius:10px;margin-top:6px}
-.signup{width:200px;height:12px;opacity:0.6;border-radius:4px;margin:6px auto 0}
+.cta{height:48px;border-radius:${t.button_radius}px;margin-top:6px}
+.signup{width:200px;height:12px;opacity:0.6;margin:6px auto 0}
 </style></head><body>
 <div class="wrap" aria-hidden="true">
 <div class="onelo-skel icon"></div>
@@ -94,8 +94,8 @@ ${redirect}
 export interface AuthSkeletonProps {
   /** Number of OAuth pills to draw (from `auth.oauthProviders`). Default 0. */
   socialCount?: number
-  /** Branding page background (from `auth.pageBackgroundColor()`). Default #111111. */
-  backgroundColor?: string
+  /** The app's brand tokens (from `auth.brandTokens()`, #681). Neutral when absent. */
+  tokens?: BrandTokens
 }
 
 /**
@@ -104,13 +104,15 @@ export interface AuthSkeletonProps {
  * `react-native` / `react-native-webview` are required LAZILY so a pure-Node
  * import of the SDK never pulls the native modules.
  */
-export function AuthSkeleton({ socialCount = 0, backgroundColor = '#111111' }: AuthSkeletonProps) {
+export function AuthSkeleton({ socialCount = 0, tokens }: AuthSkeletonProps) {
+  const t = resolveModalTokens(tokens)
+  const backgroundColor = t.page_bg
   // eslint-disable-next-line @typescript-eslint/no-var-requires
   const RN = require('react-native')
   // eslint-disable-next-line @typescript-eslint/no-var-requires
   const { WebView } = require('react-native-webview')
   const { View } = RN
-  const html = authSkeletonHtml(socialCount, backgroundColor)
+  const html = authSkeletonHtml(socialCount, t)
   return React.createElement(
     View,
     // pointerEvents none: it's a placeholder — never swallow touches (so the

@@ -87,6 +87,25 @@ describe('OneloMonitor — global crash handler lifecycle', () => {
     delete (globalThis as unknown as { ErrorUtils?: unknown }).ErrorUtils
   })
 
+  it('tags an uncaught error with meta.origin: OneloError → onelo_sdk, app error → app (#548)', async () => {
+    const fetchSpy = vi.fn().mockResolvedValue({ ok: true, status: 204 })
+    vi.stubGlobal('fetch', fetchSpy)
+    const { OneloMonitor } = await import('./monitor')
+    const { OneloError } = await import('@onelo/core')
+    const m = new OneloMonitor('pk_test', 'https://api.example.test')
+    installed?.(OneloError.sessionEnded(), false)
+    const appErr = new Error('app boom')
+    appErr.stack = 'Error: app boom\n    at onPress (http://localhost:8081/index.bundle:10:5)'
+    installed?.(appErr, false)
+    await m.flush()
+    const events = fetchSpy.mock.calls
+      .map((c) => JSON.parse(String((c[1] as RequestInit).body)).events as Array<{ featureName: string; meta: Record<string, unknown> }>)
+      .flat()
+      .filter((e) => e.featureName === 'unhandled')
+    expect(events.map((e) => e.meta.origin)).toEqual(['onelo_sdk', 'app'])
+    m.destroy()
+  })
+
   it('registers on construct, restores the prior handler on destroy(), and lets a fresh instance re-register', async () => {
     const { OneloMonitor } = await import('./monitor')
 

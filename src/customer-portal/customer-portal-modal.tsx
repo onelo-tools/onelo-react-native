@@ -3,54 +3,27 @@ import type { OneloCustomerPortal, PortalModalState } from './customer-portal'
 import {
   type ParsedOAuthMessage,
   parseOAuthMessage,
-  parseCallbackDeepLink,
   isOAuthNavigation,
   buildHostedInitUrl,
   openInSystemBrowser as openBrowser,
   OAUTH_RELAY_SCRIPT,
 } from '../auth/webview-oauth'
+import { classifyHandBack, classifyHandBackMessage } from '../core/hand-back'
+import { portalSkeletonHtml, type BrandTokens } from '@onelo/core'
+import { chromeStyles, resolveModalTokens } from '../core/brand'
+import { planChangeOf, type PlanChange } from '../core/plan-change'
+import { parseRenewRequest, renewReplyScript, sameOrigin, type RenewReply } from './portal-renewal'
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 declare const require: (id: string) => any
 
-/**
- * Pre-connect loading skeleton, shown in-app while the hosted portal page is
- * still being fetched over the network (before the WebView paints anything).
- * Without it the portal showed a bare spinner — unlike the Feedback modal, which
- * has always had a baked skeleton. The layout MIRRORS the hosted PortalSkeleton
- * (frontend/app/customer/portal/PortalSkeleton.tsx) 1:1 — icon 64, title 200×22,
- * subtitle 80×13, cards 240/80/140, max-width 432, same shimmer family — so the
- * cross-fade skeleton → hosted PortalSkeleton → loaded portal has zero layout
- * shift. `bg` is the branding page background so there's no white flash. This is
- * an SDK-local placeholder (per-SDK), NOT the hosted skeleton.
- */
-const portalSkeletonHtml = (bg: string) => `<!DOCTYPE html><html><head>
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<style>
-*{box-sizing:border-box;margin:0;padding:0}
-body{background:${bg};font-family:-apple-system,sans-serif;overflow:hidden}
-@keyframes onelo-shimmer{0%{background-position:-60vw 0}100%{background-position:100vw 0}}
-.wrap{display:flex;flex-direction:column;align-items:center;width:100%;padding:48px 24px 0}
-.col{width:100%;max-width:432px;display:flex;flex-direction:column;gap:14px}
-.sk{background-color:rgba(255,255,255,0.04);background-image:linear-gradient(90deg,rgba(255,255,255,0) 0%,rgba(255,255,255,0.12) 50%,rgba(255,255,255,0) 100%);background-size:60vw 100%;background-repeat:no-repeat;background-attachment:fixed;animation:onelo-shimmer 2.4s linear infinite;border-radius:8px}
-.strong{background-color:rgba(255,255,255,0.08);background-image:linear-gradient(90deg,rgba(255,255,255,0) 0%,rgba(255,255,255,0.18) 50%,rgba(255,255,255,0) 100%);background-size:60vw 100%;background-repeat:no-repeat;background-attachment:fixed;animation:onelo-shimmer 2.4s linear infinite;border-radius:9px}
-.icon{width:64px;height:64px;border-radius:14px;margin-bottom:14px;background:rgba(255,255,255,0.06);border:1.5px solid rgba(255,255,255,0.1)}
-.title{width:200px;height:22px;margin-bottom:10px;border-radius:6px}
-.sub{width:80px;height:13px;opacity:0.7;margin-bottom:32px;border-radius:4px}
-.c1{height:240px;border-radius:14px}
-.c2{height:80px;border-radius:14px}
-.c3{height:140px;border-radius:14px}
-</style></head><body>
-<div class="wrap">
-<div class="sk icon"></div>
-<div class="sk title"></div>
-<div class="sk sub"></div>
-<div class="col"><div class="strong c1"></div><div class="strong c2"></div><div class="strong c3"></div></div>
-</div>
-</body></html>`
+// Pre-connect loading skeleton: the shared `portalSkeletonHtml` (@onelo/core),
+// mirroring the hosted PortalSkeleton 1:1 and painted from the brand tokens (#681).
 
 export type PortalResult =
-  | { type: 'done'; event?: string }
+  /** `planChange`: the store opened in the portal finished a purchase or a
+   *  plan switch — the SDK reconciles the plan at once (#659). */
+  | { type: 'done'; event?: string; planChange?: PlanChange }
   | { type: 'cancelled' }
 
 export interface PortalModalViewProps {
@@ -61,9 +34,15 @@ export interface PortalModalViewProps {
    *  hand-off (builds `{apiUrl}/api/sdk/auth/oauth/hosted-init?…`). Optional:
    *  OAuth still works via the navigation-diversion path without it. */
   apiUrl?: string
-  /** Branding page background so the portal WebView never flashes white. */
+  /** The app's brand tokens (#681) — every piece of chrome is painted from them.
+   *  Pass `onelo.auth.brandTokens()`; neutral when absent. */
+  tokens?: BrandTokens
+  /** @deprecated Pass `tokens`. Page ground only, for pre-#681 callers. */
   backgroundColor?: string
   onResult: (result: PortalResult) => void
+  /** Answers the hosted page's renew request (#613 / #614). Without it the page
+   *  cannot renew and shows its expiry screen when its token dies. */
+  onRenewRequest?: (requestId: string) => Promise<RenewReply>
 }
 
 /**
@@ -114,8 +93,9 @@ export function CustomerPortalModal({ onelo }: CustomerPortalModalProps) {
     hostedUrl: state.hostedUrl,
     callbackScheme: state.callbackScheme,
     apiUrl: state.apiUrl,
-    backgroundColor: state.backgroundColor,
+    tokens: state.tokens,
     onResult: handleResult,
+    onRenewRequest: state.onRenewRequest,
   })
 }
 
@@ -123,9 +103,12 @@ export function CustomerPortalModal({ onelo }: CustomerPortalModalProps) {
  * Presentational portal modal (advanced use) — render it yourself with state
  * from usePortalModalState() if you need custom mounting behaviour.
  */
-export function CustomerPortalModalView({ visible, hostedUrl, callbackScheme, apiUrl, onResult, backgroundColor }: PortalModalViewProps) {
-  // Branding page background — matches the hosted portal page so no white flash.
-  const bg = backgroundColor || '#111111'
+export function CustomerPortalModalView({ visible, hostedUrl, callbackScheme, apiUrl, onResult, tokens, backgroundColor, onRenewRequest }: PortalModalViewProps) {
+  // Brand tokens (#681) — ground matches the hosted portal page so no white
+  // flash; header, ✕, retry and skeleton all from the same tokens.
+  const t = resolveModalTokens(tokens, backgroundColor)
+  const bg = t.page_bg
+  const c = chromeStyles(t)
   const RN = require('react-native')
   const { WebView } = require('react-native-webview')
   const { Modal, View, StyleSheet, TouchableOpacity, Text, Linking, Platform, StatusBar } = RN
@@ -186,13 +169,15 @@ export function CustomerPortalModalView({ visible, hostedUrl, callbackScheme, ap
    */
   const handleCallbackUrl = useCallback(
     (url: string): boolean => {
-      const parsed = parseCallbackDeepLink(url, callbackScheme)
-      if (!parsed) return false
-      if (parsed.host !== 'callback' || parsed.params['source'] !== 'portal') {
-        resolveOnce({ type: 'cancelled' })
-        return true
-      }
-      resolveOnce({ type: 'done', event: parsed.params['event'] })
+      // The one Store Hand-back decoder (#615). A purchase (#592) or a plan
+      // switch (#599) started from the portal closes it as done, like the
+      // portal's own Done, and names the plan change so the SDK reconciles it
+      // at once (#659).
+      const hb = classifyHandBack(url, callbackScheme)
+      if (!hb) return false
+      if (hb.kind === 'portal_closed') resolveOnce({ type: 'done', event: hb.event })
+      else if (hb.kind === 'purchase' || hb.kind === 'switched') resolveOnce({ type: 'done', planChange: planChangeOf(hb) })
+      else resolveOnce({ type: 'cancelled' })
       return true
     },
     [callbackScheme, resolveOnce],
@@ -229,6 +214,26 @@ export function CustomerPortalModalView({ visible, hostedUrl, callbackScheme, ap
   const handleMessage = useCallback(
     (event: any) => {
       const data: string = event.nativeEvent.data
+      // #614 — the portal (or the store it opened) asks for a fresh portal token.
+      const renewId = parseRenewRequest(data)
+      if (renewId) {
+        if (!onRenewRequest) return
+        // Only a page still on the portal's origin may receive a fresh portal.
+        if (!sameOrigin(event.nativeEvent.url, hostedUrl)) return
+        void onRenewRequest(renewId).then((reply) => {
+          webviewRef.current?.injectJavaScript?.(renewReplyScript(reply))
+        })
+        return
+      }
+      // The store (opened from the portal, or by openUpgrade) handing back as a
+      // postMessage (#627): the same outcomes as the deep-link path — a purchase
+      // or a plan switch closes as done, "Return to app" on a spent link cancels.
+      const hb = classifyHandBackMessage(data)
+      if (hb) {
+        if (hb.kind === 'purchase' || hb.kind === 'switched') resolveOnce({ type: 'done', planChange: planChangeOf(hb) })
+        else resolveOnce({ type: 'cancelled' })
+        return
+      }
       // #40 Phase 2 — hosted page mounted → hide the native fail-safe ✕.
       try {
         const m = JSON.parse(data) as Record<string, unknown>
@@ -240,7 +245,7 @@ export function CustomerPortalModalView({ visible, hostedUrl, callbackScheme, ap
       const oauth = parseOAuthMessage(data)
       if (oauth) openOAuth(oauth)
     },
-    [openOAuth],
+    [openOAuth, onRenewRequest, hostedUrl, resolveOnce],
   )
 
   // Intercept top-level navigations BEFORE the WebView loads them:
@@ -362,26 +367,26 @@ export function CustomerPortalModalView({ visible, hostedUrl, callbackScheme, ap
       height: headerHeight,
       backgroundColor: bg,
       borderBottomWidth: StyleSheet.hairlineWidth,
-      borderBottomColor: '#262626',
+      borderBottomColor: c.header.borderBottomColor,
       // Stay above the absolute loading overlay so "Done" is tappable even while
       // the portal is loading (or if a load hangs) — the exit must never be covered.
       zIndex: 1,
       elevation: 1,
     },
     headerBtn: { minWidth: 44, height: 44, paddingHorizontal: 8, alignItems: 'center', justifyContent: 'center', flexDirection: 'row' },
-    backText: { color: '#ffffff', fontSize: 17, fontWeight: '400' },
-    // Close (✕) — same neutral white icon (22px/400) as the Feedback modal, so the
+    backText: { color: c.headerText.color, fontSize: 17, fontWeight: '400' },
+    // Close (✕) — the brand text colour (22px/400) as the Feedback modal, so the
     // close control is identical across every Onelo modal + SDK.
-    doneText: { color: '#ffffff', fontSize: 22, fontWeight: '400', lineHeight: 24 },
+    doneText: { color: c.headerText.color, fontSize: 22, fontWeight: '400', lineHeight: 24 },
     webview: { flex: 1, backgroundColor: bg },
     // Skeleton sits BELOW the header (top: headerHeight) so its 48px top padding
     // aligns with where the real hosted content paints — zero shift on cross-fade.
     skeletonOverlay: { position: 'absolute', top: headerHeight, left: 0, right: 0, bottom: 0, backgroundColor: bg },
     errorContainer: { flex: 1, justifyContent: 'center', alignItems: 'center', gap: 16 },
-    retryButton: { backgroundColor: '#ffffff', paddingHorizontal: 32, paddingVertical: 14, borderRadius: 8 },
-    retryText: { color: '#000000', fontSize: 16, fontWeight: '600' },
+    retryButton: c.retryButton,
+    retryText: c.retryText,
     cancelButton: { paddingHorizontal: 32, paddingVertical: 14 },
-    cancelText: { color: '#ffffff', fontSize: 16 },
+    cancelText: c.cancelText,
   })
 
   return React.createElement(Modal, { visible, animationType: 'slide', presentationStyle: 'fullScreen', onRequestClose: handleRequestClose },
@@ -439,7 +444,7 @@ export function CustomerPortalModalView({ visible, hostedUrl, callbackScheme, ap
       // the deep-link / OAuth interception on the real WebView above.
       loading && !error && React.createElement(View, { style: styles.skeletonOverlay, pointerEvents: 'none' },
         React.createElement(WebView, {
-          source: { html: portalSkeletonHtml(bg) },
+          source: { html: portalSkeletonHtml(t) },
           style: styles.webview,
           backgroundColor: bg,
           scrollEnabled: false,

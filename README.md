@@ -86,13 +86,15 @@ Social sign-in and Stripe redirects leave your app and come back through a custo
 
 **iOS** — add the scheme under URL Types (`CFBundleURLSchemes`) in `Info.plist`.
 
+A magic link opened on the same device comes back through this scheme, sometimes after the app was killed. `OneloAuthGate` handles both cases. Without the gate, forward `Linking` `'url'` events to `onelo.auth.handleAuthCallback(url)`, and call `onelo.auth.handleLaunchUrl(await Linking.getInitialURL())` before `loadAuthView()`.
+
 ## Modules
 
 Everything below hangs off the one `onelo` instance.
 
 | Accessor | What it does | Key methods |
 |---|---|---|
-| `onelo.auth` | Hosted sign-in and sessions | `loadAuthView()`, `isAllowedIn()`, `onAuthStateChange()`, `getSession()`, `signOut()` |
+| `onelo.auth` | Hosted sign-in and sessions | `loadAuthView()`, `isAllowedIn()`, `onAuthStateChange()`, `getSession()`, `resendVerificationEmail()`, `confirmEmail()`, `getSignupMarketingConsent()`, `signOut()` |
 | `onelo.features` | Plan-gated feature flags, pushed live | `isEnabled()`, `feature()`, `subscribe()`, `refresh()` |
 | `onelo.monitor` | Error and event reporting | `track()`, `capture()`, `event()` |
 | `onelo.store` | Your hosted store, on your own Stripe | `open()`, `openUpgrade()` |
@@ -103,6 +105,12 @@ Everything below hangs off the one `onelo` instance.
 | `onelo.consent` | Versioned terms / privacy consent gate | `requiredConsents()`, `acceptConsent()`, `onConsentRequired()` |
 
 Each surface also ships a ready-made component and a state hook if you'd rather render it yourself — `StoreModal` / `useStoreModalState`, `CustomerPortalModal` / `usePortalModalState`, `ConsentGateModal` / `useConsentModalState`, `FeedbackModal`, `AuthModal`.
+
+`identify()` and its `userIdHash` argument are deprecated: the signed-in Onelo user is used automatically, and Features calls prove that user with their access token.
+
+### Showing gated UI at startup
+
+`onelo.features.ready(timeoutMs)` resolves once the server has confirmed the feature snapshot for the current user. At launch that is the user whose session was restored; after a sign-in, sign-out or user switch it is the new user, because `ready()` resets on every identity change. Show gated UI (main screen, navigation, menus) only after it resolves, and await it again after each `onAuthStateChange`. It is bounded: after the timeout, `feature()` serves the snapshot saved on the device and `subscribe()` fires when the confirmed one arrives. The features snippet in the dashboard has a `useFeaturesReady()` hook that does this.
 
 ## Device attestation
 

@@ -1,6 +1,57 @@
-import { OneloConfig, OneloSession, OneloEntitlement } from '@onelo/core';
-export { OneloConfig, OneloEntitlement, OneloError, OneloSession, OneloUser, REASON_LABELS, RESPONSE_REASON_CODES, ResponseReasonCode, UserRole } from '@onelo/core';
+import { BrandTokens, BrandSource, OneloConfig, OneloSession, SignupMarketingConsent, SignUpOptions, OneloEntitlement, ResendVerificationResult, WaitlistJoinOptions } from '@onelo/core';
+export { BrandTokens, OneloConfig, OneloEntitlement, OneloError, OneloSession, OneloUser, REASON_LABELS, RESPONSE_REASON_CODES, ResponseReasonCode, SignUpOptions, SignupMarketingConsent, UserRole, WaitlistConsent, WaitlistJoinOptions } from '@onelo/core';
 import React from 'react';
+
+/**
+ * Plan change after a Store Hand-back (#659) — the ONE place this SDK reacts
+ * to "the buyer just bought or switched a plan".
+ *
+ * The hosted store / Customer Portal only closes the modal. Waiting for the
+ * Event Stream left the app on the old plan for about a minute, so on every
+ * successful hand-back the SDK reconciles at once:
+ *   - features: a forced REST re-resolve (past the 1 s debounce),
+ *   - entitlement: a re-read of the entitlement (`hasActiveAccess`).
+ * A `plan_switch_pending` hand-back means Stripe has not applied the switch
+ * yet, so the features are re-checked on a bounded backoff until the snapshot
+ * differs from the one before the hand-back, or the delays run out.
+ *
+ * The live complement is the stream's `paywall.access_changed` (#635), which
+ * the backend sends when the grant really changes; whichever lands first wins.
+ * Same shape as `@onelo/js` `core/plan-change.ts`.
+ */
+/** What a container reports when a hosted page finished. Only a purchase or a
+ *  switch can move the plan; every other kind is ignored. */
+type PlanChange = {
+    kind: 'purchase';
+} | {
+    kind: 'switched';
+    reason: string;
+};
+
+/**
+ * Proof of the signed-in end user on Features calls (#510, #518).
+ *
+ * The Features endpoints (resolve, batch-ping, poll, module-token, the Event
+ * Stream and its Stream Token) accept `Authorization: Bearer <Onelo access
+ * token>` from a publishable-key caller and take the user from the token
+ * instead of the `userId` in the body (server: `backend/app/lib/features/end_user.py`). A token the server refuses
+ * answers `401 {"detail":{"error":"invalid_user_token"}}` and never falls back
+ * to the `userId`.
+ *
+ * This module is the ONE place that decides what a Features call sends:
+ * - signed in: the current access token (read fresh per call, so an expired
+ *   one is never reused — `auth.getSession()` refreshes near expiry);
+ * - refused: refresh once and retry once (one refresh per refusal episode);
+ * - refused again: the call is made anonymous (no token, no `userId`) and the
+ *   caller is told, so it can surface the refusal. It never loops.
+ */
+/** Where the Features calls read the signed-in user's access token. */
+interface UserTokenSource {
+    /** The current access token, or null when no Onelo user is signed in. */
+    current(): Promise<string | null>;
+    /** Refresh the session and return the new access token (null when that fails). */
+    refresh(): Promise<string | null>;
+}
 
 /**
  * OneloEventStream — ONE persistent SSE connection to
@@ -33,6 +84,12 @@ import React from 'react';
  * headers, so we apply `sdkHeaders()` (X-SDK-Version / X-Bundle-Id / …) to the
  * stream request just like Swift's `applySecurityHeaders`.
  *
+ * The signed-in user is proven with `Authorization: Bearer <access token>`
+ * (#518), read fresh on EVERY (re)connect so a reconnect never carries an
+ * expired token. A refused token (`401 invalid_user_token`) is refreshed once
+ * and retried once; refused again, that connection is opened anonymous (no
+ * Bearer, no `userId`) and the next reconnect tries the user again.
+ *
  * ─────────────────────────────────────────────────────────────────────────
  * OWNERSHIP
  * ─────────────────────────────────────────────────────────────────────────
@@ -42,6 +99,13 @@ import React from 'react';
  * reconnects, so nothing races `session.revoked`.
  */
 type SseHandler = (data: Record<string, unknown>) => void;
+/** Identity the open connection authenticated. `anonymousFallback` is true when
+ *  a signed-in user's token was refused and the connection went out without a
+ *  user — its snapshots must never replace that user's (#736). */
+interface StreamConnectionIdentity {
+    userId: string | null;
+    anonymousFallback: boolean;
+}
 /** Optional overrides for {@link OneloEventStream.start}. Any omitted field keeps its current value. */
 interface OneloEventStreamStartParams {
     /** Authenticated user id (camelCase on the wire). `null`/omitted = anonymous. */
@@ -50,7 +114,8 @@ interface OneloEventStreamStartParams {
     sinceVersion?: number;
     /** Host app version (`app_version`). Omitted = keep current. */
     appVersion?: string;
-    /** Host-supplied HMAC of the user id for secure-mode features (camelCase `userIdHash`). */
+    /** @deprecated Ignored: Secure Mode is retired, and the signed-in Onelo user
+     *  is proven with their access token automatically. */
     userIdHash?: string;
 }
 declare class OneloEventStream {
@@ -58,7 +123,10 @@ declare class OneloEventStream {
     private readonly publishableKey;
     private readonly sdkVersion?;
     private readonly bundleId?;
+    /** The signed-in user's access token, sent as `Authorization: Bearer`. */
+    private readonly userToken?;
     private readonly handlers;
+    private readonly connectionListeners;
     private xhr;
     private started;
     /** epoch-ms the current XHR was opened; used to decide if a dropped connection
@@ -68,8 +136,10 @@ declare class OneloEventStream {
     private reconnectAttempts;
     private reconnectTimer;
     private userId;
-    private userIdHash;
     private sinceVersion;
+    private tokenStage;
+    private refreshedToken;
+    private userTokenRefusedWarned;
     private appVersion;
     /**
      * Explicit feature environment ('test' | 'live') forwarded as the
@@ -96,7 +166,7 @@ declare class OneloEventStream {
     private connGen;
     /**
      * @param apiUrl          Base API URL (no trailing slash), e.g. `https://st.backend.onelo.tools`.
-     * @param publishableKey  `onelo_pk_...` — authenticates the stream via the `key` query param.
+     * @param publishableKey  `onelo_pk_...` — authenticates the stream via the `X-Publishable-Key` header (ADR-0003).
      * @param sdkVersion      SDK version string, forwarded as `sdk_version`.
      * @param bundleId        Host app bundle id, forwarded via `sdkHeaders()` as `X-Bundle-Id`.
      *
@@ -104,7 +174,9 @@ declare class OneloEventStream {
      * internally from `getInstanceId()` (Keychain-backed, cached) — no wiring
      * needed from the caller.
      */
-    constructor(apiUrl: string, publishableKey: string, sdkVersion?: string | undefined, bundleId?: string | undefined);
+    constructor(apiUrl: string, publishableKey: string, sdkVersion?: string | undefined, bundleId?: string | undefined, 
+    /** The signed-in user's access token, sent as `Authorization: Bearer`. */
+    userToken?: UserTokenSource | undefined);
     /**
      * Register a handler for a named server event (`connected`, `features_updated`,
      * `session.revoked`, `legal.consent_required`, …). Multiple handlers per name
@@ -116,7 +188,7 @@ declare class OneloEventStream {
      * Open (or re-open) the connection.
      *
      * Idempotent: a repeat call with identical params while already connected is a
-     * no-op (no needless reconnect). A changed userId / userIdHash / sinceVersion /
+     * no-op (no needless reconnect). A changed userId / sinceVersion /
      * appVersion reconnects so per-user routing stays correct.
      *
      * Downgrade refusal: once bound to a non-null userId, a `start({userId: null})`
@@ -126,6 +198,13 @@ declare class OneloEventStream {
      * fallback (~13 min). Explicit teardown still works via `stop()`.
      */
     start(params?: OneloEventStreamStartParams): void;
+    /**
+     * Observe which identity the open connection actually authenticated — distinct
+     * from the requested user: a refused token opens an anonymous-fallback
+     * connection. `null` while no connection is open.
+     */
+    onConnectionIdentity(fn: (identity: StreamConnectionIdentity | null) => void): void;
+    private _setConnectionIdentity;
     /**
      * Update the `since_version` cursor used on the NEXT reconnect. Does NOT force
      * a reconnect — the live connection keeps serving; if it drops, the reconnect
@@ -161,6 +240,17 @@ declare class OneloEventStream {
     private _processLine;
     /** Decode the JSON payload and fan out to every handler registered for the event name. */
     private _dispatch;
+    /** True when a finished 401 answered `invalid_user_token`. */
+    private _refusedUserToken;
+    /**
+     * The server refused the user's token. From `current`: refresh once and
+     * reconnect with the new token. From `refreshed` (or when the refresh yields
+     * no token): reconnect anonymous and warn. Reconnects immediately — each step
+     * happens at most once, so this cannot loop.
+     */
+    private _retryAfterRefusedToken;
+    private _resetTokenStage;
+    private _warnUserTokenRefused;
     private _buildUrl;
     private _scheduleReconnect;
     private _clearReconnect;
@@ -202,9 +292,10 @@ interface AuthModalProps {
      *  via `buildHostedInitUrl`). Optional: OAuth still works without it via the
      *  navigation-diversion path. */
     apiUrl?: string;
-    /** Branding "Page background" color (from `onelo.auth.pageBackgroundColor()`).
-     *  Painted on the container + WebView + loading overlay so there is no white
-     *  flash before the hosted page renders. Defaults to #111111. */
+    /** The app's brand tokens (#681, from `onelo.auth.brandTokens()`): ground,
+     *  skeleton, ✕ chip and retry are painted from them. Neutral when absent. */
+    tokens?: BrandTokens;
+    /** @deprecated Pass `tokens`. Page ground only, for pre-#681 callers. */
     backgroundColor?: string;
     /** Deep-link callback scheme (from `onelo.auth.callbackScheme`, config-driven,
      *  default 'onelorn'). Used to catch `<scheme>://callback?…` returns in the
@@ -214,7 +305,7 @@ interface AuthModalProps {
      *  `onelo.auth.oauthProviders`), so it matches what the hosted form renders. */
     socialCount?: number;
 }
-declare function AuthModal({ visible, hostedUrl, onResult, apiUrl, backgroundColor, callbackScheme, socialCount }: AuthModalProps): React.CElement<{
+declare function AuthModal({ visible, hostedUrl, onResult, apiUrl, tokens, backgroundColor, callbackScheme, socialCount }: AuthModalProps): React.CElement<{
     visible: boolean;
     animationType: string;
     presentationStyle: string;
@@ -252,12 +343,36 @@ declare class OneloAuth {
      *  the backend on initiate/flow-init and used by AuthModal to catch the return. */
     private readonly _callbackScheme;
     private pkceVerifier;
+    /**
+     * PKCE verifier of the latest hosted flow (#542). Its challenge goes to
+     * `/flow/init`, which binds every code that flow hands out, including one
+     * from a magic link opened on another device (#540). Kept separate from
+     * `pkceVerifier`, which belongs to the custom-UI `signIn`/`signUp` and is
+     * nulled after each of them. Persisted in the Keychain as well, because a
+     * link opened on THIS device returns through the OS, often after the app was
+     * killed while the user was in Mail.
+     */
+    private flowVerifier;
+    /** The launch URL is handed over once per instance: `getInitialURL()`
+     *  keeps returning it for the whole process. */
+    private _launchUrlHandled;
     private resolvedConfig;
+    /** The SDK's one brand-token model (#681), shared with every module. */
+    readonly brand: BrandSource;
     private heartbeatTimer;
     private refreshTimer;
     private static readonly HEARTBEAT_MS;
     /** Refresh this many seconds before the access token expires. */
     private static readonly REFRESH_LEAD_SECONDS;
+    /** Retry a TRANSIENT refresh failure (offline, a lost response, 429, 5xx —
+     *  incl. `503 refresh_unavailable`) with backoff: 5 s, 10 s, 20 s, 40 s,
+     *  then every 60 s, keeping the session. The first retry lands inside the
+     *  server's 30 s refresh-token grace window. Parity with onelo-js. */
+    private static readonly REFRESH_RETRY_BASE_MS;
+    private static readonly REFRESH_RETRY_MAX_MS;
+    private refreshRetryAttempt;
+    /** Until this time (ms) getSession() does not start a refresh on its own. */
+    private refreshBackoffUntil;
     private signOutEpoch;
     /** In-flight refresh promise — single-flight dedupe so concurrent getSession()
      *  callers share ONE POST /auth/refresh. Two concurrent refreshes would POST the
@@ -377,10 +492,28 @@ declare class OneloAuth {
      *  "endpoint unavailable" (404/405 → legacy fallback) apart from a real error
      *  (surfaced by `_decisionFromFlow`). */
     private _flowInit;
+    /**
+     * Start a hosted flow's PKCE pair (#542): a fresh verifier, kept in memory
+     * and in the Keychain, and its S256 challenge for `/flow/init`. With the
+     * challenge on the flow token, the hosted page pairs a magic link opened on
+     * another device with a code, and every code the flow hands out can only be
+     * exchanged by this install. One slot, as in onelo-js (#535): a newer flow
+     * overwrites it, and a link from the older one then fails with a clear error
+     * without being spent. A failed Keychain write leaves the in-memory verifier,
+     * which still covers every return while the app keeps running.
+     */
+    private _beginFlowPkce;
     /** Map a `/flow/init` response to a FlowDecision, throwing on any non-200. */
     private _decisionFromFlow;
     signIn(email: string, password: string): Promise<OneloSession>;
-    signUp(email: string, password: string): Promise<OneloSession>;
+    /**
+     * #818 — should your own sign-up screen show the optional Marketing Consent
+     * checkbox, and with what text? Set on the parent App in Auth → Sign-up; an
+     * App that sells asks at Checkout instead (`asked` false). Show `text`
+     * unticked and pass the person's choice to `signUp(..., { marketingConsent })`.
+     */
+    getSignupMarketingConsent(): SignupMarketingConsent;
+    signUp(email: string, password: string, options?: SignUpOptions): Promise<OneloSession>;
     signOut(): Promise<void>;
     /**
      * Wire the shared event stream (called once by Onelo, BEFORE the stream is
@@ -392,6 +525,10 @@ declare class OneloAuth {
      * connection lifecycle.
      */
     attachEventStream(stream: OneloEventStream): void;
+    /** Told when the hosted flow this class presented ended in a code — which
+     *  can carry a purchase (#659). Set by `Onelo` to its plan-change refresher. */
+    private onPlanChange;
+    setPlanChangeHandler(fn: ((change: PlanChange) => void) | null): void;
     /**
      * Handle a `session.revoked` push. One app can multiplex multiple buyers on the
      * shared connection, so filter to the current user: a `app_user_id` that
@@ -476,10 +613,12 @@ declare class OneloAuth {
      *  callers use this so non-paywall apps enter on a session alone (their
      *  `entitlement` is always `'none'`). Mirrors Electron `isPaywallEnabled`. */
     isPaywallEnabled(): boolean;
-    /** Branding "Page background" color (`checkout_bg_color`, --onelo-page-bg) from
-     *  `/api/sdk/config`. Native modals paint their WebView + container with this so
-     *  there is no white flash before the hosted page's own background renders.
-     *  Defaults to #111111 (the hosted-page default) before config resolves. */
+    /** The app's brand tokens (#681) from `/api/sdk/config` (refreshed by store /
+     *  portal / upgrade initiate responses). Every native modal paints its chrome
+     *  from these; the NEUTRAL set before config resolves — never Onelo orange. */
+    brandTokens(): BrandTokens;
+    /** Branding "Page background" color — `brandTokens().page_bg`. Native modals
+     *  paint their WebView + container with it so there is no white flash. */
     pageBackgroundColor(): string;
     /** Plan-gated enabled OAuth providers (google/github/apple) from
      *  `/api/sdk/config`; empty when social is disabled. Consumed by the Round 2
@@ -502,10 +641,39 @@ declare class OneloAuth {
      */
     private scheduleRefresh;
     private clearRefreshTimer;
+    /** The complete session in storage (read fresh — a sign-out may have
+     *  cleared it meanwhile), or null. */
+    private _storedSession;
+    /** Re-arm the refresh after a transient failure, with backoff. Reset by the
+     *  next saved session. */
+    private _scheduleRefreshRetry;
     private saveSession;
     private notifyListeners;
     private notifyModalListeners;
     sendMagicLink(email: string): Promise<void>;
+    /**
+     * Send the signed-in user a fresh Email Verification link (#819).
+     *
+     * Only for Apps with their own screen: when the parent App requires Email
+     * Verification, Onelo's hosted flow already shows "check your inbox" with a
+     * resend button and hands the session back by itself. The previous link
+     * stops working; at most 3 e-mails an hour (`verification_rate_limited`).
+     * Throws `email_verification_off` when the App has Email verification Off.
+     *
+     * `redirectTo` — your own landing page (an allowed web origin) or
+     * `<your-scheme>://…`; the link then carries `onelo_verify_token` for
+     * `confirmEmail`. Omitted, the link opens Onelo's hosted page.
+     */
+    resendVerificationEmail(options?: {
+        redirectTo?: string;
+    }): Promise<ResendVerificationResult>;
+    /**
+     * Confirm the user's address with the `onelo_verify_token` your own landing
+     * page received from the verification link (#819). Single use. When a
+     * session is signed in on this device, it is refreshed so `isAllowedIn()`
+     * opens the app without waiting for the next scheduled refresh.
+     */
+    confirmEmail(token: string): Promise<void>;
     sendPasswordReset(email: string): Promise<void>;
     /**
      * Complete a hosted-auth flow that finished OUTSIDE this app's own UI — a
@@ -534,15 +702,27 @@ declare class OneloAuth {
      *    developer-built "Check your inbox" screen, not the hosted modal.
      *    Exchanges the code directly and returns the session.
      *
-     * Does NOT recover a flow whose PROCESS was killed and relaunched — the
-     * in-memory `_modalResolve`/`pkceVerifier` are gone either way, the same
-     * limitation every other Onelo SDK's live-process shortcut has.
+     * After a relaunch there is no pending flow, so the code is exchanged
+     * directly with the hosted flow's verifier kept in the Keychain (#542). For
+     * the URL that LAUNCHED the app, use `handleLaunchUrl`.
      *
      * Returns the session when this call itself completed the exchange (the
      * no-pending-flow case); `null` when the URL wasn't ours, or when a pending
      * `loadAuthView()` flow was handed the outcome and will resolve on its own.
      */
     handleAuthCallback(url: string): Promise<OneloSession | null>;
+    /**
+     * Complete a sign-in from the URL that launched the app, i.e.
+     * `await Linking.getInitialURL()` (#542). A magic link opened on this device
+     * after the app was killed arrives only there, never as a `'url'` event.
+     * `OneloAuthGate` calls this on mount; a host app with its own root should
+     * call it BEFORE `loadAuthView()`, because a new hosted flow replaces the
+     * stored verifier the link needs.
+     *
+     * Handled once per instance, since `getInitialURL()` keeps returning the
+     * same URL for the whole process. Same result as `handleAuthCallback`.
+     */
+    handleLaunchUrl(url: string | null | undefined): Promise<OneloSession | null>;
 }
 
 type FeatureStatus = 'enabled' | 'disabled' | 'greyed' | 'hidden' | 'upsell' | 'new' | 'beta' | 'coming_soon';
@@ -589,7 +769,11 @@ declare class FeatureState {
  *  feature-specific codes (not_entitled / secure_mode_required / …), so — like
  *  the JS SDK — we define a module-scoped error class rather than overloading
  *  the shared `OneloError` with codes only Features uses. */
-type OneloFeaturesErrorCode = 'not_authenticated' | 'not_entitled' | 'secure_mode_required' | 'invalid_user_hash' | 'network_error';
+type OneloFeaturesErrorCode = 'not_authenticated' | 'not_entitled'
+/** @deprecated Secure Mode is retired; the server no longer answers with it. */
+ | 'secure_mode_required'
+/** @deprecated Secure Mode is retired; the server no longer answers with it. */
+ | 'invalid_user_hash' | 'network_error';
 declare class OneloFeaturesError extends Error {
     readonly code: OneloFeaturesErrorCode;
     constructor(code: OneloFeaturesErrorCode, message?: string);
@@ -603,6 +787,10 @@ interface OneloFeaturesOptions {
      *  'hidden' by default; 'enabled' in dev previews new gates. 1:1 with Swift
      *  `featureDefaultStatus`. See OneloConfig.featureDefaultStatus. */
     featureDefaultStatus?: FeatureStatus;
+    /** The signed-in Onelo user's access token, sent as `Authorization: Bearer`
+     *  on every Features call (resolve, batch-ping, poll, module-token) so the
+     *  server knows who the user really is. Wired by `Onelo` to `auth`. */
+    userToken?: UserTokenSource;
 }
 /** Minimal monitor surface OneloFeatures depends on. `recordFlag` is optional —
  *  present once Monitor gains flag↔error correlation (parity task 3.2); called
@@ -627,9 +815,17 @@ declare class OneloFeatures {
     private anonymousWarningLogged;
     private readonly defaultStatus;
     private currentUserId;
-    private currentUserIdHash;
+    private readonly userToken;
+    private userTokenRefusedWarned;
     private stream;
     private firstEventReceived;
+    private loadGeneration;
+    private identityLoaded;
+    private confirmedGeneration;
+    private confirmedVersion;
+    private snapshotConfirmed;
+    private streamConnection;
+    private streamConnectionGeneration;
     private readonly readyWaiters;
     private lastRefreshAt;
     constructor(apiUrl: string, publishableKey: string, monitor?: FeaturesMonitor | null, bundleId?: string, options?: OneloFeaturesOptions);
@@ -666,8 +862,11 @@ declare class OneloFeatures {
      * for instant UI, sends a (sampled) batch-ping, then either relies on the
      * shared SSE stream (signed-in) or falls back to a one-shot REST resolve + 60s
      * poll (anonymous / standalone).
+     *
+     * @param _userIdHash Deprecated and ignored: Secure Mode is retired, and the
+     *   signed-in Onelo user is proven with their access token automatically.
      */
-    load(userId: string | null, userIdHash?: string | null): Promise<void>;
+    load(userId: string | null, _userIdHash?: string | null): Promise<void>;
     /** Returns names of all features with an active status (enabled, new, or beta). */
     getActiveFeatures(): string[];
     /**
@@ -678,6 +877,9 @@ declare class OneloFeatures {
      * resolve together on the first event (or each on its own timeout).
      */
     ready(timeoutMs?: number): Promise<void>;
+    /** A comparable picture of the current snapshot — the plan-change refresher
+     *  (#659) re-checks until it differs. @internal */
+    snapshotKey(): string;
     /**
      * Force-reconcile the snapshot from the server via REST (does NOT touch the SSE
      * stream). Debounced to one call/sec unless `force` (use force from a
@@ -694,16 +896,16 @@ declare class OneloFeatures {
      * `moduleToken(for:)`.
      *
      * Throws {@link OneloFeaturesError}:
-     * - `not_authenticated` — no user identified yet (NO network call is made)
+     * - `not_authenticated` — no user identified yet (NO network call is made), or
+     *   the signed-in user's access token was refused even after a refresh
      * - `not_entitled` (403) — the user lacks access to `slug`
-     * - `secure_mode_required` (401) — app requires `userIdHash`, none supplied
-     * - `invalid_user_hash` (401) — supplied `userIdHash` failed backend HMAC
      * - `network_error` — transport failure or malformed response
      *
-     * @param slug        Feature/module slug to mint a token for.
-     * @param userIdHash  Optional secure-mode HMAC; overrides the one from load().
+     * @param slug         Feature/module slug to mint a token for.
+     * @param _userIdHash  Deprecated and ignored: Secure Mode is retired, and the
+     *   signed-in Onelo user is proven with their access token automatically.
      */
-    moduleToken(slug: string, userIdHash?: string): Promise<string>;
+    moduleToken(slug: string, _userIdHash?: string): Promise<string>;
     /** Stop the fallback poll + pending batch-ping. The shared SSE stream is owned
      *  and torn down by Onelo (Onelo.destroy → stream.destroy), NOT here — closing
      *  it from features would also drop auth's session.revoked subscription. */
@@ -729,6 +931,10 @@ declare class OneloFeatures {
     private _shouldBatchPingOnLoad;
     private _batchPing;
     private _resolve;
+    /** The server refused the signed-in user's access token even after a refresh,
+     *  so the call went out anonymous. Features has no error callback; this
+     *  one-time warning is its error channel (like the anonymous-mode warning). */
+    private _warnUserTokenRefused;
     /**
      * Logs a one-time warning when the backend reports anonymous mode (no userId)
      * AND at least one targeted feature was hidden purely because of it. Helps
@@ -874,30 +1080,60 @@ declare class OneloMonitor {
     private _unregisterGlobalHandlers;
 }
 
+type RenewReply = Record<string, unknown> & {
+    type: 'onelo:renewed' | 'onelo:renew_failed';
+    request_id: string;
+};
+
 interface FeedbackOptions {
     type?: 'bug' | 'feature_request' | 'general';
     area?: string;
     userId?: string;
 }
+
 declare class OneloFeedback {
     private readonly apiUrl;
     private readonly publishableKey;
     private readonly getActiveFeatures;
     private readonly bundleId?;
-    private readonly pageBackgroundColor;
+    /** The SDK's one brand-token model (#681) — `Onelo` passes the auth's. */
+    private readonly brand;
+    /** The signed-in Onelo user's access token (#820). Wired by `Onelo` to
+     *  `auth`; with a session the initiate call carries it and the report names
+     *  a verified reporter. Absent, the call is exactly as before. */
+    private readonly userToken?;
     private _url;
+    /** The options of the open form, re-initiated to renew its `ft` (#622). */
+    private _options;
     private _visible;
     private _listeners;
-    constructor(apiUrl: string, publishableKey: string, getActiveFeatures: () => string[], bundleId?: string | undefined, pageBackgroundColor?: () => string);
+    constructor(apiUrl: string, publishableKey: string, getActiveFeatures: () => string[], bundleId?: string | undefined, 
+    /** The SDK's one brand-token model (#681) — `Onelo` passes the auth's. */
+    brand?: BrandSource, 
+    /** The signed-in Onelo user's access token (#820). Wired by `Onelo` to
+     *  `auth`; with a session the initiate call carries it and the report names
+     *  a verified reporter. Absent, the call is exactly as before. */
+    userToken?: UserTokenSource | undefined);
     open(options?: FeedbackOptions): void;
     close(): void;
     private _fetchAndLoad;
+    /** Mint a hosted feedback URL (and with it a fresh reporter token `ft`), or
+     *  null when initiate refused. */
+    private _initiate;
+    /**
+     * Answer the hosted form's `onelo:renew_request` (kind `feedback`, #622). The
+     * form's reporter token `ft` lives 30 minutes; a form left open longer asks
+     * for a fresh one on submit. The open form's options are initiated again, so
+     * the report keeps its reporter, type, area and session.
+     */
+    renewReply(requestId: string): Promise<RenewReply>;
     private _notify;
     subscribe(listener: (url: string | null, visible: boolean) => void): () => void;
     getCurrentUrl(): string | null;
     isVisible(): boolean;
-    /** Branding page background (--onelo-page-bg) so the feedback WebView never
-     *  flashes white before the hosted feedback page paints. */
+    /** The app's brand tokens (#681) the feedback modal paints its chrome with. */
+    brandTokens(): BrandTokens;
+    /** @deprecated Use `brandTokens().page_bg`. */
     getPageBackgroundColor(): string;
 }
 
@@ -917,7 +1153,9 @@ declare class OneloWaitlist {
     private readonly publishableKey;
     private readonly bundleId?;
     constructor(apiUrl: string, publishableKey: string, bundleId?: string | undefined);
-    join(slug: string | undefined, email: string): Promise<{
+    join(slug: string | undefined, email: string, 
+    /** #818: the checkboxes your form showed — `{ consent: { marketing, custom } }`. */
+    options?: WaitlistJoinOptions): Promise<{
         success: boolean;
         position?: number;
         alreadyJoined: boolean;
@@ -925,9 +1163,13 @@ declare class OneloWaitlist {
     }>;
 }
 
-type PortalResult = {
+type PortalResult = 
+/** `planChange`: the store opened in the portal finished a purchase or a
+ *  plan switch — the SDK reconciles the plan at once (#659). */
+{
     type: 'done';
     event?: string;
+    planChange?: PlanChange;
 } | {
     type: 'cancelled';
 };
@@ -939,9 +1181,15 @@ interface PortalModalViewProps {
      *  hand-off (builds `{apiUrl}/api/sdk/auth/oauth/hosted-init?…`). Optional:
      *  OAuth still works via the navigation-diversion path without it. */
     apiUrl?: string;
-    /** Branding page background so the portal WebView never flashes white. */
+    /** The app's brand tokens (#681) — every piece of chrome is painted from them.
+     *  Pass `onelo.auth.brandTokens()`; neutral when absent. */
+    tokens?: BrandTokens;
+    /** @deprecated Pass `tokens`. Page ground only, for pre-#681 callers. */
     backgroundColor?: string;
     onResult: (result: PortalResult) => void;
+    /** Answers the hosted page's renew request (#613 / #614). Without it the page
+     *  cannot renew and shows its expiry screen when its token dies. */
+    onRenewRequest?: (requestId: string) => Promise<RenewReply>;
 }
 /**
  * Reactive hook for rendering the portal modal manually via <CustomerPortalModalView>.
@@ -967,7 +1215,7 @@ declare function CustomerPortalModal({ onelo }: CustomerPortalModalProps): React
  * Presentational portal modal (advanced use) — render it yourself with state
  * from usePortalModalState() if you need custom mounting behaviour.
  */
-declare function CustomerPortalModalView({ visible, hostedUrl, callbackScheme, apiUrl, onResult, backgroundColor }: PortalModalViewProps): React.CElement<{
+declare function CustomerPortalModalView({ visible, hostedUrl, callbackScheme, apiUrl, onResult, tokens, backgroundColor, onRenewRequest }: PortalModalViewProps): React.CElement<{
     visible: boolean;
     animationType: string;
     presentationStyle: string;
@@ -979,6 +1227,9 @@ declare function CustomerPortalModalView({ visible, hostedUrl, callbackScheme, a
     onRequestClose: () => void;
 }, any, any>>;
 
+/** Where a portal opens. `'change_plan'` lands straight in the plan picker —
+ *  the hosted portal asks the backend where the upgrade goes (#587). */
+type PortalIntent = 'change_plan';
 type PortalModalState = {
     visible: boolean;
     hostedUrl: string;
@@ -986,10 +1237,13 @@ type PortalModalState = {
     /** Backend base URL — threaded into the modal so it can build the `native_oauth`
      *  system-browser hand-off URL (`{apiUrl}/api/sdk/auth/oauth/hosted-init?…`). */
     apiUrl: string;
-    /** Branding page background (--onelo-page-bg) so the portal WebView never
-     *  flashes white before the hosted portal page paints. */
+    /** The app's brand tokens (#681): the modal's chrome is painted from them. */
+    tokens: BrandTokens;
+    /** @deprecated Use `tokens.page_bg`. */
     backgroundColor: string;
     onResult: ((result: PortalResult) => void) | null;
+    /** Answers the hosted page's renew request with a fresh portal (#614). */
+    onRenewRequest: (requestId: string) => Promise<RenewReply>;
 };
 declare class OneloCustomerPortal {
     private apiUrl;
@@ -998,11 +1252,16 @@ declare class OneloCustomerPortal {
     private getAccessToken;
     private signOut;
     private onRevoked?;
-    private pageBg;
+    private brand;
     private readonly callbackScheme;
+    private readonly onClosed?;
     private _modalVisible;
     private _modalUrl;
     private _modalResolve;
+    /** Told when the store opened in the portal modal ended in a purchase or a
+     *  plan switch (#659). Set by `Onelo` to its plan-change refresher. */
+    private onPlanChange;
+    setPlanChangeHandler(fn: ((change: PlanChange) => void) | null): void;
     private portalStateListeners;
     /**
      * @param bundleId Threaded into `sdkHeaders` so portal-initiate sends
@@ -1013,9 +1272,42 @@ declare class OneloCustomerPortal {
      *   account revoked, session compromised) so `auth.isUserRevoked` is set.
      *   Parity with Swift `portalRevokeEvents` + guard #9.
      */
-    constructor(apiUrl: string, publishableKey: string, bundleId: string | undefined, getAccessToken: () => Promise<string | null>, signOut: () => Promise<void>, onRevoked?: () => void, pageBackgroundColor?: () => string, callbackScheme?: string);
-    /** Open the hosted customer portal in a fullscreen WebView modal. */
-    open(): Promise<void>;
+    constructor(apiUrl: string, publishableKey: string, bundleId: string | undefined, getAccessToken: () => Promise<string | null>, signOut: () => Promise<void>, onRevoked?: () => void, 
+    /** The SDK's one brand-token model (#681) — `Onelo` passes the auth's. */
+    brand?: BrandSource, callbackScheme?: string, 
+    /** Injected by `Onelo` — re-reads the entitlement once the modal closes, so
+     *  `hasActiveAccess()` reflects a plan bought or changed there (#606). */
+    onClosed?: () => Promise<unknown>);
+    /**
+     * Open the hosted customer portal in a fullscreen WebView modal. Requires
+     * `<CustomerPortalModal onelo={onelo} />` mounted near your app root.
+     *
+     * @param opts.intent `'change_plan'` opens the portal straight into the plan
+     *   picker (parity with `@onelo/js` `customerPortal.open({ intent })`). The
+     *   hosted portal asks the backend where the change goes.
+     */
+    open(opts?: {
+        intent?: PortalIntent;
+    }): Promise<void>;
+    /** True while a `<CustomerPortalModal>` is mounted to present the portal. */
+    get hasModalHost(): boolean;
+    /**
+     * Present an already-minted hosted URL (portal, or a store / plan-switch URL
+     * from `/upgrade-initiate`) in the portal modal. Handles every hand-back the
+     * portal does and re-reads the entitlement when the modal closes.
+     * @internal Used by `OneloStore.openUpgrade`.
+     */
+    presentUrl(url: string): Promise<void>;
+    /**
+     * Answer the hosted portal's `onelo:renew_request` (#613 / #614): mint a fresh
+     * portal with the signed-in user's access token. Signed out or revoked →
+     * `renew_failed` with `not_authenticated`, and the page shows its branded
+     * "signed out" screen.
+     */
+    renewReply(requestId: string): Promise<RenewReply>;
+    /** GET portal-initiate with the user's access token → the hosted URL. */
+    private initiate;
+    private presentModal;
     /** Returns current modal state for rendering <CustomerPortalModal>. */
     getModalState(): PortalModalState;
     /** Subscribe to portal modal state changes. Returns an unsubscribe function. */
@@ -1038,8 +1330,10 @@ interface ConsentGateModalViewProps {
     visible: boolean;
     hostedUrl: string;
     onResult: (result: ConsentResult) => void;
-    /** Branding page background — painted on the container + WebView + overlay so
-     *  the gate never flashes white before the hosted legal page renders. */
+    /** The app's brand tokens (#681) — ground, spinner and retry are painted from
+     *  them. Pass `onelo.auth.brandTokens()`; neutral when absent. */
+    tokens?: BrandTokens;
+    /** @deprecated Pass `tokens`. Page ground only, for pre-#681 callers. */
     backgroundColor?: string;
 }
 /**
@@ -1071,7 +1365,7 @@ declare function ConsentGateModal({ onelo }: ConsentGateModalProps): React.Funct
  * button is swallowed while the gate is visible. The only exits are Accept
  * (→ record consent) or Decline (→ sign out), both relayed from the hosted page.
  */
-declare function ConsentGateModalView({ visible, hostedUrl, onResult, backgroundColor }: ConsentGateModalViewProps): React.CElement<{
+declare function ConsentGateModalView({ visible, hostedUrl, onResult, tokens, backgroundColor }: ConsentGateModalViewProps): React.CElement<{
     visible: boolean;
     animationType: string;
     presentationStyle: string;
@@ -1114,8 +1408,9 @@ type ConsentModalState = {
     visible: boolean;
     hostedUrl: string;
     onResult: ((result: ConsentResult) => void) | null;
-    /** Branding page background (--onelo-page-bg) so the gate WebView never flashes
-     *  white before the hosted legal page paints. */
+    /** The app's brand tokens (#681): the gate's chrome is painted from them. */
+    tokens: BrandTokens;
+    /** @deprecated Use `tokens.page_bg`. */
     backgroundColor: string;
 };
 /**
@@ -1215,6 +1510,17 @@ type StoreResult = {
     code: string;
 } | {
     type: 'cancelled';
+}
+/** A plan switch finished with no checkout (#599) — `source=store&event=…`.
+ *  No code; `store.open()` resolves the current session. */
+ | {
+    type: 'done';
+    reason: string;
+}
+/** The store's link died (#619). `store.open()` mints a fresh one and keeps
+ *  the modal up on it. */
+ | {
+    type: 'expired';
 };
 interface StoreModalViewProps {
     visible: boolean;
@@ -1224,7 +1530,10 @@ interface StoreModalViewProps {
      *  hand-off (builds `{apiUrl}/api/sdk/auth/oauth/hosted-init?…`). Optional:
      *  OAuth still works via the navigation-diversion path without it. */
     apiUrl?: string;
-    /** Branding page background so the checkout WebView never flashes white. */
+    /** The app's brand tokens (#681) — every piece of chrome is painted from them.
+     *  Pass `onelo.auth.brandTokens()`; neutral when absent. */
+    tokens?: BrandTokens;
+    /** @deprecated Pass `tokens`. Page ground only, for pre-#681 callers. */
     backgroundColor?: string;
     onResult: (result: StoreResult) => void;
 }
@@ -1252,7 +1561,7 @@ declare function StoreModal({ onelo }: StoreModalProps): React.FunctionComponent
  * Presentational store modal (advanced use) — render it yourself with state from
  * useStoreModalState() if you need custom mounting behaviour.
  */
-declare function StoreModalView({ visible, hostedUrl, callbackScheme, apiUrl, onResult, backgroundColor }: StoreModalViewProps): React.CElement<{
+declare function StoreModalView({ visible, hostedUrl, callbackScheme, apiUrl, onResult, tokens, backgroundColor }: StoreModalViewProps): React.CElement<{
     visible: boolean;
     animationType: string;
     presentationStyle: string;
@@ -1271,11 +1580,17 @@ type StoreModalState = {
     /** Backend base URL — threaded into the modal so it can build the `native_oauth`
      *  system-browser hand-off URL (`{apiUrl}/api/sdk/auth/oauth/hosted-init?…`). */
     apiUrl: string;
-    /** Branding page background (--onelo-page-bg) so the checkout WebView never
-     *  flashes white before the hosted store page paints. */
+    /** The app's brand tokens (#681): the modal's chrome is painted from them. */
+    tokens: BrandTokens;
+    /** @deprecated Use `tokens.page_bg`. */
     backgroundColor: string;
     onResult: ((result: StoreResult) => void) | null;
 };
+/** Where `openUpgrade` presents its URL: the customer-portal modal. */
+interface UpgradeHost {
+    readonly hasModalHost: boolean;
+    presentUrl(url: string): Promise<void>;
+}
 /**
  * Monetization entry points — the Onelo hosted store (checkout / plan selection)
  * and the upgrade flow. Ports Swift's `OneloAuth.initiateStoreFlow()` +
@@ -1290,7 +1605,7 @@ type StoreModalState = {
  *
  * Usage:
  *   const session = await onelo.store.open()        // buyer ends up signed in
- *   await onelo.store.openUpgrade('pro')            // upgrade in system browser
+ *   await onelo.store.openUpgrade('pro')            // upgrade in the portal modal
  */
 declare class OneloStore {
     private apiUrl;
@@ -1298,8 +1613,14 @@ declare class OneloStore {
     private bundleId?;
     private getAccessToken;
     private exchangeCode?;
-    private pageBg;
+    /** Told when the store ended in a purchase or a plan switch (#659). Set by
+     *  `Onelo` to its plan-change refresher. */
+    private onPlanChange;
+    setPlanChangeHandler(fn: ((change: PlanChange) => void) | null): void;
+    private getSession;
+    private brand;
     private readonly callbackScheme;
+    private readonly upgradeHost?;
     private _modalVisible;
     private _modalUrl;
     private _modalResolve;
@@ -1310,7 +1631,15 @@ declare class OneloStore {
      *   auth-state listeners fire). Delegates to the auth module's hosted-callback
      *   exchange. Required for `open()` to complete a purchase.
      */
-    constructor(apiUrl: string, publishableKey: string, bundleId: string | undefined, getAccessToken: () => Promise<string | null>, exchangeCode?: (code: string) => Promise<OneloSession>, pageBackgroundColor?: () => string, callbackScheme?: string);
+    constructor(apiUrl: string, publishableKey: string, bundleId: string | undefined, getAccessToken: () => Promise<string | null>, exchangeCode?: (code: string) => Promise<OneloSession>, 
+    /** The SDK's one brand-token model (#681) — `Onelo` passes the auth's. */
+    brand?: BrandSource, callbackScheme?: string, 
+    /** Reads the current session back — `open()` resolves with it when the
+     *  store finishes a plan switch that has no code to exchange (#599). */
+    getSession?: () => Promise<OneloSession | null>, 
+    /** The SDK container `openUpgrade` presents in (#606) — wired by `Onelo`
+     *  to the customer-portal modal. Absent → the system browser. */
+    upgradeHost?: UpgradeHost);
     /** Security headers for every store request (`sdkHeaders`) plus per-request extras. */
     private _secHeaders;
     /**
@@ -1338,9 +1667,13 @@ declare class OneloStore {
      * Act on an upsell (a feature's `upgradeCta`/`upgradeHint`, an "Available in
      * <plan>" tap). Requires a signed-in session. The backend is the single source
      * of truth for billing: an active subscriber is routed to a hosted plan-switch
-     * checkout, a user with no subscription to the hosted store. The resulting URL
-     * opens in the SYSTEM BROWSER via `Linking.openURL` (mirrors Swift
-     * `openUpgrade(forPlan:)` / `NSWorkspace.open`) — never an in-app WebView.
+     * checkout, a user with no subscription to the hosted store, and a subscriber
+     * whose plan changes are switched off to the portal, which explains it. The
+     * URL opens in the SDK's customer-portal modal (#606), so the store's
+     * hand-back (purchase, plan switch, expired link) closes it and the app sees
+     * the new plan; resolves when the modal closes. Requires
+     * `<CustomerPortalModal onelo={onelo} />` mounted — without one the URL opens
+     * in the system browser (`Linking.openURL`) and a warning is logged.
      *
      * @throws OneloError('not_authenticated') when signed out (401) or
      *   `OneloError('server_error')` on `plan_not_purchasable` (404) /
@@ -1366,6 +1699,7 @@ declare class Onelo {
     readonly store: OneloStore;
     private authUnsubscribe;
     private readonly eventStream;
+    private readonly planChange;
     /** Whether the auth-state bridge + foreground re-check auto-open the consent
      *  gate (config.autoPresentConsentGate, default true). */
     private readonly autoPresentConsent;
@@ -1375,6 +1709,9 @@ declare class Onelo {
     /** RN AppState 'change' subscription, removed in destroy() so a torn-down SDK
      *  can't leak a foreground callback that fires against dead state. */
     private appStateSubscription;
+    /** True once features loaded an identity (auth bridge or identify()), so the
+     *  cold-start restore never loads over it. */
+    private featuresBound;
     /** iOS App Attest lifecycle. Created lazily in `_initAttest` ONLY when the app
      *  is iOS AND config reports `attest_required`; null otherwise (Android, or
      *  attest not required). Its token rides every request via `sdkHeaders`. */
@@ -1415,13 +1752,14 @@ declare class Onelo {
      * re-check" rather than throwing at construction.
      */
     private _wireForeground;
-    /** Only needed when NOT using Onelo Auth (own auth system). `userIdHash` is the
-     *  host-supplied HMAC for Features secure mode (threaded into resolve / batch-ping
-     *  / module-token); omit it when not using secure mode. */
+    /** @deprecated The signed-in Onelo user is used automatically: Features calls
+     *  prove them with their access token. `userIdHash` is ignored (Secure Mode is
+     *  retired). Kept so existing code compiles. */
     identify(userId: string, userIdHash?: string): Promise<void>;
     /**
-     * Opens the hosted upgrade flow for `plan` in the SYSTEM BROWSER and returns.
-     * The backend decides the destination: an active subscriber lands on "Change
+     * Opens the hosted upgrade flow for `plan` in the SDK's customer-portal modal
+     * (`<CustomerPortalModal>` must be mounted) and resolves when it closes. The
+     * backend decides the destination: an active subscriber lands on "Change
      * plan" (target pinned; one click to confirm), a non-subscriber on the store.
      * Requires a signed-in session (throws `OneloError('not_authenticated')` otherwise).
      *
@@ -1510,4 +1848,4 @@ declare function FeedbackModal({ feedback }: FeedbackModalProps): React.CElement
     onRequestClose: () => void;
 }, any, any>>;
 
-export { AuthModal, ConsentGateModal, type ConsentGateModalProps, ConsentGateModalView, type ConsentGateModalViewProps, type ConsentModalState, type ConsentResult, CustomerPortalModal, type CustomerPortalModalProps, CustomerPortalModalView, type FeatureReason, FeatureState, type FeatureStatus, FeedbackModal, type FeedbackOptions, type FlowDecision, type ModalState, type MonitorEventOptions, Onelo, OneloAuthGate, type OneloAuthGateProps, OneloConsent, type OneloConsentEnforcement, type OneloConsentRequirement, OneloCustomerPortal, OneloFeatures, OneloFeaturesError, type OneloFeaturesErrorCode, OneloFeedback, OneloForms, OneloMonitor, OneloStore, OneloWaitlist, type PortalModalState, type PortalModalViewProps, type PortalResult, StoreModal, type StoreModalProps, type StoreModalState, StoreModalView, type StoreModalViewProps, type StoreResult, type UpgradeHint, parseConsentMessage, useConsentModalState, useModalState, usePortalModalState, useStoreModalState };
+export { AuthModal, ConsentGateModal, type ConsentGateModalProps, ConsentGateModalView, type ConsentGateModalViewProps, type ConsentModalState, type ConsentResult, CustomerPortalModal, type CustomerPortalModalProps, CustomerPortalModalView, type FeatureReason, FeatureState, type FeatureStatus, FeedbackModal, type FeedbackOptions, type FlowDecision, type ModalState, type MonitorEventOptions, Onelo, OneloAuthGate, type OneloAuthGateProps, OneloConsent, type OneloConsentEnforcement, type OneloConsentRequirement, OneloCustomerPortal, OneloFeatures, OneloFeaturesError, type OneloFeaturesErrorCode, OneloFeedback, OneloForms, OneloMonitor, OneloStore, OneloWaitlist, type PortalIntent, type PortalModalState, type PortalModalViewProps, type PortalResult, StoreModal, type StoreModalProps, type StoreModalState, StoreModalView, type StoreModalViewProps, type StoreResult, type UpgradeHint, parseConsentMessage, useConsentModalState, useModalState, usePortalModalState, useStoreModalState };

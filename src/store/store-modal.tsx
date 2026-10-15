@@ -3,14 +3,15 @@ import type { OneloStore, StoreModalState } from './store'
 import {
   type ParsedOAuthMessage,
   parseOAuthMessage,
-  parseCallbackDeepLink,
   isOAuthNavigation,
   withOAuthPreauth,
   buildHostedInitUrl,
   openInSystemBrowser as openBrowser,
   OAUTH_RELAY_SCRIPT,
 } from '../auth/webview-oauth'
-import { parseModalMessage } from '../auth/auth-modal'
+import { classifyHandBack, classifyHandBackMessage } from '../core/hand-back'
+import { skeletonCss, type BrandTokens } from '@onelo/core'
+import { chromeStyles, resolveModalTokens } from '../core/brand'
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 declare const require: (id: string) => any
@@ -21,29 +22,28 @@ declare const require: (id: string) => any
  * The layout MIRRORS the hosted StoreSkeleton (frontend/app/store/hosted/
  * StoreSkeleton.tsx): logo 64, heading 220×22, subheading 140×13, then a 3-card
  * product grid (name/price/2 desc lines/CTA), and a footer bar — so the cross-fade
- * skeleton → hosted StoreSkeleton → loaded checkout has zero layout shift. `bg` is
- * the branding page background so there's no white flash. SDK-local (per-SDK).
+ * skeleton → hosted StoreSkeleton → loaded checkout has zero layout shift. Painted
+ * from the brand tokens (#681) so there's no white flash. SDK-local (per-SDK).
  */
-const storeSkeletonHtml = (bg: string) => `<!DOCTYPE html><html><head>
+export const storeSkeletonHtml = (t: BrandTokens) => `<!DOCTYPE html><html><head>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
-body{background:${bg};font-family:-apple-system,sans-serif;overflow:hidden}
-@keyframes onelo-shimmer{0%{background-position:-60vw 0}100%{background-position:100vw 0}}
+body{background:${t.page_bg};font-family:${t.body_font};overflow:hidden}
+${skeletonCss(t)}
 .wrap{width:100%;max-width:896px;margin:0 auto;padding:48px 24px 0;display:flex;flex-direction:column;align-items:center}
 .head{width:100%;display:flex;flex-direction:column;align-items:center;margin-bottom:32px}
-.sk{background-color:rgba(255,255,255,0.04);background-image:linear-gradient(90deg,rgba(255,255,255,0) 0%,rgba(255,255,255,0.14) 50%,rgba(255,255,255,0) 100%);background-size:60vw 100%;background-repeat:no-repeat;background-attachment:fixed;animation:onelo-shimmer 2.4s linear infinite;border-radius:8px}
-.logo{width:64px;height:64px;border-radius:12px;margin-bottom:14px;background:rgba(255,255,255,0.06);border:1.5px solid rgba(255,255,255,0.1)}
-.h{width:220px;height:22px;margin-bottom:10px;border-radius:6px}
-.sub{width:140px;height:13px;opacity:0.7;border-radius:4px}
+.logo{width:64px;height:64px;border-radius:${t.card_radius}px;margin-bottom:14px;border:1.5px solid ${t.border}}
+.h{width:220px;height:22px;margin-bottom:10px}
+.sub{width:140px;height:13px;opacity:0.7}
 .grid{width:100%;display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px}
-.card{border-radius:14px;padding:18px;min-height:180px;display:flex;flex-direction:column;gap:12px;background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.06)}
+.card{border-radius:${t.card_radius}px;padding:18px;min-height:180px;display:flex;flex-direction:column;gap:12px;background:${t.card_bg};border:1px solid ${t.border}}
 .name{width:60%;height:14px}
 .price{width:40%;height:22px}
 .desc{width:90%;height:10px;opacity:0.7}
 .desc2{width:75%;height:10px;opacity:0.7}
 .spacer{flex:1}
-.cta{width:100%;height:40px;border-radius:10px}
+.cta{width:100%;height:40px;border-radius:${t.button_radius}px}
 .foot{width:110px;height:14px;opacity:0.5;margin-top:36px}
 </style></head><body>
 <div class="wrap">
@@ -63,6 +63,12 @@ body{background:${bg};font-family:-apple-system,sans-serif;overflow:hidden}
 export type StoreResult =
   | { type: 'success'; code: string }
   | { type: 'cancelled' }
+  /** A plan switch finished with no checkout (#599) — `source=store&event=…`.
+   *  No code; `store.open()` resolves the current session. */
+  | { type: 'done'; reason: string }
+  /** The store's link died (#619). `store.open()` mints a fresh one and keeps
+   *  the modal up on it. */
+  | { type: 'expired' }
 
 export interface StoreModalViewProps {
   visible: boolean
@@ -72,7 +78,10 @@ export interface StoreModalViewProps {
    *  hand-off (builds `{apiUrl}/api/sdk/auth/oauth/hosted-init?…`). Optional:
    *  OAuth still works via the navigation-diversion path without it. */
   apiUrl?: string
-  /** Branding page background so the checkout WebView never flashes white. */
+  /** The app's brand tokens (#681) — every piece of chrome is painted from them.
+   *  Pass `onelo.auth.brandTokens()`; neutral when absent. */
+  tokens?: BrandTokens
+  /** @deprecated Pass `tokens`. Page ground only, for pre-#681 callers. */
   backgroundColor?: string
   onResult: (result: StoreResult) => void
 }
@@ -125,7 +134,7 @@ export function StoreModal({ onelo }: StoreModalProps) {
     hostedUrl: state.hostedUrl,
     callbackScheme: state.callbackScheme,
     apiUrl: state.apiUrl,
-    backgroundColor: state.backgroundColor,
+    tokens: state.tokens,
     onResult: handleResult,
   })
 }
@@ -134,9 +143,12 @@ export function StoreModal({ onelo }: StoreModalProps) {
  * Presentational store modal (advanced use) — render it yourself with state from
  * useStoreModalState() if you need custom mounting behaviour.
  */
-export function StoreModalView({ visible, hostedUrl, callbackScheme, apiUrl, onResult, backgroundColor }: StoreModalViewProps) {
-  // Branding page background — matches the hosted store page so no white flash.
-  const bg = backgroundColor || '#111111'
+export function StoreModalView({ visible, hostedUrl, callbackScheme, apiUrl, onResult, tokens, backgroundColor }: StoreModalViewProps) {
+  // Brand tokens (#681) — ground matches the hosted store page so no white
+  // flash; header, ✕, retry and skeleton all from the same tokens.
+  const t = resolveModalTokens(tokens, backgroundColor)
+  const bg = t.page_bg
+  const c = chromeStyles(t)
   const RN = require('react-native')
   const { WebView } = require('react-native-webview')
   const { Modal, View, StyleSheet, TouchableOpacity, Text, Linking, Platform, StatusBar } = RN
@@ -183,23 +195,24 @@ export function StoreModalView({ visible, hostedUrl, callbackScheme, apiUrl, onR
    */
   const handleCallbackUrl = useCallback(
     (url: string): boolean => {
-      const parsed = parseCallbackDeepLink(url, callbackScheme)
-      if (!parsed) return false
-      if (parsed.host !== 'callback') {
-        resolveOnce({ type: 'cancelled' })
-        return true
-      }
-      const { code, preauth } = parsed.params
-      if (code) {
-        resolveOnce({ type: 'success', code })
-      } else if (preauth) {
+      // The one Store Hand-back decoder (#615).
+      const hb = classifyHandBack(url, callbackScheme)
+      if (!hb) return false
+      if (hb.kind === 'purchase') {
+        resolveOnce({ type: 'success', code: hb.code })
+      } else if (hb.kind === 'switched') {
+        resolveOnce({ type: 'done', reason: hb.reason })
+      } else if (hb.kind === 'preauth') {
         // Paid-product store flow: OAuth succeeded + account provisioned, but the
         // buyer still owes payment. Reload the hosted store page with
         // ?oauth_preauth=… (StoreClient drives Stripe from there). Does NOT
         // resolve the modal — the flow continues.
-        setCurrentUrl((prev) => withOAuthPreauth(prev || hostedUrl, preauth))
+        setCurrentUrl((prev) => withOAuthPreauth(prev || hostedUrl, hb.preauth))
+      } else if (hb.kind === 'expired') {
+        resolveOnce({ type: 'expired' })
       } else {
-        // No code on the callback → treat as a cancel/abort, don't try to exchange.
+        // Foreign host, portal/✕ return, error or no code → a cancel/abort,
+        // never an exchange.
         resolveOnce({ type: 'cancelled' })
       }
       return true
@@ -251,14 +264,16 @@ export function StoreModalView({ visible, hostedUrl, callbackScheme, apiUrl, onR
   const handleMessage = useCallback(
     (event: any) => {
       const data: string = event.nativeEvent.data
-      // Hosted-flow success/cancel — relayed from the store's sendSuccess() via
-      // OAUTH_RELAY_SCRIPT: an in-WebView purchase posts { type:'onelo:code', code },
-      // which we exchange for a session so OneloAuthGate reveals the app (auto-login).
-      // Mirrors auth-modal; without it the store renders "You're in!" and never signs
-      // in. Same on iOS + Android (react-native-webview bridge is identical).
-      const parsed = parseModalMessage(data)
-      if (parsed) {
-        if (parsed.type === 'code') resolveOnce({ type: 'success', code: parsed.code })
+      // The store's hand-back relayed as a postMessage by OAUTH_RELAY_SCRIPT,
+      // decoded by the one Store Hand-back decoder (#615 / #627) — the same
+      // outcomes as the deep-link path above: a purchase is exchanged for a
+      // session (auto-login), a code-less plan switch is a success, and
+      // "Return to app" on a spent link cancels.
+      const hb = classifyHandBackMessage(data)
+      if (hb) {
+        if (hb.kind === 'purchase') resolveOnce({ type: 'success', code: hb.code })
+        else if (hb.kind === 'switched') resolveOnce({ type: 'done', reason: hb.reason })
+        else if (hb.kind === 'expired') resolveOnce({ type: 'expired' })
         else resolveOnce({ type: 'cancelled' })
         return
       }
@@ -365,25 +380,25 @@ export function StoreModalView({ visible, hostedUrl, callbackScheme, apiUrl, onR
       height: headerHeight,
       backgroundColor: bg,
       borderBottomWidth: StyleSheet.hairlineWidth,
-      borderBottomColor: '#262626',
+      borderBottomColor: c.header.borderBottomColor,
       // Stay above the absolute loading overlay so "✕" is tappable even while the
       // checkout is loading (or if a load hangs) — the exit must never be covered.
       zIndex: 1,
       elevation: 1,
     },
     headerBtn: { minWidth: 44, height: 44, paddingHorizontal: 8, alignItems: 'center', justifyContent: 'center', flexDirection: 'row' },
-    backText: { color: '#ffffff', fontSize: 17, fontWeight: '400' },
-    // Close (✕) — same neutral white icon as every other Onelo modal + SDK.
-    closeText: { color: '#ffffff', fontSize: 22, fontWeight: '400', lineHeight: 24 },
+    backText: { color: c.headerText.color, fontSize: 17, fontWeight: '400' },
+    // Close (✕) — the brand text colour, like every other Onelo modal + SDK.
+    closeText: { color: c.headerText.color, fontSize: 22, fontWeight: '400', lineHeight: 24 },
     webview: { flex: 1, backgroundColor: bg },
     // Skeleton sits BELOW the header (top: headerHeight) so its 48px top padding
     // aligns with where the real hosted content paints — zero shift on cross-fade.
     skeletonOverlay: { position: 'absolute', top: headerHeight, left: 0, right: 0, bottom: 0, backgroundColor: bg },
     errorContainer: { flex: 1, justifyContent: 'center', alignItems: 'center', gap: 16 },
-    retryButton: { backgroundColor: '#ffffff', paddingHorizontal: 32, paddingVertical: 14, borderRadius: 8 },
-    retryText: { color: '#000000', fontSize: 16, fontWeight: '600' },
+    retryButton: c.retryButton,
+    retryText: c.retryText,
     cancelButton: { paddingHorizontal: 32, paddingVertical: 14 },
-    cancelText: { color: '#ffffff', fontSize: 16 },
+    cancelText: c.cancelText,
   })
 
   return React.createElement(Modal, { visible, animationType: 'slide', presentationStyle: 'fullScreen', onRequestClose: handleRequestClose },
@@ -438,7 +453,7 @@ export function StoreModalView({ visible, hostedUrl, callbackScheme, apiUrl, onR
       // the deep-link / OAuth interception on the real WebView above.
       loading && !error && React.createElement(View, { style: styles.skeletonOverlay, pointerEvents: 'none' },
         React.createElement(WebView, {
-          source: { html: storeSkeletonHtml(bg) },
+          source: { html: storeSkeletonHtml(t) },
           style: styles.webview,
           backgroundColor: bg,
           scrollEnabled: false,

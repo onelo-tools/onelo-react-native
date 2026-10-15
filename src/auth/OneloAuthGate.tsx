@@ -3,7 +3,10 @@ import { OneloError } from '@onelo/core'
 import type { Onelo } from '../onelo'
 import { AuthModal } from './auth-modal'
 import { AuthSkeleton } from './auth-skeleton'
+import { chromeStyles } from '../core/brand'
 import { useModalState } from './hooks'
+import { completeLaunchUrl } from './launch-url'
+import { resolveGateState } from './gate-state'
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 declare const require: (id: string) => any
@@ -94,15 +97,12 @@ export function OneloAuthGate({ onelo, children, fallback }: OneloAuthGateProps)
   const flowInFlight = useRef(false)
   const mountedRef = useRef(true)
 
-  /** Recompute the gate from the current session. `entitled` reads the session's
-   *  cached entitlement (revalidateEntitlement republishes it on change). */
+  /** Recompute the gate from the current session. `allowedIn` is the session's
+   *  stored server answer (revalidateEntitlement republishes it on change). */
   const recompute = useCallback(async () => {
-    await onelo.auth.whenReady()
-    const session = await onelo.auth.getSession()
-    const signedIn = session != null
-    const paywallEnabled = onelo.auth.isPaywallEnabled()
-    const entitled = session?.user.entitlement === 'active'
-    const allowedIn = signedIn && (!paywallEnabled || entitled)
+    // The server's answer (`allowed_in`), never a local copy of the rule — see
+    // gate-state.ts for the user the local copy let in (#819).
+    const { signedIn, allowedIn } = await resolveGateState(onelo.auth)
     if (!mountedRef.current) return
     setState({ resolved: true, allowedIn, signedIn })
     // #36 — the gate has resolved; the branded restore splash is done in every
@@ -147,10 +147,16 @@ export function OneloAuthGate({ onelo, children, fallback }: OneloAuthGateProps)
       .then((has) => { if (mountedRef.current && !has) setRestoring(false) })
       .catch(() => { if (mountedRef.current) setRestoring(false) })
 
-    void recompute()
+    // #542 — complete a launch URL (a same-device magic link after the app
+    // was killed) BEFORE the gate resolves; see `completeLaunchUrl`.
+    const launchHandled = completeLaunchUrl(onelo.auth, Linking, (e) => {
+      if (mountedRef.current) setRetry({ message: errorMessage(e) })
+    })
+
+    void launchHandled.then(recompute)
     // A just-completed external purchase may have landed while the app was
     // backgrounded / before this mounted — pull the fresh entitlement now.
-    void onelo.auth.revalidateEntitlement().then(recompute).catch(() => {})
+    void launchHandled.then(() => onelo.auth.revalidateEntitlement()).then(recompute).catch(() => {})
 
     // Reveal / re-gate on sign-in, sign-out, and entitlement republish.
     const unsubAuth = onelo.auth.onAuthStateChange(() => {
@@ -222,20 +228,21 @@ export function OneloAuthGate({ onelo, children, fallback }: OneloAuthGateProps)
     void driveFlow()
   }, [state.resolved, state.allowedIn, retry, driveFlow])
 
-  // #26 — paint the branding page background (checkout_bg_color, default
-  // #111111) so the pre-auth loading/retry surface matches the hosted page + the
-  // AuthModal overlay (which already uses pageBackgroundColor). Was hardcoded
-  // #000000, which flashed a different colour before the branded page.
-  const bg = onelo.auth.pageBackgroundColor()
+  // #26/#681 — the pre-auth restore / retry surface is painted from the brand
+  // tokens (page ground, retry button, error colour), matching the hosted page +
+  // the AuthModal. Neutral before config resolves.
+  const t = onelo.auth.brandTokens()
+  const bg = t.page_bg
+  const c = chromeStyles(t)
   const styles = StyleSheet.create({
     // #36 — the cold-start restore splash: the branding page background ONLY, no
     // form, no skeleton, no spinner. Reads as "opening…" for an auto-login rather
     // than flashing the sign-in form. Mirrors Swift's neutral branded background.
     restoringContainer: { flex: 1, backgroundColor: bg },
     retryContainer: { flex: 1, backgroundColor: bg, justifyContent: 'center', alignItems: 'center', gap: 16, padding: 32 },
-    errorText: { color: '#ff6b6b', fontSize: 13, textAlign: 'center' },
-    retryButton: { backgroundColor: '#ffffff', paddingHorizontal: 32, paddingVertical: 14, borderRadius: 8 },
-    retryText: { color: '#000000', fontSize: 16, fontWeight: '600' },
+    errorText: c.errorText,
+    retryButton: c.retryButton,
+    retryText: c.retryText,
   })
 
   const handleRetry = useCallback(() => setRetry(null), [])
@@ -263,7 +270,7 @@ export function OneloAuthGate({ onelo, children, fallback }: OneloAuthGateProps)
         // the hosted page's own skeleton so the transition has no jump. social-aware.
         React.createElement(AuthSkeleton, {
           socialCount: onelo.auth.oauthProviders.length,
-          backgroundColor: bg,
+          tokens: t,
         }))
 
   // AuthModal is always mounted so the hosted WebView can appear the instant
@@ -278,10 +285,9 @@ export function OneloAuthGate({ onelo, children, fallback }: OneloAuthGateProps)
       // system-browser OAuth URL from the backend base). Nav-diversion works without
       // it, but this activates the full OAuth path inside the gate.
       apiUrl: onelo.auth.baseUrl,
-      // Branding page background — the hosted auth page paints this behind its card,
-      // so the WebView shows it (not white) while loading. Resolved from config,
-      // which is ready before loadAuthView() opens the modal.
-      backgroundColor: onelo.auth.pageBackgroundColor(),
+      // Brand tokens (#681) — the modal's ground, skeleton and ✕ chip. Resolved
+      // from config, which is ready before loadAuthView() opens the modal.
+      tokens: onelo.auth.brandTokens(),
       // #26 part B — social-pill count for the loading skeleton so it matches
       // what the hosted form will render.
       socialCount: onelo.auth.oauthProviders.length,

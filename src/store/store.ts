@@ -1,4 +1,5 @@
-import { httpGet, OneloError, extractErrorCode, type OneloSession } from '@onelo/core'
+import { httpGet, OneloError, extractErrorCode, BrandSource, type BrandTokens, type OneloSession } from '@onelo/core'
+import type { PlanChange } from '../core/plan-change'
 import { sdkHeaders } from '../sdk-headers'
 import type { StoreResult } from './store-modal'
 
@@ -18,10 +19,17 @@ export type StoreModalState = {
   /** Backend base URL — threaded into the modal so it can build the `native_oauth`
    *  system-browser hand-off URL (`{apiUrl}/api/sdk/auth/oauth/hosted-init?…`). */
   apiUrl: string
-  /** Branding page background (--onelo-page-bg) so the checkout WebView never
-   *  flashes white before the hosted store page paints. */
+  /** The app's brand tokens (#681): the modal's chrome is painted from them. */
+  tokens: BrandTokens
+  /** @deprecated Use `tokens.page_bg`. */
   backgroundColor: string
   onResult: ((result: StoreResult) => void) | null
+}
+
+/** Where `openUpgrade` presents its URL: the customer-portal modal. */
+export interface UpgradeHost {
+  readonly hasModalHost: boolean
+  presentUrl(url: string): Promise<void>
 }
 
 /**
@@ -38,7 +46,7 @@ export type StoreModalState = {
  *
  * Usage:
  *   const session = await onelo.store.open()        // buyer ends up signed in
- *   await onelo.store.openUpgrade('pro')            // upgrade in system browser
+ *   await onelo.store.openUpgrade('pro')            // upgrade in the portal modal
  */
 export class OneloStore {
   private apiUrl: string
@@ -46,8 +54,16 @@ export class OneloStore {
   private bundleId?: string
   private getAccessToken: () => Promise<string | null>
   private exchangeCode?: (code: string) => Promise<OneloSession>
-  private pageBg: () => string
+  /** Told when the store ended in a purchase or a plan switch (#659). Set by
+   *  `Onelo` to its plan-change refresher. */
+  private onPlanChange: ((change: PlanChange) => void) | null = null
+  setPlanChangeHandler(fn: ((change: PlanChange) => void) | null): void {
+    this.onPlanChange = fn
+  }
+  private getSession: () => Promise<OneloSession | null>
+  private brand: BrandSource
   private readonly callbackScheme: string
+  private readonly upgradeHost?: UpgradeHost
 
   private _modalVisible = false
   private _modalUrl = ''
@@ -66,8 +82,15 @@ export class OneloStore {
     bundleId: string | undefined,
     getAccessToken: () => Promise<string | null>,
     exchangeCode?: (code: string) => Promise<OneloSession>,
-    pageBackgroundColor: () => string = () => '#111111',
+    /** The SDK's one brand-token model (#681) — `Onelo` passes the auth's. */
+    brand: BrandSource = new BrandSource(),
     callbackScheme: string = CALLBACK_SCHEME,
+    /** Reads the current session back — `open()` resolves with it when the
+     *  store finishes a plan switch that has no code to exchange (#599). */
+    getSession: () => Promise<OneloSession | null> = async () => null,
+    /** The SDK container `openUpgrade` presents in (#606) — wired by `Onelo`
+     *  to the customer-portal modal. Absent → the system browser. */
+    upgradeHost?: UpgradeHost,
   ) {
     if (!apiUrl) throw new Error('[Onelo] apiUrl is required')
     this.apiUrl = apiUrl
@@ -75,8 +98,10 @@ export class OneloStore {
     this.bundleId = bundleId
     this.getAccessToken = getAccessToken
     this.exchangeCode = exchangeCode
-    this.pageBg = pageBackgroundColor
+    this.brand = brand
     this.callbackScheme = callbackScheme
+    this.getSession = getSession
+    this.upgradeHost = upgradeHost
   }
 
   /** Security headers for every store request (`sdkHeaders`) plus per-request extras. */
@@ -119,6 +144,7 @@ export class OneloStore {
       throw OneloError.server(`Failed to initiate store flow: HTTP ${status}${code ? ` (${code})` : ''}`)
     }
 
+    this.brand.adopt(json) // #681: store-initiate carries brand_tokens
     const storeUrl = (json as Record<string, unknown>)['store_url'] as string | undefined
     if (!storeUrl) throw OneloError.server('Invalid store-initiate response: missing store_url')
     return storeUrl
@@ -138,12 +164,34 @@ export class OneloStore {
     return new Promise<OneloSession | null>((resolve, reject) => {
       this._modalUrl = hostedUrl
       this._modalResolve = async (result: StoreResult) => {
+        // The link died (#619): mint a fresh one and keep the modal up on it,
+        // so the buyer continues instead of being dropped back into the app.
+        // Each pass is a new link and the page only reports a dead one, so this
+        // cannot spin. A failed mint closes the modal as a cancel.
+        if (result.type === 'expired') {
+          const resolver = this._modalResolve
+          try {
+            this._modalUrl = await this.initiateStoreFlow(lang)
+            this._modalResolve = resolver
+            this.notifyStoreListeners()
+            return
+          } catch {
+            result = { type: 'cancelled' }
+          }
+        }
         this._modalVisible = false
         this._modalResolve = null
         this.notifyStoreListeners()
 
         if (result.type === 'cancelled') {
           resolve(null)
+          return
+        }
+        // Plan switch with no checkout (#599): nothing to exchange, the buyer is
+        // the signed-in user. A success — resolve that session, not null.
+        if (result.type === 'done') {
+          this.onPlanChange?.({ kind: 'switched', reason: result.reason })
+          this.getSession().then(resolve, reject)
           return
         }
         // Purchase completed → exchange the one-time code for a session and
@@ -154,6 +202,7 @@ export class OneloStore {
         }
         try {
           const session = await this.exchangeCode(result.code)
+          this.onPlanChange?.({ kind: 'purchase' })
           resolve(session)
         } catch (e) {
           reject(e)
@@ -168,9 +217,13 @@ export class OneloStore {
    * Act on an upsell (a feature's `upgradeCta`/`upgradeHint`, an "Available in
    * <plan>" tap). Requires a signed-in session. The backend is the single source
    * of truth for billing: an active subscriber is routed to a hosted plan-switch
-   * checkout, a user with no subscription to the hosted store. The resulting URL
-   * opens in the SYSTEM BROWSER via `Linking.openURL` (mirrors Swift
-   * `openUpgrade(forPlan:)` / `NSWorkspace.open`) — never an in-app WebView.
+   * checkout, a user with no subscription to the hosted store, and a subscriber
+   * whose plan changes are switched off to the portal, which explains it. The
+   * URL opens in the SDK's customer-portal modal (#606), so the store's
+   * hand-back (purchase, plan switch, expired link) closes it and the app sees
+   * the new plan; resolves when the modal closes. Requires
+   * `<CustomerPortalModal onelo={onelo} />` mounted — without one the URL opens
+   * in the system browser (`Linking.openURL`) and a warning is logged.
    *
    * @throws OneloError('not_authenticated') when signed out (401) or
    *   `OneloError('server_error')` on `plan_not_purchasable` (404) /
@@ -199,9 +252,16 @@ export class OneloStore {
       throw OneloError.server(`Failed to initiate upgrade: HTTP ${status}${code ? ` (${code})` : ''}`)
     }
 
+    this.brand.adopt(json) // #681: upgrade-initiate carries brand_tokens
     const upgradeUrl = (json as Record<string, unknown>)['upgrade_url'] as string | undefined
     if (!upgradeUrl) throw OneloError.server('Invalid upgrade-initiate response: missing upgrade_url')
 
+    if (this.upgradeHost?.hasModalHost) {
+      await this.upgradeHost.presentUrl(upgradeUrl)
+      return
+    }
+    // eslint-disable-next-line no-console
+    console.warn('[Onelo] openUpgrade: no <CustomerPortalModal> is mounted — opening the upgrade in the system browser, where its completion cannot reach the app.')
     // eslint-disable-next-line @typescript-eslint/no-var-requires
     const { Linking } = require('react-native')
     await Linking.openURL(upgradeUrl)
@@ -214,7 +274,8 @@ export class OneloStore {
       hostedUrl: this._modalUrl,
       callbackScheme: this.callbackScheme,
       apiUrl: this.apiUrl,
-      backgroundColor: this.pageBg(),
+      tokens: this.brand.current(),
+      backgroundColor: this.brand.current().page_bg,
       onResult: this._modalResolve,
     }
   }
