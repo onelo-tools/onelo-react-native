@@ -270,6 +270,7 @@ export function OneloAuthGate({ onelo, children, fallback }: OneloAuthGateProps)
         // the hosted page's own skeleton so the transition has no jump. social-aware.
         React.createElement(AuthSkeleton, {
           socialCount: onelo.auth.oauthProviders.length,
+          magicLink: onelo.auth.magicLinkEnabled,
           tokens: t,
         }))
 
@@ -291,6 +292,7 @@ export function OneloAuthGate({ onelo, children, fallback }: OneloAuthGateProps)
       // #26 part B — social-pill count for the loading skeleton so it matches
       // what the hosted form will render.
       socialCount: onelo.auth.oauthProviders.length,
+      magicLink: onelo.auth.magicLinkEnabled,
       // Deep-link scheme (config.callbackScheme, default 'onelorn') so OAuth returns
       // from the system browser reopen the app and complete sign-in.
       callbackScheme: onelo.auth.callbackScheme,

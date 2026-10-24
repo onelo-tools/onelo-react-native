@@ -13,7 +13,7 @@
  * family is installed (an unknown `fontFamily` warns on iOS), so native text
  * stays on the system font; the WebView skeletons use the stack as CSS.
  */
-import { NEUTRAL_BRAND_TOKENS, brandTokensFromLegacy, statusColor, type BrandTokens } from '@onelo/core'
+import { NEUTRAL_BRAND_TOKENS, brandTokensFromLegacy, statusColor, skeletonSoftFill, type BrandTokens } from '@onelo/core'
 
 /**
  * The tokens a modal paints with. `tokens` is what the SDK passes; the
@@ -61,6 +61,6 @@ export function chromeStyles(t: BrandTokens) {
  *  `animation` here): `.onelo-skel` soft block, `.onelo-skel-strong` field. */
 export function skeletonBlockCss(t: BrandTokens): string {
   const sweep = `background-image:linear-gradient(90deg,transparent 0%,${t.spinner_track} 50%,transparent 100%);background-size:60vw 100%;background-repeat:no-repeat;background-position:-100vw 0`
-  return `.onelo-skel{background-color:${t.card_bg};${sweep};border-radius:${t.field_radius}px}
+  return `.onelo-skel{background-color:${skeletonSoftFill(t)};${sweep};border-radius:${t.field_radius}px}
 .onelo-skel-strong{background-color:${t.border};${sweep};border-radius:${t.field_radius}px}`
 }

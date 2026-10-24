@@ -71,3 +71,22 @@ describe('authSkeletonHtml', () => {
     expect(authSkeletonHtml(3, bg('#111111'))).not.toContain('location.replace')
   })
 })
+
+describe('authSkeletonHtml shape + light page (#948)', () => {
+  it('draws the magic-link row only when magic link is on, between password and CTA', () => {
+    expect(authSkeletonHtml(0, bg('#111111'))).not.toContain('magic"')
+    const html = authSkeletonHtml(0, bg('#111111'), undefined, true)
+    expect(html).toMatch(/onelo-skel-strong input"><\/div>\n<div class="onelo-skel magic"><\/div><div class="onelo-skel-strong cta"/)
+  })
+
+  it('light page: soft blocks are not painted with the page colour', () => {
+    const t = bg('#ffffff')
+    const html = authSkeletonHtml(0, t)
+    expect(html).toContain(`.onelo-skel{background-color:${t.border};`)
+  })
+
+  it('dark page: soft blocks keep the card colour', () => {
+    const t = bg('#111111')
+    expect(authSkeletonHtml(0, t)).toContain(`.onelo-skel{background-color:${t.card_bg};`)
+  })
+})

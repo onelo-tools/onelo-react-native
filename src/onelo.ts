@@ -6,6 +6,8 @@ import { OneloMonitor } from './monitor/monitor'
 import { OneloFeedback } from './feedback/feedback'
 import { OneloForms } from './forms/forms'
 import { OneloWaitlist } from './waitlist/waitlist'
+import { OneloAffiliates, affiliatePost } from './affiliates/affiliates'
+import { KeychainStorage } from './core/storage'
 import { OneloCustomerPortal } from './customer-portal/customer-portal'
 import { OneloConsent } from './consent/consent'
 import { OneloStore } from './store/store'
@@ -29,6 +31,8 @@ export class Onelo {
   readonly feedback: OneloFeedback
   readonly forms: OneloForms
   readonly waitlist: OneloWaitlist
+  /** Affiliate referral capture (#929): `affiliates.capture(url, { consent })`. */
+  readonly affiliates: OneloAffiliates
   readonly customerPortal: OneloCustomerPortal
   readonly consent: OneloConsent
   readonly store: OneloStore
@@ -94,6 +98,15 @@ export class Onelo {
     this.feedback = new OneloFeedback(config.apiUrl, config.publishableKey, () => this.features.getActiveFeatures(), config.bundleId, this.auth.brand, userToken)
     this.forms = new OneloForms(config.apiUrl, config.publishableKey, config.bundleId)
     this.waitlist = new OneloWaitlist(config.apiUrl, config.publishableKey, config.bundleId)
+    this.affiliates = new OneloAffiliates(
+      config.publishableKey,
+      new KeychainStorage(),
+      affiliatePost(config.apiUrl, config.bundleId),
+      async () => {
+        const session = await this.auth.getSession()
+        return session ? { accessToken: session.accessToken, userId: session.user.id } : null
+      },
+    )
     this.customerPortal = new OneloCustomerPortal(
       config.apiUrl,
       config.publishableKey,
@@ -167,6 +180,8 @@ export class Onelo {
       if (session != null && userId != null) {
         this.eventStream.start({ userId })
         if (this.autoPresentConsent) void this.consent.presentGateIfNeeded()
+        // #929: a referral kept on this device goes to the user who signs in.
+        void this.affiliates.claimForSession()
       } else {
         this.eventStream.stop()
       }

@@ -304,8 +304,10 @@ interface AuthModalProps {
     /** #26 part B — social-pill count for the loading skeleton (from
      *  `onelo.auth.oauthProviders`), so it matches what the hosted form renders. */
     socialCount?: number;
+    /** #948: magic link on, so the skeleton draws its row. */
+    magicLink?: boolean;
 }
-declare function AuthModal({ visible, hostedUrl, onResult, apiUrl, tokens, backgroundColor, callbackScheme, socialCount }: AuthModalProps): React.CElement<{
+declare function AuthModal({ visible, hostedUrl, onResult, apiUrl, tokens, backgroundColor, callbackScheme, socialCount, magicLink }: AuthModalProps): React.CElement<{
     visible: boolean;
     animationType: string;
     presentationStyle: string;
@@ -624,6 +626,8 @@ declare class OneloAuth {
      *  `/api/sdk/config`; empty when social is disabled. Consumed by the Round 2
      *  OAuth entry point. */
     get oauthProviders(): string[];
+    /** #948: passwordless sign-in on (`/api/sdk/config` `magic_link_enabled`). */
+    get magicLinkEnabled(): boolean;
     /** Backend base URL. `AuthModal` uses it to build the OAuth system-browser
      *  hand-off URL (`{baseUrl}/api/sdk/auth/oauth/hosted-init?provider=…&token=…`)
      *  when the hosted page relays a `native_oauth{provider,token}` message. Optional for
@@ -1163,6 +1167,58 @@ declare class OneloWaitlist {
     }>;
 }
 
+/**
+ * Affiliate referral capture for apps with the Onelo SDK (#929).
+ *
+ * An Affiliate link that opens your app carries `?ref=<code>` (the Affiliate
+ * linking straight to the app) or `?onelo_click=<id>` (forwarded by Onelo's
+ * tracked link after consent there). Pass that link with the user's answer:
+ *
+ *   Linking.addEventListener('url', ({ url }) => onelo.affiliates.capture(url, { consent }))
+ *
+ * - `consent: false` stores nothing on the device; a `?ref=` only adds one to
+ *   the Affiliate's anonymous total.
+ * - `consent: true` keeps the click (Keychain entry `onelo_aff`). Which of two
+ *   clicks stays is the program's winner rule, decided by Onelo.
+ *
+ * The kept click is tied to the user who signs in, so their purchase is
+ * attributed whichever checkout opens.
+ */
+declare const AFFILIATE_STORAGE_KEY = "onelo_aff";
+interface AffiliateStore {
+    get(key: string): Promise<string | null>;
+    set(key: string, value: string): Promise<void>;
+}
+type Post = (path: string, body: Record<string, unknown>) => Promise<{
+    status: number;
+    json: Record<string, unknown>;
+} | null>;
+type Session = () => Promise<{
+    accessToken: string;
+    userId: string;
+} | null>;
+interface Kept {
+    click_id: string;
+    claimed_for?: string;
+}
+declare class OneloAffiliates {
+    private readonly publishableKey;
+    private readonly store;
+    private readonly post;
+    private readonly session;
+    constructor(publishableKey: string, store: AffiliateStore, post: Post, session: Session);
+    kept(): Promise<Kept | null>;
+    private keep;
+    /** Capture the referral in `url` after the user's answer. Stores nothing without consent. */
+    capture(url: string, { consent }: {
+        consent: boolean;
+    }): Promise<{
+        kept: boolean;
+    }>;
+    /** Tie the kept click to the signed-in user once. Called on every sign-in. */
+    claimForSession(): Promise<void>;
+}
+
 type PortalResult = 
 /** `planChange`: the store opened in the portal finished a purchase or a
  *  plan switch — the SDK reconciles the plan at once (#659). */
@@ -1694,6 +1750,8 @@ declare class Onelo {
     readonly feedback: OneloFeedback;
     readonly forms: OneloForms;
     readonly waitlist: OneloWaitlist;
+    /** Affiliate referral capture (#929): `affiliates.capture(url, { consent })`. */
+    readonly affiliates: OneloAffiliates;
     readonly customerPortal: OneloCustomerPortal;
     readonly consent: OneloConsent;
     readonly store: OneloStore;
@@ -1848,4 +1906,4 @@ declare function FeedbackModal({ feedback }: FeedbackModalProps): React.CElement
     onRequestClose: () => void;
 }, any, any>>;
 
-export { AuthModal, ConsentGateModal, type ConsentGateModalProps, ConsentGateModalView, type ConsentGateModalViewProps, type ConsentModalState, type ConsentResult, CustomerPortalModal, type CustomerPortalModalProps, CustomerPortalModalView, type FeatureReason, FeatureState, type FeatureStatus, FeedbackModal, type FeedbackOptions, type FlowDecision, type ModalState, type MonitorEventOptions, Onelo, OneloAuthGate, type OneloAuthGateProps, OneloConsent, type OneloConsentEnforcement, type OneloConsentRequirement, OneloCustomerPortal, OneloFeatures, OneloFeaturesError, type OneloFeaturesErrorCode, OneloFeedback, OneloForms, OneloMonitor, OneloStore, OneloWaitlist, type PortalIntent, type PortalModalState, type PortalModalViewProps, type PortalResult, StoreModal, type StoreModalProps, type StoreModalState, StoreModalView, type StoreModalViewProps, type StoreResult, type UpgradeHint, parseConsentMessage, useConsentModalState, useModalState, usePortalModalState, useStoreModalState };
+export { AFFILIATE_STORAGE_KEY, type AffiliateStore, AuthModal, ConsentGateModal, type ConsentGateModalProps, ConsentGateModalView, type ConsentGateModalViewProps, type ConsentModalState, type ConsentResult, CustomerPortalModal, type CustomerPortalModalProps, CustomerPortalModalView, type FeatureReason, FeatureState, type FeatureStatus, FeedbackModal, type FeedbackOptions, type FlowDecision, type ModalState, type MonitorEventOptions, Onelo, OneloAffiliates, OneloAuthGate, type OneloAuthGateProps, OneloConsent, type OneloConsentEnforcement, type OneloConsentRequirement, OneloCustomerPortal, OneloFeatures, OneloFeaturesError, type OneloFeaturesErrorCode, OneloFeedback, OneloForms, OneloMonitor, OneloStore, OneloWaitlist, type PortalIntent, type PortalModalState, type PortalModalViewProps, type PortalResult, StoreModal, type StoreModalProps, type StoreModalState, StoreModalView, type StoreModalViewProps, type StoreResult, type UpgradeHint, parseConsentMessage, useConsentModalState, useModalState, usePortalModalState, useStoreModalState };

@@ -34,8 +34,10 @@ import { resolveModalTokens, skeletonBlockCss } from '../core/brand'
  *  @param redirectTo when set, the skeleton `location.replace()`s to this URL after
  *    it paints — the single-WebView hand-off (#28): the ONE WebView shows the
  *    skeleton, then navigates to the hosted page (kept visible until it paints),
- *    with NO extra history entry (replace, not push) so `goBack` still works (#27). */
-export function authSkeletonHtml(socialCount: number, t: BrandTokens, redirectTo?: string): string {
+ *    with NO extra history entry (replace, not push) so `goBack` still works (#27).
+ *  @param magicLink #948: passwordless sign-in on — draws the hosted form's
+ *    "Email me a sign-in link instead" row between the password and the CTA. */
+export function authSkeletonHtml(socialCount: number, t: BrandTokens, redirectTo?: string, magicLink = false): string {
   const n = Math.max(0, Math.min(4, Math.floor(socialCount || 0)))
   // Redirect after two frames so the skeleton is actually painted first; the
   // current page stays rendered during the load, so there's no flash.
@@ -71,6 +73,7 @@ ${skeletonBlockCss(t)}
 .forgot{width:90px;height:11px;opacity:0.7}
 .cta{height:48px;border-radius:${t.button_radius}px;margin-top:6px}
 .signup{width:200px;height:12px;opacity:0.6;margin:6px auto 0}
+.magic{width:190px;height:12px;opacity:0.6;align-self:center}
 </style></head><body>
 <div class="wrap" aria-hidden="true">
 <div class="onelo-skel icon"></div>
@@ -82,7 +85,7 @@ ${pills}${divider}
 <div class="onelo-skel-strong input"></div>
 <div class="lblrow"><div class="onelo-skel lbl2"></div><div class="onelo-skel forgot"></div></div>
 <div class="onelo-skel-strong input"></div>
-<div class="onelo-skel-strong cta"></div>
+${magicLink ? '<div class="onelo-skel magic"></div>' : ''}<div class="onelo-skel-strong cta"></div>
 <div class="onelo-skel signup"></div>
 </div>
 </div>
@@ -94,6 +97,8 @@ ${redirect}
 export interface AuthSkeletonProps {
   /** Number of OAuth pills to draw (from `auth.oauthProviders`). Default 0. */
   socialCount?: number
+  /** #948: magic link on (from `auth.magicLinkEnabled`). Default false. */
+  magicLink?: boolean
   /** The app's brand tokens (from `auth.brandTokens()`, #681). Neutral when absent. */
   tokens?: BrandTokens
 }
@@ -104,7 +109,7 @@ export interface AuthSkeletonProps {
  * `react-native` / `react-native-webview` are required LAZILY so a pure-Node
  * import of the SDK never pulls the native modules.
  */
-export function AuthSkeleton({ socialCount = 0, tokens }: AuthSkeletonProps) {
+export function AuthSkeleton({ socialCount = 0, magicLink = false, tokens }: AuthSkeletonProps) {
   const t = resolveModalTokens(tokens)
   const backgroundColor = t.page_bg
   // eslint-disable-next-line @typescript-eslint/no-var-requires
@@ -112,7 +117,7 @@ export function AuthSkeleton({ socialCount = 0, tokens }: AuthSkeletonProps) {
   // eslint-disable-next-line @typescript-eslint/no-var-requires
   const { WebView } = require('react-native-webview')
   const { View } = RN
-  const html = authSkeletonHtml(socialCount, t)
+  const html = authSkeletonHtml(socialCount, t, undefined, magicLink)
   return React.createElement(
     View,
     // pointerEvents none: it's a placeholder — never swallow touches (so the

@@ -379,6 +379,7 @@ var require_brand_tokens = __commonJS({
     exports2.brandTokensFromResponse = brandTokensFromResponse2;
     exports2.withAlpha = withAlpha;
     exports2.statusColor = statusColor2;
+    exports2.skeletonSoftFill = skeletonSoftFill2;
     exports2.skeletonCss = skeletonCss2;
     exports2.spinnerCss = spinnerCss;
     exports2.portalSkeletonHtml = portalSkeletonHtml2;
@@ -530,11 +531,15 @@ var require_brand_tokens = __commonJS({
       }
     };
     exports2.BrandSource = BrandSource5;
+    function skeletonSoftFill2(t) {
+      return t.light_bg ? t.border : t.card_bg;
+    }
     function skeletonCss2(t) {
+      const soft = skeletonSoftFill2(t);
       const sweep = `background-image:linear-gradient(90deg,transparent 0%,${t.spinner_track} 50%,transparent 100%);background-size:60vw 100%;background-repeat:no-repeat;background-attachment:fixed;animation:onelo-shimmer 2.4s linear infinite`;
       return [
         "@keyframes onelo-shimmer{0%{background-position:-60vw 0}100%{background-position:100vw 0}}",
-        `.sk{background-color:${t.card_bg};${sweep};border-radius:${t.field_radius}px}`,
+        `.sk{background-color:${soft};${sweep};border-radius:${t.field_radius}px}`,
         `.strong{background-color:${t.border};${sweep};border-radius:${t.field_radius}px}`
       ].join("\n");
     }
@@ -571,25 +576,27 @@ ${skeletonCss2(t)}
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
-body{background:${t.page_bg};font-family:${t.body_font};padding:40px 36px 32px;overflow:hidden}
+body{background:${t.page_bg};font-family:${t.body_font};padding:24px 24px 0;overflow:hidden}
 ${skeletonCss2(t)}
-.icon{width:64px;height:64px;border-radius:${t.card_radius}px;margin:0 auto 16px}
-.title{width:220px;height:22px;margin:0 auto 40px}
-.cards{display:flex;gap:12px;margin-bottom:32px}
-.card{flex:1;height:76px;border-radius:${t.card_radius}px}
-.label{width:60px;height:13px;margin-bottom:8px}
-.input{width:100%;height:44px;margin-bottom:24px}
-.textarea{width:100%;height:110px;margin-bottom:32px}
+.icon{width:64px;height:64px;border-radius:${t.card_radius}px;margin:0 auto 14px}
+.col{width:100%;max-width:360px;margin:0 auto;display:flex;flex-direction:column;gap:16px}
+.title{width:220px;height:22px;margin:0 auto 4px}
+.cards{display:flex;gap:8px}
+.card{flex:1;height:56px;border-radius:${t.card_radius}px}
+.field{display:flex;flex-direction:column;gap:6px}
+.label{width:60px;height:13px}
+.input{width:100%;height:44px}
+.textarea{width:100%;height:100px}
 .btn{width:100%;height:48px;border-radius:${t.button_radius}px}
 </style></head><body>
 <div class="sk icon"></div>
+<div class="col">
 <div class="sk title"></div>
 <div class="cards"><div class="sk card"></div><div class="sk card"></div><div class="sk card"></div></div>
-<div class="sk label"></div>
-<div class="strong input"></div>
-<div class="sk label"></div>
-<div class="strong textarea"></div>
+<div class="field"><div class="sk label"></div><div class="strong input"></div></div>
+<div class="field"><div class="sk label"></div><div class="strong textarea"></div></div>
 <div class="strong btn"></div>
+</div>
 </body></html>`;
     }
   }
@@ -781,7 +788,7 @@ var require_package = __commonJS({
   "package.json"(exports2, module2) {
     module2.exports = {
       name: "@onelo/react-native",
-      version: "0.53.1",
+      version: "0.55.0",
       description: "Onelo React Native SDK",
       main: "./dist/index.js",
       types: "./dist/index.d.ts",
@@ -1488,6 +1495,7 @@ var init_sdk_headers = __esm({
 // src/index.ts
 var index_exports = {};
 __export(index_exports, {
+  AFFILIATE_STORAGE_KEY: () => AFFILIATE_STORAGE_KEY,
   AuthModal: () => AuthModal,
   ConsentGateModal: () => ConsentGateModal,
   ConsentGateModalView: () => ConsentGateModalView,
@@ -1496,6 +1504,7 @@ __export(index_exports, {
   FeatureState: () => FeatureState,
   FeedbackModal: () => FeedbackModal,
   Onelo: () => Onelo,
+  OneloAffiliates: () => OneloAffiliates,
   OneloAuthGate: () => OneloAuthGate,
   OneloConsent: () => OneloConsent,
   OneloCustomerPortal: () => OneloCustomerPortal,
@@ -1784,12 +1793,12 @@ function chromeStyles(t) {
 }
 function skeletonBlockCss(t) {
   const sweep = `background-image:linear-gradient(90deg,transparent 0%,${t.spinner_track} 50%,transparent 100%);background-size:60vw 100%;background-repeat:no-repeat;background-position:-100vw 0`;
-  return `.onelo-skel{background-color:${t.card_bg};${sweep};border-radius:${t.field_radius}px}
+  return `.onelo-skel{background-color:${(0, import_core2.skeletonSoftFill)(t)};${sweep};border-radius:${t.field_radius}px}
 .onelo-skel-strong{background-color:${t.border};${sweep};border-radius:${t.field_radius}px}`;
 }
 
 // src/auth/auth-skeleton.tsx
-function authSkeletonHtml(socialCount, t, redirectTo) {
+function authSkeletonHtml(socialCount, t, redirectTo, magicLink = false) {
   const n = Math.max(0, Math.min(4, Math.floor(socialCount || 0)));
   const redirect = redirectTo ? `<script>requestAnimationFrame(function(){requestAnimationFrame(function(){location.replace(${JSON.stringify(redirectTo)})})})</script>` : "";
   const pills = Array.from({ length: n }).map(() => '<div class="onelo-skel-strong pill"></div>').join("");
@@ -1816,6 +1825,7 @@ ${skeletonBlockCss(t)}
 .forgot{width:90px;height:11px;opacity:0.7}
 .cta{height:48px;border-radius:${t.button_radius}px;margin-top:6px}
 .signup{width:200px;height:12px;opacity:0.6;margin:6px auto 0}
+.magic{width:190px;height:12px;opacity:0.6;align-self:center}
 </style></head><body>
 <div class="wrap" aria-hidden="true">
 <div class="onelo-skel icon"></div>
@@ -1827,7 +1837,7 @@ ${pills}${divider}
 <div class="onelo-skel-strong input"></div>
 <div class="lblrow"><div class="onelo-skel lbl2"></div><div class="onelo-skel forgot"></div></div>
 <div class="onelo-skel-strong input"></div>
-<div class="onelo-skel-strong cta"></div>
+${magicLink ? '<div class="onelo-skel magic"></div>' : ""}<div class="onelo-skel-strong cta"></div>
 <div class="onelo-skel signup"></div>
 </div>
 </div>
@@ -1835,13 +1845,13 @@ ${pills}${divider}
 ${redirect}
 </body></html>`;
 }
-function AuthSkeleton({ socialCount = 0, tokens }) {
+function AuthSkeleton({ socialCount = 0, magicLink = false, tokens }) {
   const t = resolveModalTokens(tokens);
   const backgroundColor = t.page_bg;
   const RN = require("react-native");
   const { WebView } = require("react-native-webview");
   const { View } = RN;
-  const html = authSkeletonHtml(socialCount, t);
+  const html = authSkeletonHtml(socialCount, t, void 0, magicLink);
   return import_react.default.createElement(
     View,
     // pointerEvents none: it's a placeholder — never swallow touches (so the
@@ -1902,7 +1912,7 @@ function isExpiredAuthError(err) {
 function shouldShowNativeStoreClose(opts) {
   return opts.onStore && !opts.hostedReady && opts.failSafeArmed;
 }
-function AuthModal({ visible, hostedUrl, onResult, apiUrl, tokens, backgroundColor, callbackScheme, socialCount = 0 }) {
+function AuthModal({ visible, hostedUrl, onResult, apiUrl, tokens, backgroundColor, callbackScheme, socialCount = 0, magicLink = false }) {
   const scheme = callbackScheme || CALLBACK_SCHEME;
   const RN = require("react-native");
   const { WebView } = require("react-native-webview");
@@ -2130,7 +2140,7 @@ function AuthModal({ visible, hostedUrl, onResult, apiUrl, tokens, backgroundCol
         // to the hosted URL after it paints. ONE WebView shows the skeleton then
         // the page — no separate overlay instance, no slide, no jump. The skeleton
         // stays visible during the network load until the hosted page paints.
-        source: { html: authSkeletonHtml(socialCount, t, currentUrl) },
+        source: { html: authSkeletonHtml(socialCount, t, currentUrl, magicLink) },
         onError: handleError,
         onMessage: handleMessage,
         injectedJavaScript: OAUTH_RELAY_SCRIPT,
@@ -2358,6 +2368,8 @@ var _OneloAuth = class _OneloAuth {
         // unmapped — the field is surfaced via the `oauthProviders` getter and
         // consumed by the Round 2 OAuth entry point.
         oauthProviders: Array.isArray(j["oauth_providers"]) ? j["oauth_providers"] : void 0,
+        // #948: the sign-in skeleton draws the magic-link row from this.
+        magicLinkEnabled: j["magic_link_enabled"] === true,
         signupMarketingConsent: (0, import_core3.signupMarketingConsentFromConfig)(j)
       };
       this.attestRequired = j["attest_required"] ?? false;
@@ -2955,6 +2967,10 @@ var _OneloAuth = class _OneloAuth {
    *  OAuth entry point. */
   get oauthProviders() {
     return this.resolvedConfig?.oauthProviders ?? [];
+  }
+  /** #948: passwordless sign-in on (`/api/sdk/config` `magic_link_enabled`). */
+  get magicLinkEnabled() {
+    return this.resolvedConfig?.magicLinkEnabled === true;
   }
   /** Backend base URL. `AuthModal` uses it to build the OAuth system-browser
    *  hand-off URL (`{baseUrl}/api/sdk/auth/oauth/hosted-init?provider=…&token=…`)
@@ -4659,6 +4675,109 @@ var OneloWaitlist = class {
   }
 };
 
+// src/affiliates/affiliates.ts
+var AFFILIATE_STORAGE_KEY = "onelo_aff";
+var UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+var CODE = /^[A-Za-z0-9]{6,32}$/;
+function queryOf(url) {
+  const q = url.split("#")[0].split("?")[1] ?? "";
+  const out = {};
+  for (const part of q.split("&")) {
+    const i = part.indexOf("=");
+    if (i <= 0) continue;
+    try {
+      out[decodeURIComponent(part.slice(0, i))] = decodeURIComponent(part.slice(i + 1).replace(/\+/g, " "));
+    } catch {
+    }
+  }
+  return out;
+}
+var OneloAffiliates = class {
+  constructor(publishableKey, store, post, session) {
+    this.publishableKey = publishableKey;
+    this.store = store;
+    this.post = post;
+    this.session = session;
+  }
+  async kept() {
+    try {
+      const raw = await this.store.get(AFFILIATE_STORAGE_KEY);
+      const parsed = raw ? JSON.parse(raw) : null;
+      return parsed && typeof parsed.click_id === "string" && UUID.test(parsed.click_id) ? parsed : null;
+    } catch {
+      return null;
+    }
+  }
+  keep(kept) {
+    return this.store.set(AFFILIATE_STORAGE_KEY, JSON.stringify(kept));
+  }
+  /** Capture the referral in `url` after the user's answer. Stores nothing without consent. */
+  async capture(url, { consent }) {
+    const q = queryOf(url);
+    const code = q.ref && CODE.test(q.ref) ? q.ref.toLowerCase() : null;
+    const forwarded = q.onelo_click && UUID.test(q.onelo_click) ? q.onelo_click : null;
+    if (!consent) {
+      if (code) await this.post("/v1/sdk/affiliates/refused", { publishableKey: this.publishableKey, code });
+      return { kept: false };
+    }
+    const existing = await this.kept();
+    if (code) {
+      const res = await this.post("/v1/sdk/affiliates/click", {
+        publishableKey: this.publishableKey,
+        code,
+        source: "sdk",
+        ...existing ? { existing: existing.click_id } : {}
+      });
+      const id = res?.json.click_id;
+      if (res?.status === 200 && typeof id === "string" && UUID.test(id) && id !== existing?.click_id) {
+        await this.keep({ click_id: id });
+      }
+    } else if (forwarded && forwarded !== existing?.click_id) {
+      await this.keep({ click_id: forwarded });
+    }
+    await this.claimForSession();
+    return { kept: await this.kept() !== null };
+  }
+  /** Tie the kept click to the signed-in user once. Called on every sign-in. */
+  async claimForSession() {
+    const kept = await this.kept();
+    if (!kept) return;
+    const s = await this.session().catch(() => null);
+    if (!s || kept.claimed_for === s.userId) return;
+    const res = await this.post("/v1/sdk/affiliates/claim", {
+      publishableKey: this.publishableKey,
+      userToken: s.accessToken,
+      clickId: kept.click_id
+    });
+    if (res?.status === 200) await this.keep({ ...kept, claimed_for: s.userId });
+  }
+};
+function affiliatePost(apiUrl, bundleId) {
+  return async (path, body) => {
+    try {
+      const { sdkHeaders: sdkHeaders2 } = await Promise.resolve().then(() => (init_sdk_headers(), sdk_headers_exports));
+      const { maybeSelfHealFromError: maybeSelfHealFromError2 } = await Promise.resolve().then(() => (init_attest(), attest_exports));
+      const bodyStr = JSON.stringify(body);
+      const res = await fetch(`${apiUrl}${path}`, {
+        method: "POST",
+        headers: {
+          ...await sdkHeaders2(bundleId, void 0, { method: "POST", path, body: bodyStr }),
+          "Content-Type": "application/json"
+        },
+        body: bodyStr
+      });
+      const json = await res.json().catch(() => ({}));
+      if (!res.ok) maybeSelfHealFromError2(json);
+      return { status: res.status, json };
+    } catch {
+      return null;
+    }
+  };
+}
+
+// src/onelo.ts
+init_storage();
+
 // src/customer-portal/customer-portal.ts
 var import_core8 = __toESM(require_dist());
 init_sdk_headers();
@@ -5700,6 +5819,15 @@ var Onelo = class {
     this.feedback = new OneloFeedback(config.apiUrl, config.publishableKey, () => this.features.getActiveFeatures(), config.bundleId, this.auth.brand, userToken);
     this.forms = new OneloForms(config.apiUrl, config.publishableKey, config.bundleId);
     this.waitlist = new OneloWaitlist(config.apiUrl, config.publishableKey, config.bundleId);
+    this.affiliates = new OneloAffiliates(
+      config.publishableKey,
+      new KeychainStorage(),
+      affiliatePost(config.apiUrl, config.bundleId),
+      async () => {
+        const session = await this.auth.getSession();
+        return session ? { accessToken: session.accessToken, userId: session.user.id } : null;
+      }
+    );
     this.customerPortal = new OneloCustomerPortal(
       config.apiUrl,
       config.publishableKey,
@@ -5756,6 +5884,7 @@ var Onelo = class {
       if (session != null && userId != null) {
         this.eventStream.start({ userId });
         if (this.autoPresentConsent) void this.consent.presentGateIfNeeded();
+        void this.affiliates.claimForSession();
       } else {
         this.eventStream.stop();
       }
@@ -6013,6 +6142,7 @@ function OneloAuthGate({ onelo, children, fallback }) {
   // the hosted page's own skeleton so the transition has no jump. social-aware.
   import_react4.default.createElement(AuthSkeleton, {
     socialCount: onelo.auth.oauthProviders.length,
+    magicLink: onelo.auth.magicLinkEnabled,
     tokens: t
   });
   return import_react4.default.createElement(
@@ -6034,6 +6164,7 @@ function OneloAuthGate({ onelo, children, fallback }) {
       // #26 part B — social-pill count for the loading skeleton so it matches
       // what the hosted form will render.
       socialCount: onelo.auth.oauthProviders.length,
+      magicLink: onelo.auth.magicLinkEnabled,
       // Deep-link scheme (config.callbackScheme, default 'onelorn') so OAuth returns
       // from the system browser reopen the app and complete sign-in.
       callbackScheme: onelo.auth.callbackScheme
@@ -6523,7 +6654,7 @@ var storeSkeletonHtml = (t) => `<!DOCTYPE html><html><head>
 *{box-sizing:border-box;margin:0;padding:0}
 body{background:${t.page_bg};font-family:${t.body_font};overflow:hidden}
 ${(0, import_core14.skeletonCss)(t)}
-.wrap{width:100%;max-width:896px;margin:0 auto;padding:48px 24px 0;display:flex;flex-direction:column;align-items:center}
+.wrap{width:100%;max-width:896px;margin:0 auto;padding:48px 24px;display:flex;flex-direction:column;align-items:center}
 .head{width:100%;display:flex;flex-direction:column;align-items:center;margin-bottom:32px}
 .logo{width:64px;height:64px;border-radius:${t.card_radius}px;margin-bottom:14px;border:1.5px solid ${t.border}}
 .h{width:220px;height:22px;margin-bottom:10px}
@@ -6963,6 +7094,7 @@ function ConsentGateModalView({ visible, hostedUrl, onResult, tokens, background
 }
 // Annotate the CommonJS export names for ESM import in node:
 0 && (module.exports = {
+  AFFILIATE_STORAGE_KEY,
   AuthModal,
   ConsentGateModal,
   ConsentGateModalView,
@@ -6971,6 +7103,7 @@ function ConsentGateModalView({ visible, hostedUrl, onResult, tokens, background
   FeatureState,
   FeedbackModal,
   Onelo,
+  OneloAffiliates,
   OneloAuthGate,
   OneloConsent,
   OneloCustomerPortal,

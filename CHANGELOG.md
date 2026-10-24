@@ -5,7 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.53.1] — 2026-10-07
+## [0.55.0] — 2026-10-24
+
+### Added
+
+- `onelo.auth.magicLinkEnabled`; the sign-in loading skeleton draws the magic-link row when passwordless sign-in is on.
+
+### Fixed
+
+- On a light page the skeletons' soft blocks are visible (they were painted white on white).
+
+## [0.54.0-staging] — 2026-10-23
+
+### Added
+
+- `onelo.affiliates.capture(url, { consent })` captures an Affiliate referral from the link that opened your app
+  (#929). It reads `?ref=<code>` or `?onelo_click=<id>`. Without consent nothing
+  is stored on the device. With consent the click is kept and tied to the user
+  who signs in, so their purchase is attributed whichever checkout opens.
+
+## [0.53.1-staging] — 2026-10-07
 
 ### Fixed
 

@@ -42,7 +42,8 @@ describe('React Native chrome from brand_tokens (#681)', () => {
   it('WebView skeletons: page ground, card/border blocks, radii', () => {
     const auth = authSkeletonHtml(2, T)
     expect(auth).toContain('body{background:#f5f5f4')
-    expect(auth).toContain('.onelo-skel{background-color:#ffffff')
+    // #948: light page → soft blocks take the border colour, not the white card.
+    expect(auth).toContain('.onelo-skel{background-color:#e4e4e7')
     expect(auth).toContain('.cta{height:48px;border-radius:3px')
     expect(auth).not.toContain('rgba(255,255,255,0.04)')
     const store = storeSkeletonHtml(T)

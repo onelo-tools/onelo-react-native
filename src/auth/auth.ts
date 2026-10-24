@@ -257,6 +257,8 @@ export class OneloAuth {
         // unmapped — the field is surfaced via the `oauthProviders` getter and
         // consumed by the Round 2 OAuth entry point.
         oauthProviders: Array.isArray(j['oauth_providers']) ? (j['oauth_providers'] as string[]) : undefined,
+        // #948: the sign-in skeleton draws the magic-link row from this.
+        magicLinkEnabled: j['magic_link_enabled'] === true,
         signupMarketingConsent: signupMarketingConsentFromConfig(j),
       }
       // App Attest requirement is not part of the typed ResolvedSDKConfig
@@ -983,6 +985,11 @@ export class OneloAuth {
    *  OAuth entry point. */
   get oauthProviders(): string[] {
     return this.resolvedConfig?.oauthProviders ?? []
+  }
+
+  /** #948: passwordless sign-in on (`/api/sdk/config` `magic_link_enabled`). */
+  get magicLinkEnabled(): boolean {
+    return this.resolvedConfig?.magicLinkEnabled === true
   }
 
   /** Backend base URL. `AuthModal` uses it to build the OAuth system-browser

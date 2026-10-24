@@ -31,7 +31,7 @@ export const storeSkeletonHtml = (t: BrandTokens) => `<!DOCTYPE html><html><head
 *{box-sizing:border-box;margin:0;padding:0}
 body{background:${t.page_bg};font-family:${t.body_font};overflow:hidden}
 ${skeletonCss(t)}
-.wrap{width:100%;max-width:896px;margin:0 auto;padding:48px 24px 0;display:flex;flex-direction:column;align-items:center}
+.wrap{width:100%;max-width:896px;margin:0 auto;padding:48px 24px;display:flex;flex-direction:column;align-items:center}
 .head{width:100%;display:flex;flex-direction:column;align-items:center;margin-bottom:32px}
 .logo{width:64px;height:64px;border-radius:${t.card_radius}px;margin-bottom:14px;border:1.5px solid ${t.border}}
 .h{width:220px;height:22px;margin-bottom:10px}

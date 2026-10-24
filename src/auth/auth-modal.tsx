@@ -96,9 +96,11 @@ interface AuthModalProps {
   /** #26 part B — social-pill count for the loading skeleton (from
    *  `onelo.auth.oauthProviders`), so it matches what the hosted form renders. */
   socialCount?: number
+  /** #948: magic link on, so the skeleton draws its row. */
+  magicLink?: boolean
 }
 
-export function AuthModal({ visible, hostedUrl, onResult, apiUrl, tokens, backgroundColor, callbackScheme, socialCount = 0 }: AuthModalProps) {
+export function AuthModal({ visible, hostedUrl, onResult, apiUrl, tokens, backgroundColor, callbackScheme, socialCount = 0, magicLink = false }: AuthModalProps) {
   // Config-driven deep-link scheme (default 'onelorn'). Register it natively so a
   // system-browser return (OAuth) can reopen the app; in-WebView returns are caught
   // by handleShouldStartLoad regardless.
@@ -429,7 +431,7 @@ export function AuthModal({ visible, hostedUrl, onResult, apiUrl, tokens, backgr
         // to the hosted URL after it paints. ONE WebView shows the skeleton then
         // the page — no separate overlay instance, no slide, no jump. The skeleton
         // stays visible during the network load until the hosted page paints.
-        source: { html: authSkeletonHtml(socialCount, t, currentUrl) },
+        source: { html: authSkeletonHtml(socialCount, t, currentUrl, magicLink) },
         onError: handleError,
         onMessage: handleMessage,
         injectedJavaScript: OAUTH_RELAY_SCRIPT,
