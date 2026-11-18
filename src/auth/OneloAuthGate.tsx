@@ -1,9 +1,9 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react'
-import { OneloError } from '@onelo/core'
 import type { Onelo } from '../onelo'
 import { AuthModal } from './auth-modal'
 import { AuthSkeleton } from './auth-skeleton'
 import { chromeStyles } from '../core/brand'
+import { appUserMessage, oneloText } from '../core/texts'
 import { useModalState } from './hooks'
 import { completeLaunchUrl } from './launch-url'
 import { resolveGateState } from './gate-state'
@@ -37,10 +37,13 @@ interface GateState {
   signedIn: boolean
 }
 
+/** #1076 — the retry screen's message, in the Page Language: an App User's
+ *  own error translated, a lost connection said so, anything else (a server's
+ *  message, a developer's configuration error) "Something went wrong". The
+ *  raw error is logged for the developer. */
 function errorMessage(e: unknown): string | undefined {
-  if (e instanceof OneloError) return e.message
-  if (e instanceof Error) return e.message
-  return undefined
+  if (e == null) return undefined
+  return appUserMessage(e, 'OneloAuthGate')
 }
 
 /**
@@ -262,7 +265,7 @@ export function OneloAuthGate({ onelo, children, fallback }: OneloAuthGateProps)
           ? React.createElement(Text, { style: styles.errorText }, retry.message)
           : null,
         React.createElement(TouchableOpacity, { style: styles.retryButton, onPress: handleRetry },
-          React.createElement(Text, { style: styles.retryText }, 'Sign In')
+          React.createElement(Text, { style: styles.retryText }, oneloText('signIn'))
         )
       )
     : (fallback ??

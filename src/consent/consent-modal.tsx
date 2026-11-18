@@ -2,6 +2,7 @@ import React, { useState, useEffect, useCallback } from 'react'
 import type { OneloConsent, ConsentModalState } from './consent'
 import type { BrandTokens } from '@onelo/core'
 import { chromeStyles, resolveModalTokens } from '../core/brand'
+import { oneloText } from '../core/texts'
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 declare const require: (id: string) => any
@@ -199,7 +200,7 @@ export function ConsentGateModalView({ visible, hostedUrl, onResult, tokens, bac
       // block, but a network blip must not trap the user behind a blank screen).
       error && React.createElement(View, { style: styles.errorContainer },
         React.createElement(TouchableOpacity, { style: styles.retryButton, onPress: handleRetry },
-          React.createElement(Text, { style: styles.retryText }, 'Retry')
+          React.createElement(Text, { style: styles.retryText }, oneloText('retry'))
         )
       )
     )

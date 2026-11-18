@@ -61,6 +61,8 @@ afterEach(() => { ;(Module as unknown as { _load: unknown })._load = realLoad })
 
 import { OneloAuthGate } from './OneloAuthGate'
 import { completeLaunchUrl } from './launch-url'
+import { OneloError } from '@onelo/core'
+import { oneloText, withAppUserText } from '../core/texts'
 
 function fakeOnelo(handleLaunchUrl: (url: string | null | undefined) => Promise<unknown>) {
   return {
@@ -100,11 +102,14 @@ describe('OneloAuthGate mount — the launch URL', () => {
   })
 
   it('shows a failed completion on the retry surface', async () => {
-    const onelo = fakeOnelo(async () => { throw new Error('belongs to a different sign-in') })
+    // #1076: the App User's words for it (Page Language), not the raw message.
+    const onelo = fakeOnelo(async () => {
+      throw withAppUserText(OneloError.server('belongs to a different sign-in'), 'linkOtherSignIn')
+    })
     OneloAuthGate({ onelo: onelo as never, children: null })
     effects[0]()
     await flush()
-    expect(retryCalls).toEqual([{ message: 'belongs to a different sign-in' }])
+    expect(retryCalls).toEqual([{ message: oneloText('linkOtherSignIn') }])
     expect(order).toContain('recompute')
   })
 })

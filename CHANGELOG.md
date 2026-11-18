@@ -5,7 +5,46 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.55.0] — 2026-10-24
+## [0.60.0] — 2026-11-18
+
+### Changed
+
+- `OneloError` messages an App User may be shown (signed out, sign-in cancelled, session ended, account suspended, no active subscription, network error, verification limits and links) follow the Page Language the SDK adopts, in English, Polish, German, French, Spanish, Italian, Portuguese (European) and Dutch (#1079, from the shared core). Error codes are unchanged; messages that address the developer (an invalid key, a configuration, server diagnostics) stay English. Branch on `error.code`, never on the message.
+- `OneloError.noActivePlan()`'s message is the App User's: "No active subscription — the plan has expired or was cancelled." The `[no_active_plan]` prefix and the instruction to the developer are gone. Branch on `code === 'no_active_plan'`.
+
+## [0.59.0-staging] — 2026-11-18
+
+### Added
+
+- The SDK's own texts follow the App User's Page Language (#1076): "Sign In", "Cancel", "Retry", "Manage Subscription", the back and close buttons and their accessibility labels ("Close feedback", "Close checkout", "Close customer portal"), the feature badges (`FeatureState.badgeLabel`: New, Beta, Coming soon, "Available in <plan>" with the plan name as written, Change plan) and the sign-in retry screen's message, in English, Polish, German, French, Spanish, Italian, Portuguese (European) and Dutch. The badges use the hosted pages' words.
+- `new Onelo({ language })`: the App's language. The SDK sends it instead of the device language with `/api/sdk/config` (the device languages ride as `Accept-Language`) and as the default `lang` of the sign-in, store, upgrade, consent and waitlist calls. The backend answers `page_language`, chosen within the App Languages; the SDK adopts it and keeps it for the next launch.
+- `onelo.auth.pageLanguage`: the Page Language the SDK's texts are drawn in (`'en'` until the backend first answers).
+- `OneloConfig` is now exported from this package (the shared options plus `language`).
+
+### Changed
+
+- `FeatureState.badgeLabel` in English: "Coming Soon" is now "Coming soon" and the upsell fallback "Upgrade" is now "Change plan", the hosted pages' words. Branch on `status`, never on the label.
+- The sign-in retry screen (`OneloAuthGate`) no longer shows a raw error message. An App User's own error (session ended, account suspended, no active plan, a link from another sign-in, a store not configured yet) is shown in the Page Language; a lost connection says so; anything else shows "Something went wrong. Please try again." The raw error is logged with `console.warn`. `OneloError.message` itself stays English.
+
+## [0.58.0-staging] — 2026-11-18
+
+### Added
+
+- `waitlist.join()` sends the device language, or the `language` the App passes in its options (sent unchanged). The backend stores the Page Language of the sign-up (one of the App Languages) on the waitlist entry for the waitlist emails (#1038).
+
+## [0.57.0-staging] — 2026-11-18
+
+### Changed
+
+- `store.initiateStoreFlow()`, `store.open()`, `store.openUpgrade()`, `onelo.openUpgrade()` and `auth.resolveFlow()` send the device language when the App passes none, instead of `en` (or nothing for the sign-in flow); the `lang` parameter is now optional. A language the App passes is sent unchanged (#1039). The backend picks the Page Language within the App Languages; the SDK only sends the language.
+
+## [0.56.0-staging] — 2026-11-18
+
+### Changed
+
+- `requiredConsents()` sends the device language. Each item's `url` and `consentUrl` open the document in the App User's language when the App offers it and a version in that language exists, else in the document's main language (#1073). The backend chooses; the SDK only sends the language.
+
+## [0.55.0-staging] — 2026-10-24
 
 ### Added
 

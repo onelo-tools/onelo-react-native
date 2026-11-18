@@ -12,6 +12,7 @@ import {
 import { classifyHandBack, classifyHandBackMessage } from '../core/hand-back'
 import { skeletonCss, type BrandTokens } from '@onelo/core'
 import { chromeStyles, resolveModalTokens } from '../core/brand'
+import { oneloText } from '../core/texts'
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 declare const require: (id: string) => any
@@ -412,16 +413,16 @@ export function StoreModalView({ visible, hostedUrl, callbackScheme, apiUrl, onR
               onPress: goBack,
               style: styles.headerBtn,
               accessibilityRole: 'button',
-              accessibilityLabel: 'Go back',
+              accessibilityLabel: oneloText('goBack'),
               hitSlop: { top: 8, bottom: 8, left: 8, right: 8 },
-            }, React.createElement(Text, { style: styles.backText, allowFontScaling: false }, '‹ Back'))
+            }, React.createElement(Text, { style: styles.backText, allowFontScaling: false }, oneloText('backButton')))
           // Empty leading spacer keeps "✕" pinned right when Back is hidden.
           : React.createElement(View, { style: styles.headerBtn }),
         React.createElement(TouchableOpacity, {
           onPress: handleCancel,
           style: styles.headerBtn,
           accessibilityRole: 'button',
-          accessibilityLabel: 'Close checkout',
+          accessibilityLabel: oneloText('closeCheckout'),
           hitSlop: { top: 8, bottom: 8, left: 8, right: 8 },
         }, React.createElement(Text, { style: styles.closeText, allowFontScaling: false }, '✕'))
       ),
@@ -462,10 +463,10 @@ export function StoreModalView({ visible, hostedUrl, callbackScheme, apiUrl, onR
       ),
       error && React.createElement(View, { style: styles.errorContainer },
         React.createElement(TouchableOpacity, { style: styles.retryButton, onPress: handleRetry },
-          React.createElement(Text, { style: styles.retryText }, 'Retry')
+          React.createElement(Text, { style: styles.retryText }, oneloText('retry'))
         ),
         React.createElement(TouchableOpacity, { style: styles.cancelButton, onPress: handleCancel },
-          React.createElement(Text, { style: styles.cancelText }, 'Cancel')
+          React.createElement(Text, { style: styles.cancelText }, oneloText('cancel'))
         )
       )
     )

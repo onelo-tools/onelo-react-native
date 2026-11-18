@@ -1,5 +1,5 @@
-import { BrandTokens, BrandSource, OneloConfig, OneloSession, SignupMarketingConsent, SignUpOptions, OneloEntitlement, ResendVerificationResult, WaitlistJoinOptions } from '@onelo/core';
-export { BrandTokens, OneloConfig, OneloEntitlement, OneloError, OneloSession, OneloUser, REASON_LABELS, RESPONSE_REASON_CODES, ResponseReasonCode, SignUpOptions, SignupMarketingConsent, UserRole, WaitlistConsent, WaitlistJoinOptions } from '@onelo/core';
+import { BrandTokens, BrandSource, OneloSession, SignupMarketingConsent, SignUpOptions, OneloEntitlement, ResendVerificationResult, WaitlistJoinOptions, OneloConfig as OneloConfig$1 } from '@onelo/core';
+export { BrandTokens, OneloEntitlement, OneloError, OneloSession, OneloUser, REASON_LABELS, RESPONSE_REASON_CODES, ResponseReasonCode, SignUpOptions, SignupMarketingConsent, UserRole, WaitlistConsent, WaitlistJoinOptions } from '@onelo/core';
 import React from 'react';
 
 /**
@@ -344,6 +344,9 @@ declare class OneloAuth {
     /** Deep-link callback scheme (config.callbackScheme, default 'onelorn'). Sent to
      *  the backend on initiate/flow-init and used by AuthModal to catch the return. */
     private readonly _callbackScheme;
+    /** #1076 — the App's language (`config.language`), or undefined for the
+     *  device language. The default `lang` of every Page Language request. */
+    private readonly _language?;
     private pkceVerifier;
     /**
      * PKCE verifier of the latest hosted flow (#542). Its challenge goes to
@@ -459,6 +462,16 @@ declare class OneloAuth {
      */
     private _awaitAttestReady;
     private initialize;
+    /** #1076 — the App User's Page Language (ADR-0043) the SDK's own texts are
+     *  drawn in ('Sign In', 'Cancel', 'Close feedback', the feature badges, the
+     *  retry screen): `config.language` when it is one of the App Languages,
+     *  else the device language when it is one, else the App's default — chosen
+     *  by the backend in `/api/sdk/config` and kept for the next launch. `'en'`
+     *  until the first answer. The same language as the Hosted Pages. */
+    get pageLanguage(): string;
+    /** The language a Page Language request sends: `lang` passed for this call,
+     *  else the App's `config.language`, else the device language. */
+    requestLanguage(lang?: string): string;
     whenReady(): Promise<void>;
     loadAuthView(): Promise<OneloSession | null>;
     /**
@@ -488,6 +501,10 @@ declare class OneloAuth {
      * dedicated code for (mirrors the JS SDK). Public so a Round 2 content-gate /
      * accessory WebView can reuse the same centralised decision. Parity with Swift
      * `resolveFlow` and JS `resolveFlow`.
+     *
+     * @param lang  The App's language for the sign-in page. Omitted, the
+     *   `language` from the config is sent, else the device language (#1039,
+     *   #1076); the backend picks the Page Language.
      */
     resolveFlow(lang?: string): Promise<FlowDecision>;
     /** Raw `/flow/init` request — returns status + body so `loadAuthView` can tell
@@ -760,8 +777,9 @@ declare class FeatureState {
     get isNew(): boolean;
     get isBeta(): boolean;
     get isComingSoon(): boolean;
-    /** Promo/lock badge (parity with Swift): New/Beta/Coming Soon, 🔒 for greyed
-     *  (locked — never hide it), and "Available in <plan>" for upsell. */
+    /** Promo/lock badge (parity with Swift): New/Beta/Coming soon, 🔒 for greyed
+     *  (locked — never hide it), and "Available in <plan>" for upsell. In the App
+     *  User's Page Language (#1076); the plan name is shown as written. */
     get badgeLabel(): string | null;
     /** Non-null when the feature is plan-blocked AND the backend named the
      *  unlocking plan — surface in upgrade-prompt UI. */
@@ -1156,9 +1174,18 @@ declare class OneloWaitlist {
     private readonly apiUrl;
     private readonly publishableKey;
     private readonly bundleId?;
-    constructor(apiUrl: string, publishableKey: string, bundleId?: string | undefined);
+    /** #1076 — the App's language (`config.language`), sent when a join passes
+     *  none; undefined sends the device language. */
+    private readonly language?;
+    constructor(apiUrl: string, publishableKey: string, bundleId?: string | undefined, 
+    /** #1076 — the App's language (`config.language`), sent when a join passes
+     *  none; undefined sends the device language. */
+    language?: string | undefined);
     join(slug: string | undefined, email: string, 
-    /** #818: the checkboxes your form showed — `{ consent: { marketing, custom } }`. */
+    /** #818: the checkboxes your form showed — `{ consent: { marketing, custom } }`.
+     *  #1038: `language` — the App's language for this sign-up; omitted, the
+     *  config's `language` (#1076), else the device language is sent and the
+     *  backend stores the join's Page Language. */
     options?: WaitlistJoinOptions): Promise<{
         success: boolean;
         position?: number;
@@ -1495,6 +1522,8 @@ declare class OneloConsent {
      *  NOT auto-open the gate — the dev drives their own UI via `requiredConsents()`
      *  + `onConsentRequired()`. From `config.autoPresentConsentGate` (default true). */
     private readonly autoPresent;
+    /** #1076 — the App's language (`config.language`); undefined = the device's. */
+    private readonly language?;
     private _modalVisible;
     private _modalUrl;
     private _modalResolve;
@@ -1508,7 +1537,7 @@ declare class OneloConsent {
      *  a sign-in bridge trigger + an app foreground call) so only one gate opens.
      *  JS is single-threaded, so a boolean is enough. */
     private _presenting;
-    constructor(apiUrl: string, publishableKey: string, auth: OneloAuth, bundleId?: string, autoPresent?: boolean);
+    constructor(apiUrl: string, publishableKey: string, auth: OneloAuth, bundleId?: string, autoPresent?: boolean, language?: string);
     /** Current consent revision — bumped on each `legal.consent_required` push
      *  (parity with Swift @Published consentRevision). */
     get consentRevision(): number;
@@ -1677,6 +1706,8 @@ declare class OneloStore {
     private brand;
     private readonly callbackScheme;
     private readonly upgradeHost?;
+    /** #1076 — the App's language (`config.language`); undefined = the device's. */
+    private readonly language?;
     private _modalVisible;
     private _modalUrl;
     private _modalResolve;
@@ -1695,7 +1726,10 @@ declare class OneloStore {
     getSession?: () => Promise<OneloSession | null>, 
     /** The SDK container `openUpgrade` presents in (#606) — wired by `Onelo`
      *  to the customer-portal modal. Absent → the system browser. */
-    upgradeHost?: UpgradeHost);
+    upgradeHost?: UpgradeHost, 
+    /** #1076 — the App's language, the default `lang` of every page this
+     *  opens. Undefined sends the device language. */
+    language?: string);
     /** Security headers for every store request (`sdkHeaders`) plus per-request extras. */
     private _secHeaders;
     /**
@@ -1704,6 +1738,10 @@ declare class OneloStore {
      * Bearer`) so the store binds to the existing user and skips signup (re-purchase);
      * cold-start omits it. Mirrors Swift `initiateStoreFlow(lang:)`. Use for a custom
      * presentation; `open()` wraps it.
+     *
+     * @param lang  The App's language for the store. Omitted, the `language` from
+     *   the config is sent, else the device language (#1039, #1076); the backend
+     *   picks the Page Language within the App Languages.
      *
      * @throws OneloError('server_error') on `store_not_configured` (409) /
      *   `paywall_not_enabled` (403) — DO NOT open a WebView in that case — or any
@@ -1731,6 +1769,8 @@ declare class OneloStore {
      * `<CustomerPortalModal onelo={onelo} />` mounted — without one the URL opens
      * in the system browser (`Linking.openURL`) and a warning is logged.
      *
+     * @param lang  The App's language for the page. Omitted, the `language` from
+     *   the config is sent, else the device language (#1039, #1076).
      * @throws OneloError('not_authenticated') when signed out (401) or
      *   `OneloError('server_error')` on `plan_not_purchasable` (404) /
      *   `callback_scheme_required` (400) / any other non-200.
@@ -1743,6 +1783,21 @@ declare class OneloStore {
     private notifyStoreListeners;
 }
 
+/** The React Native SDK's configuration: the shared `@onelo/core` options plus
+ *  this SDK's own. */
+interface OneloConfig extends OneloConfig$1 {
+    /**
+     * #1076 — the App's language for its App User (a BCP 47 tag such as `'de'` or
+     * `'pt-PT'`), e.g. the language your own UI is set to. Omitted, the device
+     * language is used. Onelo picks the **Page Language** from it: this language
+     * when it is one of your App Languages, else the device language when it is
+     * one, else your App's default. The hosted pages the SDK opens and its own
+     * texts ('Sign In', 'Cancel', 'Close feedback', the feature badges, the retry
+     * screen) use that language; `onelo.auth.pageLanguage` tells you which. A
+     * `lang` passed to a single call wins for that call's page.
+     */
+    language?: string;
+}
 declare class Onelo {
     readonly auth: OneloAuth;
     readonly features: OneloFeatures;
@@ -1906,4 +1961,4 @@ declare function FeedbackModal({ feedback }: FeedbackModalProps): React.CElement
     onRequestClose: () => void;
 }, any, any>>;
 
-export { AFFILIATE_STORAGE_KEY, type AffiliateStore, AuthModal, ConsentGateModal, type ConsentGateModalProps, ConsentGateModalView, type ConsentGateModalViewProps, type ConsentModalState, type ConsentResult, CustomerPortalModal, type CustomerPortalModalProps, CustomerPortalModalView, type FeatureReason, FeatureState, type FeatureStatus, FeedbackModal, type FeedbackOptions, type FlowDecision, type ModalState, type MonitorEventOptions, Onelo, OneloAffiliates, OneloAuthGate, type OneloAuthGateProps, OneloConsent, type OneloConsentEnforcement, type OneloConsentRequirement, OneloCustomerPortal, OneloFeatures, OneloFeaturesError, type OneloFeaturesErrorCode, OneloFeedback, OneloForms, OneloMonitor, OneloStore, OneloWaitlist, type PortalIntent, type PortalModalState, type PortalModalViewProps, type PortalResult, StoreModal, type StoreModalProps, type StoreModalState, StoreModalView, type StoreModalViewProps, type StoreResult, type UpgradeHint, parseConsentMessage, useConsentModalState, useModalState, usePortalModalState, useStoreModalState };
+export { AFFILIATE_STORAGE_KEY, type AffiliateStore, AuthModal, ConsentGateModal, type ConsentGateModalProps, ConsentGateModalView, type ConsentGateModalViewProps, type ConsentModalState, type ConsentResult, CustomerPortalModal, type CustomerPortalModalProps, CustomerPortalModalView, type FeatureReason, FeatureState, type FeatureStatus, FeedbackModal, type FeedbackOptions, type FlowDecision, type ModalState, type MonitorEventOptions, Onelo, OneloAffiliates, OneloAuthGate, type OneloAuthGateProps, type OneloConfig, OneloConsent, type OneloConsentEnforcement, type OneloConsentRequirement, OneloCustomerPortal, OneloFeatures, OneloFeaturesError, type OneloFeaturesErrorCode, OneloFeedback, OneloForms, OneloMonitor, OneloStore, OneloWaitlist, type PortalIntent, type PortalModalState, type PortalModalViewProps, type PortalResult, StoreModal, type StoreModalProps, type StoreModalState, StoreModalView, type StoreModalViewProps, type StoreResult, type UpgradeHint, parseConsentMessage, useConsentModalState, useModalState, usePortalModalState, useStoreModalState };

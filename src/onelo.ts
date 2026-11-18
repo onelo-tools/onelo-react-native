@@ -1,4 +1,4 @@
-import type { OneloConfig } from '@onelo/core'
+import type { OneloConfig as CoreOneloConfig } from '@onelo/core'
 import { PlanChangeRefresher, type PlanChange } from './core/plan-change'
 import { OneloAuth } from './auth/auth'
 import { OneloFeatures } from './features/features'
@@ -22,6 +22,22 @@ const SDK_VERSION: string = require('../package.json').version
 interface AppStateSubscription { remove: () => void }
 interface AppStateLike {
   addEventListener: (type: 'change', handler: (state: string) => void) => AppStateSubscription
+}
+
+/** The React Native SDK's configuration: the shared `@onelo/core` options plus
+ *  this SDK's own. */
+export interface OneloConfig extends CoreOneloConfig {
+  /**
+   * #1076 — the App's language for its App User (a BCP 47 tag such as `'de'` or
+   * `'pt-PT'`), e.g. the language your own UI is set to. Omitted, the device
+   * language is used. Onelo picks the **Page Language** from it: this language
+   * when it is one of your App Languages, else the device language when it is
+   * one, else your App's default. The hosted pages the SDK opens and its own
+   * texts ('Sign In', 'Cancel', 'Close feedback', the feature badges, the retry
+   * screen) use that language; `onelo.auth.pageLanguage` tells you which. A
+   * `lang` passed to a single call wins for that call's page.
+   */
+  language?: string
 }
 
 export class Onelo {
@@ -97,7 +113,7 @@ export class Onelo {
     })
     this.feedback = new OneloFeedback(config.apiUrl, config.publishableKey, () => this.features.getActiveFeatures(), config.bundleId, this.auth.brand, userToken)
     this.forms = new OneloForms(config.apiUrl, config.publishableKey, config.bundleId)
-    this.waitlist = new OneloWaitlist(config.apiUrl, config.publishableKey, config.bundleId)
+    this.waitlist = new OneloWaitlist(config.apiUrl, config.publishableKey, config.bundleId, config.language)
     this.affiliates = new OneloAffiliates(
       config.publishableKey,
       new KeychainStorage(),
@@ -121,7 +137,7 @@ export class Onelo {
 
     this.autoPresentConsent = config.autoPresentConsentGate ?? true
     this.autoLifecycleRefresh = config.autoLifecycleRefresh ?? true
-    this.consent = new OneloConsent(config.apiUrl, config.publishableKey, this.auth, config.bundleId, this.autoPresentConsent)
+    this.consent = new OneloConsent(config.apiUrl, config.publishableKey, this.auth, config.bundleId, this.autoPresentConsent, config.language)
     this.store = new OneloStore(
       config.apiUrl,
       config.publishableKey,
@@ -132,6 +148,7 @@ export class Onelo {
       this.auth.callbackScheme,
       () => this.auth.getSession(),
       this.customerPortal,
+      config.language,
     )
 
     // The shared SSE connection. Register auth + consent handlers BEFORE the
@@ -306,7 +323,7 @@ export class Onelo {
    * Thin delegate to {@link OneloStore.openUpgrade} for cross-platform parity with
    * Swift `Onelo.openUpgrade(forPlan:)` / Android / Flutter `onelo.openUpgrade`.
    */
-  async openUpgrade(plan: string, lang = 'en'): Promise<void> {
+  async openUpgrade(plan: string, lang?: string): Promise<void> {
     return this.store.openUpgrade(plan, lang)
   }
 

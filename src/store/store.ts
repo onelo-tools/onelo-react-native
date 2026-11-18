@@ -1,4 +1,5 @@
 import { httpGet, OneloError, extractErrorCode, BrandSource, type BrandTokens, type OneloSession } from '@onelo/core'
+import { requestLanguage } from '../core/page-language'
 import type { PlanChange } from '../core/plan-change'
 import { sdkHeaders } from '../sdk-headers'
 import type { StoreResult } from './store-modal'
@@ -64,6 +65,8 @@ export class OneloStore {
   private brand: BrandSource
   private readonly callbackScheme: string
   private readonly upgradeHost?: UpgradeHost
+  /** #1076 — the App's language (`config.language`); undefined = the device's. */
+  private readonly language?: string
 
   private _modalVisible = false
   private _modalUrl = ''
@@ -91,6 +94,9 @@ export class OneloStore {
     /** The SDK container `openUpgrade` presents in (#606) — wired by `Onelo`
      *  to the customer-portal modal. Absent → the system browser. */
     upgradeHost?: UpgradeHost,
+    /** #1076 — the App's language, the default `lang` of every page this
+     *  opens. Undefined sends the device language. */
+    language?: string,
   ) {
     if (!apiUrl) throw new Error('[Onelo] apiUrl is required')
     this.apiUrl = apiUrl
@@ -102,6 +108,7 @@ export class OneloStore {
     this.callbackScheme = callbackScheme
     this.getSession = getSession
     this.upgradeHost = upgradeHost
+    this.language = language
   }
 
   /** Security headers for every store request (`sdkHeaders`) plus per-request extras. */
@@ -116,11 +123,15 @@ export class OneloStore {
    * cold-start omits it. Mirrors Swift `initiateStoreFlow(lang:)`. Use for a custom
    * presentation; `open()` wraps it.
    *
+   * @param lang  The App's language for the store. Omitted, the `language` from
+   *   the config is sent, else the device language (#1039, #1076); the backend
+   *   picks the Page Language within the App Languages.
+   *
    * @throws OneloError('server_error') on `store_not_configured` (409) /
    *   `paywall_not_enabled` (403) — DO NOT open a WebView in that case — or any
    *   other non-200. `OneloError('invalid_publishable_key')` on 401.
    */
-  async initiateStoreFlow(lang = 'en'): Promise<string> {
+  async initiateStoreFlow(lang?: string): Promise<string> {
     // Bearer only when signed in (re-purchase / reauth binding); anonymous store
     // omits it. getAccessToken() auto-refreshes a near-expiry token.
     const token = await this.getAccessToken()
@@ -129,7 +140,7 @@ export class OneloStore {
       `${this.apiUrl}/api/sdk/paywall/store-initiate` +
       `?key=${encodeURIComponent(this.publishableKey)}` +
       `&callback_scheme=${encodeURIComponent(this.callbackScheme)}` +
-      `&lang=${encodeURIComponent(lang)}`
+      `&lang=${encodeURIComponent(requestLanguage(this.language, lang))}`
 
     const { status, json } = await httpGet(
       url,
@@ -158,7 +169,7 @@ export class OneloStore {
    *
    * Requires `<StoreModal onelo={onelo} />` mounted near your app root.
    */
-  async open(lang = 'en'): Promise<OneloSession | null> {
+  async open(lang?: string): Promise<OneloSession | null> {
     const hostedUrl = await this.initiateStoreFlow(lang)
 
     return new Promise<OneloSession | null>((resolve, reject) => {
@@ -225,11 +236,13 @@ export class OneloStore {
    * `<CustomerPortalModal onelo={onelo} />` mounted — without one the URL opens
    * in the system browser (`Linking.openURL`) and a warning is logged.
    *
+   * @param lang  The App's language for the page. Omitted, the `language` from
+   *   the config is sent, else the device language (#1039, #1076).
    * @throws OneloError('not_authenticated') when signed out (401) or
    *   `OneloError('server_error')` on `plan_not_purchasable` (404) /
    *   `callback_scheme_required` (400) / any other non-200.
    */
-  async openUpgrade(plan: string, lang = 'en'): Promise<void> {
+  async openUpgrade(plan: string, lang?: string): Promise<void> {
     // getAccessToken() refreshes a near-expiry token before returning it, then we
     // require a session (parity with Swift's refresh-then-require).
     const token = await this.getAccessToken()
@@ -240,7 +253,7 @@ export class OneloStore {
       `?key=${encodeURIComponent(this.publishableKey)}` +
       `&plan=${encodeURIComponent(plan)}` +
       `&callback_scheme=${encodeURIComponent(this.callbackScheme)}` +
-      `&lang=${encodeURIComponent(lang)}`
+      `&lang=${encodeURIComponent(requestLanguage(this.language, lang))}`
 
     const { status, json } = await httpGet(url, await this._secHeaders({ Authorization: `Bearer ${token}` }))
 

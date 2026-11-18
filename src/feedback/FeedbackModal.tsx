@@ -3,6 +3,7 @@ import type { OneloFeedback } from './feedback'
 import { parseRenewRequest, renewReplyScript, sameOrigin } from '../customer-portal/portal-renewal'
 import { feedbackSkeletonHtml } from '@onelo/core'
 import { chromeStyles } from '../core/brand'
+import { oneloText } from '../core/texts'
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 declare const require: (id: string) => any
@@ -150,7 +151,7 @@ export function FeedbackModal({ feedback }: FeedbackModalProps) {
               onPress: () => feedback.close(),
               style: styles.closeBtn,
               accessibilityRole: 'button',
-              accessibilityLabel: 'Close feedback',
+              accessibilityLabel: oneloText('closeFeedback'),
               hitSlop: { top: 8, bottom: 8, left: 8, right: 8 },
             },
               React.createElement(Text, { style: styles.closeIcon, allowFontScaling: false }, '✕')

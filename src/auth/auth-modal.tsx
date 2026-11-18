@@ -14,6 +14,7 @@ import { authSkeletonHtml } from './auth-skeleton'
 import { classifyHandBackMessage } from '../core/hand-back'
 import type { BrandTokens } from '@onelo/core'
 import { chromeStyles, resolveModalTokens } from '../core/brand'
+import { oneloText } from '../core/texts'
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 declare const require: (id: string) => any
@@ -455,17 +456,17 @@ export function AuthModal({ visible, hostedUrl, onResult, apiUrl, tokens, backgr
         style: styles.closeButton,
         onPress: handleBackOrCancel,
         accessibilityRole: 'button',
-        accessibilityLabel: canGoBack ? 'Back' : 'Close',
+        accessibilityLabel: oneloText(canGoBack ? 'back' : 'close'),
         hitSlop: { top: 8, bottom: 8, left: 8, right: 8 },
       },
         React.createElement(Text, { style: styles.closeText }, '✕')
       ),
       error && React.createElement(View, { style: styles.errorContainer },
         React.createElement(TouchableOpacity, { style: styles.retryButton, onPress: handleRetry },
-          React.createElement(Text, { style: styles.retryText }, 'Sign In')
+          React.createElement(Text, { style: styles.retryText }, oneloText('signIn'))
         ),
         React.createElement(TouchableOpacity, { style: styles.cancelButton, onPress: handleCancel },
-          React.createElement(Text, { style: styles.cancelText }, 'Cancel')
+          React.createElement(Text, { style: styles.cancelText }, oneloText('cancel'))
         )
       )
     )

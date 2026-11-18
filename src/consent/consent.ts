@@ -1,6 +1,7 @@
 import { httpGet, httpPost, OneloError, type BrandTokens } from '@onelo/core'
 import { sdkHeaders } from '../sdk-headers'
 import type { OneloAuth } from '../auth/auth'
+import { requestLanguage } from '../core/page-language'
 import type { OneloEventStream } from '../core/event-stream'
 import type { ConsentResult } from './consent-modal'
 
@@ -96,6 +97,8 @@ export class OneloConsent {
    *  NOT auto-open the gate — the dev drives their own UI via `requiredConsents()`
    *  + `onConsentRequired()`. From `config.autoPresentConsentGate` (default true). */
   private readonly autoPresent: boolean
+  /** #1076 — the App's language (`config.language`); undefined = the device's. */
+  private readonly language?: string
 
   private _modalVisible = false
   private _modalUrl = ''
@@ -113,13 +116,14 @@ export class OneloConsent {
    *  JS is single-threaded, so a boolean is enough. */
   private _presenting = false
 
-  constructor(apiUrl: string, publishableKey: string, auth: OneloAuth, bundleId?: string, autoPresent = true) {
+  constructor(apiUrl: string, publishableKey: string, auth: OneloAuth, bundleId?: string, autoPresent = true, language?: string) {
     if (!apiUrl) throw new Error('[Onelo] apiUrl is required')
     this.apiUrl = apiUrl
     this.publishableKey = publishableKey
     this.auth = auth
     this.bundleId = bundleId
     this.autoPresent = autoPresent
+    this.language = language
   }
 
   /** Current consent revision — bumped on each `legal.consent_required` push
@@ -169,7 +173,11 @@ export class OneloConsent {
     const session = await this.auth.getSession()
     if (!session) return []
     try {
-      const { status, json } = await httpGet(`${this.apiUrl}/v1/sdk/consent/required`, {
+      // #1073: the App's language (#1076), else the device language; the
+      // backend picks the Page Language (within the App Languages) and links
+      // each document in it.
+      const url = `${this.apiUrl}/v1/sdk/consent/required?lang=${encodeURIComponent(requestLanguage(this.language))}`
+      const { status, json } = await httpGet(url, {
         ...(await sdkHeaders(this.bundleId, this.publishableKey)),
         Authorization: `Bearer ${session.accessToken}`,
       })

@@ -33,6 +33,213 @@ var __toESM = (mod, isNodeMode, target) => (target = mod != null ? __create(__ge
 ));
 var __toCommonJS = (mod) => __copyProps(__defProp({}, "__esModule", { value: true }), mod);
 
+// ../onelo-core/dist/marketing-consent.js
+var require_marketing_consent = __commonJS({
+  "../onelo-core/dist/marketing-consent.js"(exports2) {
+    "use strict";
+    Object.defineProperty(exports2, "__esModule", { value: true });
+    exports2.NO_SIGNUP_MARKETING_CONSENT = void 0;
+    exports2.signupMarketingConsentFromConfig = signupMarketingConsentFromConfig2;
+    exports2.deviceLanguage = deviceLanguage2;
+    exports2.configLanguageParam = configLanguageParam2;
+    exports2.signUpConsentFields = signUpConsentFields2;
+    exports2.waitlistConsentField = waitlistConsentField2;
+    exports2.waitlistLanguageField = waitlistLanguageField2;
+    exports2.NO_SIGNUP_MARKETING_CONSENT = { asked: false, text: null, language: null };
+    function signupMarketingConsentFromConfig2(json) {
+      const raw = json["signup_marketing_consent"];
+      if (!raw || typeof raw !== "object")
+        return exports2.NO_SIGNUP_MARKETING_CONSENT;
+      return {
+        asked: raw["asked"] === true,
+        text: typeof raw["text"] === "string" ? raw["text"] : null,
+        language: typeof raw["language"] === "string" ? raw["language"] : null
+      };
+    }
+    function deviceLanguage2() {
+      try {
+        const nav = globalThis.navigator;
+        if (nav?.language)
+          return nav.language;
+        const locale = Intl.DateTimeFormat().resolvedOptions().locale;
+        if (locale)
+          return locale;
+      } catch {
+      }
+      return "en";
+    }
+    function configLanguageParam2(language = deviceLanguage2()) {
+      return `&lang=${encodeURIComponent(language)}`;
+    }
+    function signUpConsentFields2(options, question) {
+      if (options?.marketingConsent !== true)
+        return {};
+      return { marketing_consent: true, lang: question.language ?? deviceLanguage2() };
+    }
+    function waitlistConsentField2(options) {
+      const consent = options?.consent;
+      if (!consent)
+        return {};
+      const out = {};
+      if (consent.marketing !== void 0)
+        out.marketing = consent.marketing === true;
+      if (consent.custom !== void 0)
+        out.custom = consent.custom === true;
+      return Object.keys(out).length > 0 ? { consent: out } : {};
+    }
+    function waitlistLanguageField2(options) {
+      return { language: options?.language ?? deviceLanguage2() };
+    }
+  }
+});
+
+// ../onelo-core/dist/page-language.js
+var require_page_language = __commonJS({
+  "../onelo-core/dist/page-language.js"(exports2) {
+    "use strict";
+    Object.defineProperty(exports2, "__esModule", { value: true });
+    exports2.PAGE_LANGUAGES = void 0;
+    exports2.pageLanguage = pageLanguage;
+    exports2.primarySubtag = primarySubtag2;
+    exports2.adoptPageLanguage = adoptPageLanguage2;
+    exports2.resetPageLanguageForTest = resetPageLanguageForTest;
+    exports2.requestLanguage = requestLanguage2;
+    exports2.textsLanguage = textsLanguage;
+    exports2.fillText = fillText;
+    var marketing_consent_1 = require_marketing_consent();
+    exports2.PAGE_LANGUAGES = ["en", "pl", "de", "fr", "es", "it", "pt", "nl"];
+    var current2 = "en";
+    function pageLanguage() {
+      return current2;
+    }
+    function primarySubtag2(tag) {
+      if (typeof tag !== "string")
+        return null;
+      const primary = tag.trim().split(/[-_]/)[0]?.toLowerCase() ?? "";
+      return /^[a-z]{2,3}$/.test(primary) ? primary : null;
+    }
+    function adoptPageLanguage2(answer) {
+      const primary = primarySubtag2(answer);
+      if (!primary)
+        return null;
+      current2 = primary;
+      return primary;
+    }
+    function resetPageLanguageForTest() {
+      current2 = "en";
+    }
+    function requestLanguage2(passed, appLanguage) {
+      return passed || appLanguage || (0, marketing_consent_1.deviceLanguage)();
+    }
+    function textsLanguage(language = current2) {
+      const primary = primarySubtag2(language);
+      return primary && exports2.PAGE_LANGUAGES.includes(primary) ? primary : "en";
+    }
+    function fillText(text, fill = {}) {
+      let out = text;
+      for (const [name, value] of Object.entries(fill))
+        out = out.split(`{${name}}`).join(value);
+      return out;
+    }
+  }
+});
+
+// ../onelo-core/dist/error-text.js
+var require_error_text = __commonJS({
+  "../onelo-core/dist/error-text.js"(exports2) {
+    "use strict";
+    Object.defineProperty(exports2, "__esModule", { value: true });
+    exports2.ONELO_ERROR_TEXTS = void 0;
+    exports2.oneloErrorText = oneloErrorText;
+    var page_language_1 = require_page_language();
+    exports2.ONELO_ERROR_TEXTS = {
+      en: {
+        notAuthenticated: "User is not authenticated",
+        network: "Network error: {detail}",
+        cancelled: "Sign in was cancelled",
+        sessionEnded: "Your session ended \u2014 please sign in again",
+        userRevoked: "This user account has been suspended",
+        noActivePlan: "No active subscription \u2014 the plan has expired or was cancelled.",
+        verificationRateLimited: "At most 3 verification emails an hour \u2014 try again later",
+        invalidVerificationToken: "This verification link is invalid, already used, replaced by a newer one, or expired"
+      },
+      pl: {
+        notAuthenticated: "U\u017Cytkownik nie jest zalogowany",
+        network: "B\u0142\u0105d sieci: {detail}",
+        cancelled: "Logowanie zosta\u0142o anulowane",
+        sessionEnded: "Twoja sesja si\u0119 zako\u0144czy\u0142a \u2014 zaloguj si\u0119 ponownie",
+        userRevoked: "To konto u\u017Cytkownika zosta\u0142o zawieszone",
+        noActivePlan: "Brak aktywnej subskrypcji \u2014 plan wygas\u0142 lub zosta\u0142 anulowany.",
+        verificationRateLimited: "Najwy\u017Cej 3 e-maile weryfikacyjne na godzin\u0119 \u2014 spr\xF3buj p\xF3\u017Aniej",
+        invalidVerificationToken: "Ten link weryfikacyjny jest nieprawid\u0142owy, zosta\u0142 ju\u017C u\u017Cyty, zast\u0105piony nowszym albo wygas\u0142"
+      },
+      de: {
+        notAuthenticated: "Der Benutzer ist nicht angemeldet",
+        network: "Netzwerkfehler: {detail}",
+        cancelled: "Die Anmeldung wurde abgebrochen",
+        sessionEnded: "Ihre Sitzung ist abgelaufen \u2014 bitte melden Sie sich erneut an",
+        userRevoked: "Dieses Benutzerkonto wurde gesperrt",
+        noActivePlan: "Kein aktives Abonnement \u2014 der Plan ist abgelaufen oder wurde gek\xFCndigt.",
+        verificationRateLimited: "H\xF6chstens 3 Best\xE4tigungs-E-Mails pro Stunde \u2014 bitte versuchen Sie es sp\xE4ter erneut",
+        invalidVerificationToken: "Dieser Best\xE4tigungslink ist ung\xFCltig, wurde bereits verwendet, durch einen neueren ersetzt oder ist abgelaufen"
+      },
+      fr: {
+        notAuthenticated: "L\u2019utilisateur n\u2019est pas connect\xE9",
+        network: "Erreur r\xE9seau : {detail}",
+        cancelled: "La connexion a \xE9t\xE9 annul\xE9e",
+        sessionEnded: "Votre session a pris fin \u2014 veuillez vous reconnecter",
+        userRevoked: "Ce compte utilisateur a \xE9t\xE9 suspendu",
+        noActivePlan: "Aucun abonnement actif \u2014 le forfait a expir\xE9 ou a \xE9t\xE9 r\xE9sili\xE9.",
+        verificationRateLimited: "3 e-mails de v\xE9rification par heure au maximum \u2014 r\xE9essayez plus tard",
+        invalidVerificationToken: "Ce lien de v\xE9rification n\u2019est pas valide, a d\xE9j\xE0 \xE9t\xE9 utilis\xE9, a \xE9t\xE9 remplac\xE9 par un plus r\xE9cent ou a expir\xE9"
+      },
+      es: {
+        notAuthenticated: "El usuario no ha iniciado sesi\xF3n",
+        network: "Error de red: {detail}",
+        cancelled: "Se ha cancelado el inicio de sesi\xF3n",
+        sessionEnded: "Tu sesi\xF3n ha terminado \u2014 vuelve a iniciar sesi\xF3n",
+        userRevoked: "Esta cuenta de usuario ha sido suspendida",
+        noActivePlan: "No hay ninguna suscripci\xF3n activa \u2014 el plan ha caducado o se ha cancelado.",
+        verificationRateLimited: "Como m\xE1ximo 3 correos de verificaci\xF3n por hora \u2014 int\xE9ntalo m\xE1s tarde",
+        invalidVerificationToken: "Este enlace de verificaci\xF3n no es v\xE1lido, ya se ha usado, se ha sustituido por uno m\xE1s reciente o ha caducado"
+      },
+      it: {
+        notAuthenticated: "L\u2019utente non ha effettuato l\u2019accesso",
+        network: "Errore di rete: {detail}",
+        cancelled: "L\u2019accesso \xE8 stato annullato",
+        sessionEnded: "La tua sessione \xE8 terminata \u2014 accedi di nuovo",
+        userRevoked: "Questo account utente \xE8 stato sospeso",
+        noActivePlan: "Nessun abbonamento attivo \u2014 il piano \xE8 scaduto o \xE8 stato annullato.",
+        verificationRateLimited: "Al massimo 3 e-mail di verifica all\u2019ora \u2014 riprova pi\xF9 tardi",
+        invalidVerificationToken: "Questo link di verifica non \xE8 valido, \xE8 gi\xE0 stato usato, \xE8 stato sostituito da uno pi\xF9 recente o \xE8 scaduto"
+      },
+      pt: {
+        notAuthenticated: "O utilizador n\xE3o iniciou sess\xE3o",
+        network: "Erro de rede: {detail}",
+        cancelled: "O in\xEDcio de sess\xE3o foi cancelado",
+        sessionEnded: "A sua sess\xE3o terminou \u2014 inicie sess\xE3o novamente",
+        userRevoked: "Esta conta de utilizador foi suspensa",
+        noActivePlan: "Nenhuma subscri\xE7\xE3o ativa \u2014 o plano expirou ou foi cancelado.",
+        verificationRateLimited: "No m\xE1ximo 3 e-mails de verifica\xE7\xE3o por hora \u2014 tente mais tarde",
+        invalidVerificationToken: "Este link de verifica\xE7\xE3o \xE9 inv\xE1lido, j\xE1 foi utilizado, foi substitu\xEDdo por um mais recente ou expirou"
+      },
+      nl: {
+        notAuthenticated: "De gebruiker is niet ingelogd",
+        network: "Netwerkfout: {detail}",
+        cancelled: "Inloggen is geannuleerd",
+        sessionEnded: "Je sessie is be\xEBindigd \u2014 log opnieuw in",
+        userRevoked: "Dit gebruikersaccount is opgeschort",
+        noActivePlan: "Geen actief abonnement \u2014 het abonnement is verlopen of opgezegd.",
+        verificationRateLimited: "Maximaal 3 verificatie-e-mails per uur \u2014 probeer het later opnieuw",
+        invalidVerificationToken: "Deze verificatielink is ongeldig, al gebruikt, vervangen door een nieuwere of verlopen"
+      }
+    };
+    function oneloErrorText(key, fill = {}, language = (0, page_language_1.pageLanguage)()) {
+      return (0, page_language_1.fillText)(exports2.ONELO_ERROR_TEXTS[(0, page_language_1.textsLanguage)(language)][key], fill);
+    }
+  }
+});
+
 // ../onelo-core/dist/types.js
 var require_types = __commonJS({
   "../onelo-core/dist/types.js"(exports2) {
@@ -41,6 +248,7 @@ var require_types = __commonJS({
     exports2.OneloError = void 0;
     exports2.isSessionEndError = isSessionEndError2;
     exports2.extractErrorCode = extractErrorCode2;
+    var error_text_1 = require_error_text();
     var OneloError7 = class _OneloError extends Error {
       constructor(code, message) {
         super(message);
@@ -48,7 +256,7 @@ var require_types = __commonJS({
         this.name = "OneloError";
       }
       static notAuthenticated() {
-        return new _OneloError("not_authenticated", "User is not authenticated");
+        return new _OneloError("not_authenticated", (0, error_text_1.oneloErrorText)("notAuthenticated"));
       }
       static hostedFlowRequired() {
         return new _OneloError("hosted_flow_required", "This app requires the hosted sign-in flow. Use loadAuthView().");
@@ -66,15 +274,16 @@ var require_types = __commonJS({
        * The END USER has no active subscription (it lapsed or was cancelled) — the
        * backend cleared the session. This is NOT a config error and NOT an account
        * revocation: route the user to your store / upgrade flow to re-subscribe.
+       * #1079: the message is the App User's, in the Page Language.
        */
       static noActivePlan() {
-        return new _OneloError("no_active_plan", "[no_active_plan] No active subscription \u2014 the plan has expired or was cancelled. Route the user to your store / upgrade flow to re-subscribe.");
+        return new _OneloError("no_active_plan", (0, error_text_1.oneloErrorText)("noActivePlan"));
       }
       static invalidKey(msg) {
         return new _OneloError("invalid_publishable_key", `Invalid publishable key: ${msg}`);
       }
       static network(msg) {
-        return new _OneloError("network_error", `Network error: ${msg}`);
+        return new _OneloError("network_error", (0, error_text_1.oneloErrorText)("network", { detail: msg }));
       }
       static server(msg) {
         return new _OneloError("server_error", msg);
@@ -83,7 +292,7 @@ var require_types = __commonJS({
         return new _OneloError("timeout", msg);
       }
       static cancelled() {
-        return new _OneloError("cancelled", "Sign in was cancelled");
+        return new _OneloError("cancelled", (0, error_text_1.oneloErrorText)("cancelled"));
       }
       static revoked() {
         return new _OneloError("revoked", "This application has been revoked");
@@ -91,7 +300,7 @@ var require_types = __commonJS({
       /** The account was BANNED. Only a real ban may say "suspended" — never an
        *  ended or replaced session (see sessionEnded). */
       static userRevoked() {
-        return new _OneloError("user_revoked", "This user account has been suspended");
+        return new _OneloError("user_revoked", (0, error_text_1.oneloErrorText)("userRevoked"));
       }
       /**
        * The session is over — it expired, was replaced (`session_compromised`:
@@ -101,11 +310,11 @@ var require_types = __commonJS({
        * fired `onAuthStateChange(null)`.
        */
       static sessionEnded() {
-        return new _OneloError("session_ended", "Your session ended \u2014 please sign in again");
+        return new _OneloError("session_ended", (0, error_text_1.oneloErrorText)("sessionEnded"));
       }
       /** Email Verification (#819): at most 3 verification e-mails an hour. */
       static verificationRateLimited() {
-        return new _OneloError("verification_rate_limited", "At most 3 verification emails an hour \u2014 try again later");
+        return new _OneloError("verification_rate_limited", (0, error_text_1.oneloErrorText)("verificationRateLimited"));
       }
       /** Email Verification is Off for this App (Auth → Sign-up on the parent App). */
       static emailVerificationOff() {
@@ -118,7 +327,7 @@ var require_types = __commonJS({
       }
       /** The verification link was used, replaced by a newer one, or expired. */
       static invalidVerificationToken() {
-        return new _OneloError("invalid_verification_token", "This verification link is invalid, already used, replaced by a newer one, or expired");
+        return new _OneloError("invalid_verification_token", (0, error_text_1.oneloErrorText)("invalidVerificationToken"));
       }
     };
     exports2.OneloError = OneloError7;
@@ -644,62 +853,6 @@ var require_verification = __commonJS({
   }
 });
 
-// ../onelo-core/dist/marketing-consent.js
-var require_marketing_consent = __commonJS({
-  "../onelo-core/dist/marketing-consent.js"(exports2) {
-    "use strict";
-    Object.defineProperty(exports2, "__esModule", { value: true });
-    exports2.NO_SIGNUP_MARKETING_CONSENT = void 0;
-    exports2.signupMarketingConsentFromConfig = signupMarketingConsentFromConfig2;
-    exports2.deviceLanguage = deviceLanguage;
-    exports2.configLanguageParam = configLanguageParam2;
-    exports2.signUpConsentFields = signUpConsentFields2;
-    exports2.waitlistConsentField = waitlistConsentField2;
-    exports2.NO_SIGNUP_MARKETING_CONSENT = { asked: false, text: null, language: null };
-    function signupMarketingConsentFromConfig2(json) {
-      const raw = json["signup_marketing_consent"];
-      if (!raw || typeof raw !== "object")
-        return exports2.NO_SIGNUP_MARKETING_CONSENT;
-      return {
-        asked: raw["asked"] === true,
-        text: typeof raw["text"] === "string" ? raw["text"] : null,
-        language: typeof raw["language"] === "string" ? raw["language"] : null
-      };
-    }
-    function deviceLanguage() {
-      try {
-        const nav = globalThis.navigator;
-        if (nav?.language)
-          return nav.language;
-        const locale = Intl.DateTimeFormat().resolvedOptions().locale;
-        if (locale)
-          return locale;
-      } catch {
-      }
-      return "en";
-    }
-    function configLanguageParam2(language = deviceLanguage()) {
-      return `&lang=${encodeURIComponent(language)}`;
-    }
-    function signUpConsentFields2(options, question) {
-      if (options?.marketingConsent !== true)
-        return {};
-      return { marketing_consent: true, lang: question.language ?? deviceLanguage() };
-    }
-    function waitlistConsentField2(options) {
-      const consent = options?.consent;
-      if (!consent)
-        return {};
-      const out = {};
-      if (consent.marketing !== void 0)
-        out.marketing = consent.marketing === true;
-      if (consent.custom !== void 0)
-        out.custom = consent.custom === true;
-      return Object.keys(out).length > 0 ? { consent: out } : {};
-    }
-  }
-});
-
 // ../onelo-core/dist/index.js
 var require_dist = __commonJS({
   "../onelo-core/dist/index.js"(exports2) {
@@ -730,6 +883,8 @@ var require_dist = __commonJS({
     __exportStar(require_brand_tokens(), exports2);
     __exportStar(require_verification(), exports2);
     __exportStar(require_marketing_consent(), exports2);
+    __exportStar(require_page_language(), exports2);
+    __exportStar(require_error_text(), exports2);
   }
 });
 
@@ -788,7 +943,7 @@ var require_package = __commonJS({
   "package.json"(exports2, module2) {
     module2.exports = {
       name: "@onelo/react-native",
-      version: "0.55.0",
+      version: "0.60.0",
       description: "Onelo React Native SDK",
       main: "./dist/index.js",
       types: "./dist/index.d.ts",
@@ -965,12 +1120,12 @@ function _base64Decode(b64) {
   }
   return out;
 }
-var import_js_sha2562, import_core, TOKEN_KEY, EXPIRY_KEY, KEY_ID_KEY, INTEGRITY_TOKEN_KEY, INTEGRITY_EXPIRY_KEY, REFRESH_SKEW_MS, ATTEST_HTTP_TIMEOUT_MS, _cachedAttestToken, _cachedIntegrityToken, _activeAttest, _OneloAttest, OneloAttest;
+var import_js_sha2562, import_core3, TOKEN_KEY, EXPIRY_KEY, KEY_ID_KEY, INTEGRITY_TOKEN_KEY, INTEGRITY_EXPIRY_KEY, REFRESH_SKEW_MS, ATTEST_HTTP_TIMEOUT_MS, _cachedAttestToken, _cachedIntegrityToken, _activeAttest, _OneloAttest, OneloAttest;
 var init_attest = __esm({
   "src/attest.ts"() {
     "use strict";
     import_js_sha2562 = require("js-sha256");
-    import_core = __toESM(require_dist());
+    import_core3 = __toESM(require_dist());
     init_instance_id();
     TOKEN_KEY = "onelo.attest_token";
     EXPIRY_KEY = "onelo.attest_token_expiry";
@@ -1055,8 +1210,8 @@ var init_attest = __esm({
         }
         const native = this._native();
         if (!native) return;
-        const current = _cachedAttestToken ? await this._loadCached() : null;
-        if (current && !this._isNearExpiry(current.expiresAt)) return;
+        const current2 = _cachedAttestToken ? await this._loadCached() : null;
+        if (current2 && !this._isNearExpiry(current2.expiresAt)) return;
         await this._attestSingleFlight(native);
       }
       async _startAndroid() {
@@ -1080,8 +1235,8 @@ var init_attest = __esm({
       async _refreshIntegrityIfNeeded() {
         const native = this._native();
         if (!native?.prepareIntegrityToken || !native?.requestIntegrityToken) return;
-        const current = _cachedIntegrityToken ? await this._loadCachedIntegrity() : null;
-        if (current && !this._isNearExpiry(current.expiresAt)) return;
+        const current2 = _cachedIntegrityToken ? await this._loadCachedIntegrity() : null;
+        if (current2 && !this._isNearExpiry(current2.expiresAt)) return;
         await this._integritySingleFlight(native);
       }
       _integritySingleFlight(native) {
@@ -1117,7 +1272,7 @@ var init_attest = __esm({
        *  digest, freshness) is identical regardless of which SDK sent the token. */
       async _sendIntegrityToken(args) {
         const { status, json } = await _withTimeout2(
-          (0, import_core.httpPost)(
+          (0, import_core3.httpPost)(
             `${this.apiUrl}/api/sdk/auth/play-integrity`,
             {
               integrity_token: args.googleToken,
@@ -1268,7 +1423,7 @@ ${body}`;
       async _fetchSingleUseChallenge() {
         const url = `${this.apiUrl}/api/sdk/auth/assert-challenge?key=${encodeURIComponent(this.publishableKey)}`;
         const { status, json } = await _withTimeout2(
-          (0, import_core.httpGet)(url, { "X-Onelo-Instance-Id": await getInstanceId() }),
+          (0, import_core3.httpGet)(url, { "X-Onelo-Instance-Id": await getInstanceId() }),
           ATTEST_HTTP_TIMEOUT_MS,
           "assert-challenge"
         );
@@ -1298,7 +1453,7 @@ ${body}`;
        *  Swift `fetchChallenge`). */
       async _fetchChallenge() {
         const { status, json } = await _withTimeout2(
-          (0, import_core.httpGet)(
+          (0, import_core3.httpGet)(
             `${this.apiUrl}/api/sdk/auth/attest-challenge`,
             { "X-Onelo-Instance-Id": await getInstanceId() }
           ),
@@ -1318,7 +1473,7 @@ ${body}`;
        */
       async _sendAttestation(args) {
         const { status, json } = await _withTimeout2(
-          (0, import_core.httpPost)(
+          (0, import_core3.httpPost)(
             `${this.apiUrl}/api/sdk/auth/attest`,
             {
               attestation: args.attestation,
@@ -1508,7 +1663,7 @@ __export(index_exports, {
   OneloAuthGate: () => OneloAuthGate,
   OneloConsent: () => OneloConsent,
   OneloCustomerPortal: () => OneloCustomerPortal,
-  OneloError: () => import_core15.OneloError,
+  OneloError: () => import_core16.OneloError,
   OneloFeatures: () => OneloFeatures,
   OneloFeaturesError: () => OneloFeaturesError,
   OneloFeedback: () => OneloFeedback,
@@ -1516,8 +1671,8 @@ __export(index_exports, {
   OneloMonitor: () => OneloMonitor,
   OneloStore: () => OneloStore,
   OneloWaitlist: () => OneloWaitlist,
-  REASON_LABELS: () => import_core16.REASON_LABELS,
-  RESPONSE_REASON_CODES: () => import_core16.RESPONSE_REASON_CODES,
+  REASON_LABELS: () => import_core17.REASON_LABELS,
+  RESPONSE_REASON_CODES: () => import_core17.RESPONSE_REASON_CODES,
   StoreModal: () => StoreModal,
   StoreModalView: () => StoreModalView,
   parseConsentMessage: () => parseConsentMessage,
@@ -1594,7 +1749,7 @@ var PlanChangeRefresher = class {
 };
 
 // src/auth/auth.ts
-var import_core3 = __toESM(require_dist());
+var import_core5 = __toESM(require_dist());
 
 // src/core/pkce.ts
 var import_js_sha256 = require("js-sha256");
@@ -1623,6 +1778,326 @@ function base64urlEncode(bytes) {
 
 // src/auth/auth.ts
 init_storage();
+
+// src/core/page-language.ts
+var import_core = __toESM(require_dist());
+var PAGE_LANGUAGE_STORAGE_KEY = "onelo_page_language";
+var current = "en";
+function currentPageLanguage() {
+  return current;
+}
+function primarySubtag(tag) {
+  if (typeof tag !== "string") return null;
+  const primary = tag.trim().split(/[-_]/)[0]?.toLowerCase() ?? "";
+  return /^[a-z]{2,3}$/.test(primary) ? primary : null;
+}
+function adoptPageLanguage(answer) {
+  const lang = primarySubtag(answer);
+  if (!lang) return null;
+  current = lang;
+  (0, import_core.adoptPageLanguage)(lang);
+  return lang;
+}
+function requestLanguage(appLanguage, passed) {
+  const pick = (v) => typeof v === "string" && v.trim() ? v.trim() : null;
+  return pick(passed) ?? pick(appLanguage) ?? (0, import_core.deviceLanguage)();
+}
+function deviceLanguages() {
+  try {
+    const nav = globalThis.navigator;
+    const list = Array.isArray(nav?.languages) ? nav.languages.filter((t) => typeof t === "string" && primarySubtag(t) !== null) : [];
+    if (list.length > 0) return list;
+  } catch {
+  }
+  return [(0, import_core.deviceLanguage)()];
+}
+function acceptLanguage(tags = deviceLanguages()) {
+  const usable = tags.filter((t) => primarySubtag(t) !== null).slice(0, 6);
+  if (usable.length === 0) return null;
+  return usable.map((tag, i) => i === 0 ? tag : `${tag};q=${Math.max(0.1, 1 - i * 0.1).toFixed(1)}`).join(", ");
+}
+
+// src/core/texts.ts
+var import_core2 = __toESM(require_dist());
+var ONELO_TEXTS = {
+  en: {
+    signIn: "Sign In",
+    cancel: "Cancel",
+    retry: "Retry",
+    manageSubscription: "Manage Subscription",
+    back: "Back",
+    backButton: "\u2039 Back",
+    goBack: "Go back",
+    close: "Close",
+    closeFeedback: "Close feedback",
+    closeCheckout: "Close checkout",
+    closeCustomerPortal: "Close customer portal",
+    badgeNew: "New",
+    badgeBeta: "Beta",
+    badgeComingSoon: "Coming soon",
+    badgeAvailableIn: "Available in {plan}",
+    badgeUpgrade: "Change plan",
+    somethingWentWrong: "Something went wrong. Please try again.",
+    connectionProblem: "Couldn't connect. Check your internet connection and try again.",
+    linkOtherSignIn: "This sign-in link belongs to a different sign-in on this device. Open the sign-in again and request a new link.",
+    storeNotConfiguredContactSupport: "The store hasn't been configured yet. Please contact support.",
+    errorNotAuthenticated: "User is not authenticated",
+    errorCancelled: "Sign in was cancelled",
+    errorSessionEnded: "Your session ended \u2014 please sign in again",
+    errorUserRevoked: "This user account has been suspended",
+    errorNoActivePlan: "No active subscription \u2014 the plan has expired or was cancelled.",
+    errorInAppStoreNotAllowed: "Plans can't be purchased inside this app. Buyers purchase on the web and sign in here.",
+    errorVerificationRateLimited: "At most 3 verification emails an hour \u2014 try again later",
+    errorInvalidVerificationToken: "This verification link is invalid, already used, replaced by a newer one, or expired"
+  },
+  pl: {
+    signIn: "Zaloguj si\u0119",
+    cancel: "Anuluj",
+    retry: "Spr\xF3buj ponownie",
+    manageSubscription: "Zarz\u0105dzaj subskrypcj\u0105",
+    back: "Wstecz",
+    backButton: "\u2039 Wstecz",
+    goBack: "Wr\xF3\u0107",
+    close: "Zamknij",
+    closeFeedback: "Zamknij opinie",
+    closeCheckout: "Zamknij sklep",
+    closeCustomerPortal: "Zamknij portal klienta",
+    badgeNew: "Nowo\u015B\u0107",
+    badgeBeta: "Beta",
+    badgeComingSoon: "Wkr\xF3tce",
+    badgeAvailableIn: "Dost\u0119pne w planie {plan}",
+    badgeUpgrade: "Zmie\u0144 plan",
+    somethingWentWrong: "Co\u015B posz\u0142o nie tak. Spr\xF3buj ponownie.",
+    connectionProblem: "Nie uda\u0142o si\u0119 po\u0142\u0105czy\u0107. Sprawd\u017A po\u0142\u0105czenie z internetem i spr\xF3buj ponownie.",
+    linkOtherSignIn: "Ten link do logowania nale\u017Cy do innego logowania na tym urz\u0105dzeniu. Otw\xF3rz logowanie ponownie i popro\u015B o nowy link.",
+    storeNotConfiguredContactSupport: "Sklep nie zosta\u0142 jeszcze skonfigurowany. Skontaktuj si\u0119 z pomoc\u0105 techniczn\u0105.",
+    errorNotAuthenticated: "U\u017Cytkownik nie jest zalogowany",
+    errorCancelled: "Logowanie zosta\u0142o anulowane",
+    errorSessionEnded: "Twoja sesja si\u0119 zako\u0144czy\u0142a \u2014 zaloguj si\u0119 ponownie",
+    errorUserRevoked: "To konto u\u017Cytkownika zosta\u0142o zawieszone",
+    errorNoActivePlan: "Brak aktywnej subskrypcji \u2014 plan wygas\u0142 lub zosta\u0142 anulowany.",
+    errorInAppStoreNotAllowed: "W tej aplikacji nie mo\u017Cna kupi\u0107 planu. Kupuj\u0105cy kupuj\u0105 w przegl\u0105darce i loguj\u0105 si\u0119 tutaj.",
+    errorVerificationRateLimited: "Najwy\u017Cej 3 e-maile weryfikacyjne na godzin\u0119 \u2014 spr\xF3buj p\xF3\u017Aniej",
+    errorInvalidVerificationToken: "Ten link weryfikacyjny jest nieprawid\u0142owy, zosta\u0142 ju\u017C u\u017Cyty, zast\u0105piony nowszym albo wygas\u0142"
+  },
+  de: {
+    signIn: "Anmelden",
+    cancel: "Abbrechen",
+    retry: "Erneut versuchen",
+    manageSubscription: "Abo verwalten",
+    back: "Zur\xFCck",
+    backButton: "\u2039 Zur\xFCck",
+    goBack: "Zur\xFCck",
+    close: "Schlie\xDFen",
+    closeFeedback: "Feedback schlie\xDFen",
+    closeCheckout: "Shop schlie\xDFen",
+    closeCustomerPortal: "Kundenportal schlie\xDFen",
+    badgeNew: "Neu",
+    badgeBeta: "Beta",
+    badgeComingSoon: "Demn\xE4chst verf\xFCgbar",
+    badgeAvailableIn: "Verf\xFCgbar im Plan {plan}",
+    badgeUpgrade: "Plan \xE4ndern",
+    somethingWentWrong: "Etwas ist schiefgelaufen. Bitte versuchen Sie es erneut.",
+    connectionProblem: "Keine Verbindung m\xF6glich. Bitte pr\xFCfen Sie Ihre Internetverbindung und versuchen Sie es erneut.",
+    linkOtherSignIn: "Dieser Anmeldelink geh\xF6rt zu einer anderen Anmeldung auf diesem Ger\xE4t. \xD6ffnen Sie die Anmeldung erneut und fordern Sie einen neuen Link an.",
+    storeNotConfiguredContactSupport: "Der Shop ist noch nicht eingerichtet. Bitte wenden Sie sich an den Support.",
+    errorNotAuthenticated: "Der Benutzer ist nicht angemeldet",
+    errorCancelled: "Die Anmeldung wurde abgebrochen",
+    errorSessionEnded: "Ihre Sitzung ist abgelaufen \u2014 bitte melden Sie sich erneut an",
+    errorUserRevoked: "Dieses Benutzerkonto wurde gesperrt",
+    errorNoActivePlan: "Kein aktives Abonnement \u2014 der Plan ist abgelaufen oder wurde gek\xFCndigt.",
+    errorInAppStoreNotAllowed: "In dieser App k\xF6nnen keine Pl\xE4ne gekauft werden. K\xE4ufer kaufen im Web und melden sich hier an.",
+    errorVerificationRateLimited: "H\xF6chstens 3 Best\xE4tigungs-E-Mails pro Stunde \u2014 bitte versuchen Sie es sp\xE4ter erneut",
+    errorInvalidVerificationToken: "Dieser Best\xE4tigungslink ist ung\xFCltig, wurde bereits verwendet, durch einen neueren ersetzt oder ist abgelaufen"
+  },
+  fr: {
+    signIn: "Se connecter",
+    cancel: "Annuler",
+    retry: "R\xE9essayer",
+    manageSubscription: "G\xE9rer l\u2019abonnement",
+    back: "Retour",
+    backButton: "\u2039 Retour",
+    goBack: "Revenir en arri\xE8re",
+    close: "Fermer",
+    closeFeedback: "Fermer les commentaires",
+    closeCheckout: "Fermer la boutique",
+    closeCustomerPortal: "Fermer le portail client",
+    badgeNew: "Nouveau",
+    badgeBeta: "B\xEAta",
+    badgeComingSoon: "Bient\xF4t disponible",
+    badgeAvailableIn: "Disponible avec le plan {plan}",
+    badgeUpgrade: "Changer de plan",
+    somethingWentWrong: "Une erreur s\u2019est produite. Veuillez r\xE9essayer.",
+    connectionProblem: "Connexion impossible. V\xE9rifiez votre connexion Internet et r\xE9essayez.",
+    linkOtherSignIn: "Ce lien de connexion appartient \xE0 une autre connexion sur cet appareil. Rouvrez la connexion et demandez un nouveau lien.",
+    storeNotConfiguredContactSupport: "La boutique n\u2019est pas encore configur\xE9e. Veuillez contacter l\u2019assistance.",
+    errorNotAuthenticated: "L\u2019utilisateur n\u2019est pas connect\xE9",
+    errorCancelled: "La connexion a \xE9t\xE9 annul\xE9e",
+    errorSessionEnded: "Votre session a pris fin \u2014 veuillez vous reconnecter",
+    errorUserRevoked: "Ce compte utilisateur a \xE9t\xE9 suspendu",
+    errorNoActivePlan: "Aucun abonnement actif \u2014 le plan a expir\xE9 ou a \xE9t\xE9 r\xE9sili\xE9.",
+    errorInAppStoreNotAllowed: "Aucun plan ne peut \xEAtre achet\xE9 dans cette application. Les acheteurs ach\xE8tent sur le web et se connectent ici.",
+    errorVerificationRateLimited: "3 e-mails de v\xE9rification par heure au maximum \u2014 r\xE9essayez plus tard",
+    errorInvalidVerificationToken: "Ce lien de v\xE9rification n\u2019est pas valide, a d\xE9j\xE0 \xE9t\xE9 utilis\xE9, a \xE9t\xE9 remplac\xE9 par un plus r\xE9cent ou a expir\xE9"
+  },
+  es: {
+    signIn: "Iniciar sesi\xF3n",
+    cancel: "Cancelar",
+    retry: "Reintentar",
+    manageSubscription: "Gestionar suscripci\xF3n",
+    back: "Atr\xE1s",
+    backButton: "\u2039 Atr\xE1s",
+    goBack: "Volver",
+    close: "Cerrar",
+    closeFeedback: "Cerrar comentarios",
+    closeCheckout: "Cerrar la tienda",
+    closeCustomerPortal: "Cerrar el portal de cliente",
+    badgeNew: "Nuevo",
+    badgeBeta: "Beta",
+    badgeComingSoon: "Pr\xF3ximamente",
+    badgeAvailableIn: "Disponible en el plan {plan}",
+    badgeUpgrade: "Cambiar plan",
+    somethingWentWrong: "Algo ha salido mal. Int\xE9ntalo de nuevo.",
+    connectionProblem: "No se ha podido conectar. Comprueba tu conexi\xF3n a internet e int\xE9ntalo de nuevo.",
+    linkOtherSignIn: "Este enlace de inicio de sesi\xF3n pertenece a otro inicio de sesi\xF3n en este dispositivo. Vuelve a abrir el inicio de sesi\xF3n y solicita un nuevo enlace.",
+    storeNotConfiguredContactSupport: "La tienda a\xFAn no est\xE1 configurada. Ponte en contacto con el soporte.",
+    errorNotAuthenticated: "El usuario no ha iniciado sesi\xF3n",
+    errorCancelled: "Se ha cancelado el inicio de sesi\xF3n",
+    errorSessionEnded: "Tu sesi\xF3n ha terminado \u2014 vuelve a iniciar sesi\xF3n",
+    errorUserRevoked: "Esta cuenta de usuario ha sido suspendida",
+    errorNoActivePlan: "No hay ninguna suscripci\xF3n activa \u2014 el plan ha caducado o se ha cancelado.",
+    errorInAppStoreNotAllowed: "No se pueden comprar planes dentro de esta aplicaci\xF3n. Los compradores compran en la web e inician sesi\xF3n aqu\xED.",
+    errorVerificationRateLimited: "Como m\xE1ximo 3 correos de verificaci\xF3n por hora \u2014 int\xE9ntalo m\xE1s tarde",
+    errorInvalidVerificationToken: "Este enlace de verificaci\xF3n no es v\xE1lido, ya se ha usado, se ha sustituido por uno m\xE1s reciente o ha caducado"
+  },
+  it: {
+    signIn: "Accedi",
+    cancel: "Annulla",
+    retry: "Riprova",
+    manageSubscription: "Gestisci abbonamento",
+    back: "Indietro",
+    backButton: "\u2039 Indietro",
+    goBack: "Torna indietro",
+    close: "Chiudi",
+    closeFeedback: "Chiudi feedback",
+    closeCheckout: "Chiudi il negozio",
+    closeCustomerPortal: "Chiudi il portale clienti",
+    badgeNew: "Novit\xE0",
+    badgeBeta: "Beta",
+    badgeComingSoon: "Prossimamente",
+    badgeAvailableIn: "Disponibile nel piano {plan}",
+    badgeUpgrade: "Cambia piano",
+    somethingWentWrong: "Si \xE8 verificato un problema. Riprova.",
+    connectionProblem: "Impossibile connettersi. Controlla la connessione a internet e riprova.",
+    linkOtherSignIn: "Questo link di accesso appartiene a un altro accesso su questo dispositivo. Apri di nuovo l\u2019accesso e richiedi un nuovo link.",
+    storeNotConfiguredContactSupport: "Lo store non \xE8 ancora configurato. Contatta l\u2019assistenza.",
+    errorNotAuthenticated: "L\u2019utente non ha effettuato l\u2019accesso",
+    errorCancelled: "L\u2019accesso \xE8 stato annullato",
+    errorSessionEnded: "La tua sessione \xE8 terminata \u2014 accedi di nuovo",
+    errorUserRevoked: "Questo account utente \xE8 stato sospeso",
+    errorNoActivePlan: "Nessun abbonamento attivo \u2014 il piano \xE8 scaduto o \xE8 stato annullato.",
+    errorInAppStoreNotAllowed: "In questa app non \xE8 possibile acquistare piani. Gli acquirenti acquistano sul web e accedono qui.",
+    errorVerificationRateLimited: "Al massimo 3 e-mail di verifica all\u2019ora \u2014 riprova pi\xF9 tardi",
+    errorInvalidVerificationToken: "Questo link di verifica non \xE8 valido, \xE8 gi\xE0 stato usato, \xE8 stato sostituito da uno pi\xF9 recente o \xE8 scaduto"
+  },
+  pt: {
+    signIn: "Iniciar sess\xE3o",
+    cancel: "Cancelar",
+    retry: "Tentar novamente",
+    manageSubscription: "Gerir subscri\xE7\xE3o",
+    back: "Voltar",
+    backButton: "\u2039 Voltar",
+    goBack: "Voltar atr\xE1s",
+    close: "Fechar",
+    closeFeedback: "Fechar coment\xE1rios",
+    closeCheckout: "Fechar a loja",
+    closeCustomerPortal: "Fechar o portal do cliente",
+    badgeNew: "Novo",
+    badgeBeta: "Beta",
+    badgeComingSoon: "Brevemente",
+    badgeAvailableIn: "Dispon\xEDvel no plano {plan}",
+    badgeUpgrade: "Mudar de plano",
+    somethingWentWrong: "Ocorreu um erro. Tente novamente.",
+    connectionProblem: "N\xE3o foi poss\xEDvel estabelecer liga\xE7\xE3o. Verifique a sua liga\xE7\xE3o \xE0 internet e tente novamente.",
+    linkOtherSignIn: "Este link de in\xEDcio de sess\xE3o pertence a outro in\xEDcio de sess\xE3o neste dispositivo. Abra novamente o in\xEDcio de sess\xE3o e pe\xE7a um novo link.",
+    storeNotConfiguredContactSupport: "A loja ainda n\xE3o foi configurada. Contacte o apoio ao cliente.",
+    errorNotAuthenticated: "O utilizador n\xE3o iniciou sess\xE3o",
+    errorCancelled: "O in\xEDcio de sess\xE3o foi cancelado",
+    errorSessionEnded: "A sua sess\xE3o terminou \u2014 inicie sess\xE3o novamente",
+    errorUserRevoked: "Esta conta de utilizador foi suspensa",
+    errorNoActivePlan: "Nenhuma subscri\xE7\xE3o ativa \u2014 o plano expirou ou foi cancelado.",
+    errorInAppStoreNotAllowed: "N\xE3o \xE9 poss\xEDvel comprar planos nesta aplica\xE7\xE3o. Os compradores compram na web e iniciam sess\xE3o aqui.",
+    errorVerificationRateLimited: "No m\xE1ximo 3 e-mails de verifica\xE7\xE3o por hora \u2014 tente mais tarde",
+    errorInvalidVerificationToken: "Este link de verifica\xE7\xE3o \xE9 inv\xE1lido, j\xE1 foi utilizado, foi substitu\xEDdo por um mais recente ou expirou"
+  },
+  nl: {
+    signIn: "Inloggen",
+    cancel: "Annuleren",
+    retry: "Opnieuw proberen",
+    manageSubscription: "Abonnement beheren",
+    back: "Terug",
+    backButton: "\u2039 Terug",
+    goBack: "Ga terug",
+    close: "Sluiten",
+    closeFeedback: "Feedback sluiten",
+    closeCheckout: "Winkel sluiten",
+    closeCustomerPortal: "Klantportaal sluiten",
+    badgeNew: "Nieuw",
+    badgeBeta: "B\xE8ta",
+    badgeComingSoon: "Binnenkort beschikbaar",
+    badgeAvailableIn: "Beschikbaar in het plan {plan}",
+    badgeUpgrade: "Plan wijzigen",
+    somethingWentWrong: "Er is iets misgegaan. Probeer het opnieuw.",
+    connectionProblem: "Kan geen verbinding maken. Controleer je internetverbinding en probeer het opnieuw.",
+    linkOtherSignIn: "Deze inloglink hoort bij een andere inlogpoging op dit apparaat. Open het inloggen opnieuw en vraag een nieuwe link aan.",
+    storeNotConfiguredContactSupport: "De winkel is nog niet ingesteld. Neem contact op met de ondersteuning.",
+    errorNotAuthenticated: "De gebruiker is niet ingelogd",
+    errorCancelled: "Inloggen is geannuleerd",
+    errorSessionEnded: "Je sessie is be\xEBindigd \u2014 log opnieuw in",
+    errorUserRevoked: "Dit gebruikersaccount is opgeschort",
+    errorNoActivePlan: "Geen actief abonnement \u2014 het abonnement is verlopen of opgezegd.",
+    errorInAppStoreNotAllowed: "In deze app kunnen geen abonnementen worden gekocht. Kopers kopen op het web en loggen hier in.",
+    errorVerificationRateLimited: "Maximaal 3 verificatie-e-mails per uur \u2014 probeer het later opnieuw",
+    errorInvalidVerificationToken: "Deze verificatielink is ongeldig, al gebruikt, vervangen door een nieuwere of verlopen"
+  }
+};
+function oneloText(key, vars = {}, language = currentPageLanguage()) {
+  const lang = primarySubtag(language) ?? "en";
+  const raw = (ONELO_TEXTS[lang] ?? ONELO_TEXTS.en)[key];
+  return vars.plan === void 0 ? raw : raw.replace("{plan}", vars.plan);
+}
+var APP_USER_ERROR_TEXT = {
+  not_authenticated: "errorNotAuthenticated",
+  cancelled: "errorCancelled",
+  session_ended: "errorSessionEnded",
+  user_revoked: "errorUserRevoked",
+  no_active_plan: "errorNoActivePlan",
+  in_app_store_not_allowed: "errorInAppStoreNotAllowed",
+  verification_rate_limited: "errorVerificationRateLimited",
+  invalid_verification_token: "errorInvalidVerificationToken",
+  network_error: "connectionProblem",
+  timeout: "connectionProblem"
+};
+var APP_USER_TEXT = /* @__PURE__ */ Symbol.for("onelo.appUserText");
+function withAppUserText(error, key) {
+  ;
+  error[APP_USER_TEXT] = key;
+  return error;
+}
+function appUserMessage(error, context = "sign-in") {
+  console.warn(`[Onelo] ${context}: ${error instanceof Error ? error.message : String(error)}`);
+  const marked = error !== null && typeof error === "object" ? error[APP_USER_TEXT] : void 0;
+  if (marked) return oneloText(marked);
+  if (error instanceof import_core2.OneloError) {
+    return oneloText(APP_USER_ERROR_TEXT[error.code] ?? "somethingWentWrong");
+  }
+  if (error instanceof TypeError && /network request failed/i.test(error.message)) {
+    return oneloText("connectionProblem");
+  }
+  return oneloText("somethingWentWrong");
+}
+
+// src/auth/auth.ts
 init_sdk_headers();
 init_attest();
 
@@ -1756,10 +2231,10 @@ function openInSystemBrowser(Linking, url, onError) {
 var import_react = __toESM(require("react"));
 
 // src/core/brand.ts
-var import_core2 = __toESM(require_dist());
+var import_core4 = __toESM(require_dist());
 function resolveModalTokens(tokens, backgroundColor) {
   if (tokens) return tokens;
-  return backgroundColor ? (0, import_core2.brandTokensFromLegacy)(null, backgroundColor) : import_core2.NEUTRAL_BRAND_TOKENS;
+  return backgroundColor ? (0, import_core4.brandTokensFromLegacy)(null, backgroundColor) : import_core4.NEUTRAL_BRAND_TOKENS;
 }
 function chromeStyles(t) {
   return {
@@ -1767,7 +2242,7 @@ function chromeStyles(t) {
     webview: { flex: 1, backgroundColor: t.page_bg },
     errorContainer: { flex: 1, justifyContent: "center", alignItems: "center", gap: 16, padding: 32, backgroundColor: t.page_bg },
     errorTitle: { color: t.text, fontSize: 17, fontWeight: "600", textAlign: "center" },
-    errorText: { color: (0, import_core2.statusColor)(t, "danger"), fontSize: 13, textAlign: "center" },
+    errorText: { color: (0, import_core4.statusColor)(t, "danger"), fontSize: 13, textAlign: "center" },
     retryButton: { backgroundColor: t.button_bg, paddingHorizontal: 32, paddingVertical: 14, borderRadius: t.button_radius },
     retryText: { color: t.button_text, fontSize: 16, fontWeight: "600" },
     cancelButton: { paddingHorizontal: 32, paddingVertical: 14 },
@@ -1793,7 +2268,7 @@ function chromeStyles(t) {
 }
 function skeletonBlockCss(t) {
   const sweep = `background-image:linear-gradient(90deg,transparent 0%,${t.spinner_track} 50%,transparent 100%);background-size:60vw 100%;background-repeat:no-repeat;background-position:-100vw 0`;
-  return `.onelo-skel{background-color:${(0, import_core2.skeletonSoftFill)(t)};${sweep};border-radius:${t.field_radius}px}
+  return `.onelo-skel{background-color:${(0, import_core4.skeletonSoftFill)(t)};${sweep};border-radius:${t.field_radius}px}
 .onelo-skel-strong{background-color:${t.border};${sweep};border-radius:${t.field_radius}px}`;
 }
 
@@ -2166,7 +2641,7 @@ function AuthModal({ visible, hostedUrl, onResult, apiUrl, tokens, backgroundCol
           style: styles.closeButton,
           onPress: handleBackOrCancel,
           accessibilityRole: "button",
-          accessibilityLabel: canGoBack ? "Back" : "Close",
+          accessibilityLabel: oneloText(canGoBack ? "back" : "close"),
           hitSlop: { top: 8, bottom: 8, left: 8, right: 8 }
         },
         import_react2.default.createElement(Text, { style: styles.closeText }, "\u2715")
@@ -2177,12 +2652,12 @@ function AuthModal({ visible, hostedUrl, onResult, apiUrl, tokens, backgroundCol
         import_react2.default.createElement(
           TouchableOpacity,
           { style: styles.retryButton, onPress: handleRetry },
-          import_react2.default.createElement(Text, { style: styles.retryText }, "Sign In")
+          import_react2.default.createElement(Text, { style: styles.retryText }, oneloText("signIn"))
         ),
         import_react2.default.createElement(
           TouchableOpacity,
           { style: styles.cancelButton, onPress: handleCancel },
-          import_react2.default.createElement(Text, { style: styles.cancelText }, "Cancel")
+          import_react2.default.createElement(Text, { style: styles.cancelText }, oneloText("cancel"))
         )
       )
     )
@@ -2211,7 +2686,7 @@ var _OneloAuth = class _OneloAuth {
     this._launchUrlHandled = false;
     this.resolvedConfig = null;
     /** The SDK's one brand-token model (#681), shared with every module. */
-    this.brand = new import_core3.BrandSource();
+    this.brand = new import_core5.BrandSource();
     this.heartbeatTimer = null;
     this.refreshTimer = null;
     this.refreshRetryAttempt = 0;
@@ -2270,6 +2745,7 @@ var _OneloAuth = class _OneloAuth {
     this.publishableKey = config.publishableKey;
     this.bundleId = config.bundleId;
     this._callbackScheme = config.callbackScheme || CALLBACK_SCHEME2;
+    this._language = config.language;
     this.storage = new KeychainStorage();
     if (!config.bundleId) {
       void getNativeBundleId().then((nb) => {
@@ -2338,16 +2814,30 @@ var _OneloAuth = class _OneloAuth {
     }
   }
   async initialize() {
+    let answered = false;
+    const restoreLanguage = Promise.resolve().then(() => this.storage.get(PAGE_LANGUAGE_STORAGE_KEY)).then((kept) => {
+      if (!answered) adoptPageLanguage(kept);
+    }).catch(() => {
+    });
     try {
       const verifier = generateCodeVerifier();
       this.pkceVerifier = verifier;
       const challenge = generateCodeChallenge(verifier);
-      const url = `${this.apiUrl}/api/sdk/config?key=${encodeURIComponent(this.publishableKey)}&code_challenge=${encodeURIComponent(challenge)}${(0, import_core3.configLanguageParam)()}`;
-      const { status, json } = await (0, import_core3.httpGet)(url, await this._secHeaders());
-      if (status === 401 || status === 404) throw import_core3.OneloError.invalidKey("Server rejected the key");
-      if (status !== 200) throw import_core3.OneloError.server(`Config request failed: HTTP ${status}`);
+      const url = `${this.apiUrl}/api/sdk/config?key=${encodeURIComponent(this.publishableKey)}&code_challenge=${encodeURIComponent(challenge)}${(0, import_core5.configLanguageParam)(this.requestLanguage())}`;
+      const headers = await this._secHeaders();
+      const accept = acceptLanguage();
+      if (accept) headers["Accept-Language"] = accept;
+      const { status, json } = await (0, import_core5.httpGet)(url, headers);
+      if (status === 401 || status === 404) throw import_core5.OneloError.invalidKey("Server rejected the key");
+      if (status !== 200) throw import_core5.OneloError.server(`Config request failed: HTTP ${status}`);
       const j = json;
-      const brandTokens = (0, import_core3.brandTokensFromResponse)(j) ?? import_core3.NEUTRAL_BRAND_TOKENS;
+      const lang = adoptPageLanguage(j["page_language"]);
+      if (lang) {
+        answered = true;
+        void this.storage.set(PAGE_LANGUAGE_STORAGE_KEY, lang).catch(() => {
+        });
+      }
+      const brandTokens = (0, import_core5.brandTokensFromResponse)(j) ?? import_core5.NEUTRAL_BRAND_TOKENS;
       this.brand.set(brandTokens);
       this.resolvedConfig = {
         supabaseUrl: j["supabase_url"],
@@ -2370,7 +2860,7 @@ var _OneloAuth = class _OneloAuth {
         oauthProviders: Array.isArray(j["oauth_providers"]) ? j["oauth_providers"] : void 0,
         // #948: the sign-in skeleton draws the magic-link row from this.
         magicLinkEnabled: j["magic_link_enabled"] === true,
-        signupMarketingConsent: (0, import_core3.signupMarketingConsentFromConfig)(j)
+        signupMarketingConsent: (0, import_core5.signupMarketingConsentFromConfig)(j)
       };
       this.attestRequired = j["attest_required"] ?? false;
       const cpn = j["cloud_project_number"];
@@ -2386,10 +2876,25 @@ var _OneloAuth = class _OneloAuth {
       console.warn(
         "[Onelo] SDK initialization failed \u2014 auth, attestation and config-gated features are disabled until this is fixed: " + msg
       );
-      if (e instanceof import_core3.OneloError && e.code === "invalid_publishable_key") {
+      if (e instanceof import_core5.OneloError && e.code === "invalid_publishable_key") {
         this.isRevoked = true;
       }
+      await restoreLanguage;
     }
+  }
+  /** #1076 — the App User's Page Language (ADR-0043) the SDK's own texts are
+   *  drawn in ('Sign In', 'Cancel', 'Close feedback', the feature badges, the
+   *  retry screen): `config.language` when it is one of the App Languages,
+   *  else the device language when it is one, else the App's default — chosen
+   *  by the backend in `/api/sdk/config` and kept for the next launch. `'en'`
+   *  until the first answer. The same language as the Hosted Pages. */
+  get pageLanguage() {
+    return currentPageLanguage();
+  }
+  /** The language a Page Language request sends: `lang` passed for this call,
+   *  else the App's `config.language`, else the device language. */
+  requestLanguage(lang) {
+    return requestLanguage(this._language, lang);
   }
   async whenReady() {
     await this.initPromise;
@@ -2397,7 +2902,7 @@ var _OneloAuth = class _OneloAuth {
   // ── Hosted flow ─────────────────────────────────────────────────────────────
   async loadAuthView() {
     await this.initPromise;
-    if (this.isRevoked) throw import_core3.OneloError.invalidKey("Application key has been revoked");
+    if (this.isRevoked) throw import_core5.OneloError.invalidKey("Application key has been revoked");
     let decision = null;
     const { status, json } = await this._flowInit();
     if (status !== 404 && status !== 405) decision = this._decisionFromFlow(status, json);
@@ -2417,7 +2922,7 @@ var _OneloAuth = class _OneloAuth {
           return;
         }
         if (result.type === "error") {
-          reject(import_core3.OneloError.server(result.message));
+          reject(import_core5.OneloError.server(result.message));
           return;
         }
         if (result.type === "expired") {
@@ -2449,8 +2954,8 @@ var _OneloAuth = class _OneloAuth {
    * body `{publishableKey, code, code_verifier}` (PKCE snake even in a camel body).
    */
   async exchangeHostedCode(code) {
-    const verifier = this.flowVerifier ?? await this.storage.get(import_core3.TOKEN_KEYS.MAGIC_LINK_VERIFIER);
-    const { status, json } = await (0, import_core3.httpPost)(
+    const verifier = this.flowVerifier ?? await this.storage.get(import_core5.TOKEN_KEYS.MAGIC_LINK_VERIFIER);
+    const { status, json } = await (0, import_core5.httpPost)(
       `${this.apiUrl}/api/sdk/auth/hosted-callback`,
       { publishableKey: this.publishableKey, code, code_verifier: verifier },
       await this._secHeaders()
@@ -2458,15 +2963,15 @@ var _OneloAuth = class _OneloAuth {
     if (status !== 200) {
       const detail = json?.["detail"];
       if (detail === "code_verifier required" || detail === "PKCE verification failed") {
-        throw import_core3.OneloError.server(
+        throw withAppUserText(import_core5.OneloError.server(
           "This sign-in link belongs to a different sign-in on this device. Open the sign-in again and request a new link."
-        );
+        ), "linkOtherSignIn");
       }
-      throw import_core3.OneloError.server(`Hosted callback failed: ${typeof detail === "string" ? detail : `HTTP ${status}`}`);
+      throw import_core5.OneloError.server(`Hosted callback failed: ${typeof detail === "string" ? detail : `HTTP ${status}`}`);
     }
     this.flowVerifier = null;
-    await this.storage.delete(import_core3.TOKEN_KEYS.MAGIC_LINK_VERIFIER);
-    const session = (0, import_core3.mapSession)(json);
+    await this.storage.delete(import_core5.TOKEN_KEYS.MAGIC_LINK_VERIFIER);
+    const session = (0, import_core5.mapSession)(json);
     await this.saveSession(session);
     return session;
   }
@@ -2486,14 +2991,14 @@ var _OneloAuth = class _OneloAuth {
     };
   }
   async getHostedUrl() {
-    const { status, json } = await (0, import_core3.httpGet)(
+    const { status, json } = await (0, import_core5.httpGet)(
       `${this.apiUrl}/api/sdk/auth/initiate?key=${encodeURIComponent(this.publishableKey)}&callback_scheme=${this._callbackScheme}`,
       await this._secHeaders()
     );
-    if (status !== 200) throw import_core3.OneloError.server("Failed to initiate hosted auth flow");
+    if (status !== 200) throw import_core5.OneloError.server("Failed to initiate hosted auth flow");
     const j = json;
     const hostedUrl = j["hosted_url"];
-    if (!hostedUrl) throw import_core3.OneloError.server("Invalid initiate response");
+    if (!hostedUrl) throw import_core5.OneloError.server("Invalid initiate response");
     if (j["app_name"]) this.appName = j["app_name"];
     if (j["app_logo_url"]) this.appLogoUrl = j["app_logo_url"];
     return hostedUrl;
@@ -2508,6 +3013,10 @@ var _OneloAuth = class _OneloAuth {
    * dedicated code for (mirrors the JS SDK). Public so a Round 2 content-gate /
    * accessory WebView can reuse the same centralised decision. Parity with Swift
    * `resolveFlow` and JS `resolveFlow`.
+   *
+   * @param lang  The App's language for the sign-in page. Omitted, the
+   *   `language` from the config is sent, else the device language (#1039,
+   *   #1076); the backend picks the Page Language.
    */
   async resolveFlow(lang) {
     const { status, json } = await this._flowInit(lang);
@@ -2521,9 +3030,9 @@ var _OneloAuth = class _OneloAuth {
     const existing = await this.getSession();
     const headers = await this._secHeaders();
     if (existing?.accessToken) headers["Authorization"] = `Bearer ${existing.accessToken}`;
-    const langParam = lang ? `&lang=${encodeURIComponent(lang)}` : "";
+    const langParam = `&lang=${encodeURIComponent(this.requestLanguage(lang))}`;
     const challenge = await this._beginFlowPkce();
-    const { status, json } = await (0, import_core3.httpGet)(
+    const { status, json } = await (0, import_core5.httpGet)(
       `${this.apiUrl}/api/sdk/flow/init?key=${encodeURIComponent(this.publishableKey)}&callback_scheme=${this._callbackScheme}&code_challenge=${encodeURIComponent(challenge)}${langParam}`,
       headers
     );
@@ -2543,7 +3052,7 @@ var _OneloAuth = class _OneloAuth {
   async _beginFlowPkce() {
     const verifier = generateCodeVerifier();
     this.flowVerifier = verifier;
-    await this.storage.set(import_core3.TOKEN_KEYS.MAGIC_LINK_VERIFIER, verifier);
+    await this.storage.set(import_core5.TOKEN_KEYS.MAGIC_LINK_VERIFIER, verifier);
     return generateCodeChallenge(verifier);
   }
   /** Map a `/flow/init` response to a FlowDecision, throwing on any non-200. */
@@ -2551,7 +3060,8 @@ var _OneloAuth = class _OneloAuth {
     if (status !== 200) {
       const detail = j["detail"];
       const reason = typeof detail === "string" ? detail : j["error"] ?? `HTTP ${status}`;
-      throw import_core3.OneloError.server(`Failed to resolve auth flow: ${reason}`);
+      const error = import_core5.OneloError.server(`Failed to resolve auth flow: ${reason}`);
+      throw reason === "store_not_configured" ? withAppUserText(error, "storeNotConfiguredContactSupport") : error;
     }
     if (j["action"] === "authorized") return { action: "authorized" };
     if (j["action"] === "present" && typeof j["url"] === "string") {
@@ -2561,29 +3071,29 @@ var _OneloAuth = class _OneloAuth {
       if (appLogo) this.appLogoUrl = appLogo;
       return { action: "present", surface: String(j["surface"] ?? ""), url: j["url"], appName, appLogo };
     }
-    throw import_core3.OneloError.server("Invalid flow response");
+    throw import_core5.OneloError.server("Invalid flow response");
   }
   // ── Custom UI (paid plans only) ─────────────────────────────────────────────
   async signIn(email, password) {
     await this.initPromise;
     await this._awaitAttestReady();
-    if (!this.allowCustomBranding) throw import_core3.OneloError.planRequired();
+    if (!this.allowCustomBranding) throw import_core5.OneloError.planRequired();
     if (!this.pkceVerifier) this.pkceVerifier = generateCodeVerifier();
-    const { status, json } = await (0, import_core3.httpPost)(
+    const { status, json } = await (0, import_core5.httpPost)(
       `${this.apiUrl}/api/sdk/auth/signin`,
       { email, password, publishableKey: this.publishableKey, code_verifier: this.pkceVerifier },
       await this._secHeaders()
     );
-    (0, import_core3.checkHostedFlowRequired)(json);
+    (0, import_core5.checkHostedFlowRequired)(json);
     const j = json;
     if (status === 403) {
       const detail = j["detail"];
-      if (detail?.["error"] === "user_revoked") throw import_core3.OneloError.userRevoked();
-      throw import_core3.OneloError.server(detail?.["message"] ?? j["error"]);
+      if (detail?.["error"] === "user_revoked") throw import_core5.OneloError.userRevoked();
+      throw import_core5.OneloError.server(detail?.["message"] ?? j["error"]);
     }
-    if (status !== 200) throw import_core3.OneloError.server(`Sign in failed: HTTP ${status}`);
+    if (status !== 200) throw import_core5.OneloError.server(`Sign in failed: HTTP ${status}`);
     this.pkceVerifier = null;
-    const session = (0, import_core3.mapSession)(j);
+    const session = (0, import_core5.mapSession)(j);
     await this.saveSession(session);
     return session;
   }
@@ -2594,14 +3104,14 @@ var _OneloAuth = class _OneloAuth {
    * unticked and pass the person's choice to `signUp(..., { marketingConsent })`.
    */
   getSignupMarketingConsent() {
-    return this.resolvedConfig?.signupMarketingConsent ?? import_core3.NO_SIGNUP_MARKETING_CONSENT;
+    return this.resolvedConfig?.signupMarketingConsent ?? import_core5.NO_SIGNUP_MARKETING_CONSENT;
   }
   async signUp(email, password, options) {
     await this.initPromise;
     await this._awaitAttestReady();
-    if (!this.allowCustomBranding) throw import_core3.OneloError.planRequired();
+    if (!this.allowCustomBranding) throw import_core5.OneloError.planRequired();
     if (!this.pkceVerifier) this.pkceVerifier = generateCodeVerifier();
-    const { status, json } = await (0, import_core3.httpPost)(
+    const { status, json } = await (0, import_core5.httpPost)(
       `${this.apiUrl}/api/sdk/auth/signup`,
       {
         email,
@@ -2609,15 +3119,15 @@ var _OneloAuth = class _OneloAuth {
         publishableKey: this.publishableKey,
         code_verifier: this.pkceVerifier,
         // #818: only when the person ticked it, in the language of the text shown.
-        ...(0, import_core3.signUpConsentFields)(options, this.getSignupMarketingConsent())
+        ...(0, import_core5.signUpConsentFields)(options, this.getSignupMarketingConsent())
       },
       await this._secHeaders()
     );
-    (0, import_core3.checkHostedFlowRequired)(json);
+    (0, import_core5.checkHostedFlowRequired)(json);
     const j = json;
-    if (status !== 200) throw import_core3.OneloError.server(`Sign up failed: HTTP ${status}`);
+    if (status !== 200) throw import_core5.OneloError.server(`Sign up failed: HTTP ${status}`);
     this.pkceVerifier = null;
-    const session = (0, import_core3.mapSession)(j);
+    const session = (0, import_core5.mapSession)(j);
     await this.saveSession(session);
     return session;
   }
@@ -2626,7 +3136,7 @@ var _OneloAuth = class _OneloAuth {
     this.signOutEpoch++;
     this.stopHeartbeat();
     this.clearRefreshTimer();
-    const accessToken = await this.storage.get(import_core3.TOKEN_KEYS.ACCESS_TOKEN);
+    const accessToken = await this.storage.get(import_core5.TOKEN_KEYS.ACCESS_TOKEN);
     await this.storage.clear();
     this.notifyListeners(null);
     if (accessToken) {
@@ -2634,7 +3144,7 @@ var _OneloAuth = class _OneloAuth {
         Authorization: `Bearer ${accessToken}`,
         "X-Publishable-Key": this.publishableKey
       });
-      void (0, import_core3.httpPost)(`${this.apiUrl}/api/sdk/auth/signout`, {}, headers).catch(() => {
+      void (0, import_core5.httpPost)(`${this.apiUrl}/api/sdk/auth/signout`, {}, headers).catch(() => {
       });
     }
   }
@@ -2670,7 +3180,7 @@ var _OneloAuth = class _OneloAuth {
    * revalidation can't resurrect the just-cleared session.
    */
   async _handleSessionRevoked(data) {
-    const userJson = await this.storage.get(import_core3.TOKEN_KEYS.USER_JSON);
+    const userJson = await this.storage.get(import_core5.TOKEN_KEYS.USER_JSON);
     if (!userJson) return;
     let currentUserId;
     try {
@@ -2703,9 +3213,9 @@ var _OneloAuth = class _OneloAuth {
   async hasStoredSession() {
     try {
       const [accessToken, refreshToken, userJson] = await Promise.all([
-        this.storage.get(import_core3.TOKEN_KEYS.ACCESS_TOKEN),
-        this.storage.get(import_core3.TOKEN_KEYS.REFRESH_TOKEN),
-        this.storage.get(import_core3.TOKEN_KEYS.USER_JSON)
+        this.storage.get(import_core5.TOKEN_KEYS.ACCESS_TOKEN),
+        this.storage.get(import_core5.TOKEN_KEYS.REFRESH_TOKEN),
+        this.storage.get(import_core5.TOKEN_KEYS.USER_JSON)
       ]);
       if (!accessToken || !refreshToken || !userJson) return false;
       const user = JSON.parse(userJson);
@@ -2716,17 +3226,17 @@ var _OneloAuth = class _OneloAuth {
   }
   async getSession() {
     const [accessToken, refreshToken, expiresAtStr, userJson] = await Promise.all([
-      this.storage.get(import_core3.TOKEN_KEYS.ACCESS_TOKEN),
-      this.storage.get(import_core3.TOKEN_KEYS.REFRESH_TOKEN),
-      this.storage.get(import_core3.TOKEN_KEYS.EXPIRES_AT),
-      this.storage.get(import_core3.TOKEN_KEYS.USER_JSON)
+      this.storage.get(import_core5.TOKEN_KEYS.ACCESS_TOKEN),
+      this.storage.get(import_core5.TOKEN_KEYS.REFRESH_TOKEN),
+      this.storage.get(import_core5.TOKEN_KEYS.EXPIRES_AT),
+      this.storage.get(import_core5.TOKEN_KEYS.USER_JSON)
     ]);
     if (!accessToken || !refreshToken || !userJson) return null;
     const expiresAt = parseInt(expiresAtStr ?? "0", 10);
     if (Date.now() / 1e3 > expiresAt - 60) {
       if (Date.now() < this.refreshBackoffUntil) return this._storedSession();
       return this.refreshSession().catch((e) => {
-        if ((0, import_core3.isSessionEndError)(e)) return null;
+        if ((0, import_core5.isSessionEndError)(e)) return null;
         return this._storedSession();
       });
     }
@@ -2750,11 +3260,11 @@ var _OneloAuth = class _OneloAuth {
   }
   async _doRefresh() {
     const epoch = this.signOutEpoch;
-    const refreshToken = await this.storage.get(import_core3.TOKEN_KEYS.REFRESH_TOKEN);
+    const refreshToken = await this.storage.get(import_core5.TOKEN_KEYS.REFRESH_TOKEN);
     if (!refreshToken) return null;
     let res;
     try {
-      res = await (0, import_core3.httpPost)(
+      res = await (0, import_core5.httpPost)(
         `${this.apiUrl}/api/sdk/auth/refresh`,
         // Wire key MUST be snake_case `refresh_token`: the backend
         // RefreshRequest model (sdk_auth.py) requires it and rejects a
@@ -2768,10 +3278,10 @@ var _OneloAuth = class _OneloAuth {
       throw e;
     }
     const { status, json } = res;
-    (0, import_core3.checkHostedFlowRequired)(json);
+    (0, import_core5.checkHostedFlowRequired)(json);
     if (status === 429 || status >= 500) {
       if (epoch === this.signOutEpoch) this._scheduleRefreshRetry();
-      throw import_core3.OneloError.server(`Session refresh is temporarily unavailable (HTTP ${status})`);
+      throw import_core5.OneloError.server(`Session refresh is temporarily unavailable (HTTP ${status})`);
     }
     const j = json;
     const teardown = async () => {
@@ -2783,12 +3293,12 @@ var _OneloAuth = class _OneloAuth {
     if (j["error"] === "user_revoked") {
       if (epoch === this.signOutEpoch) this.isUserRevoked = true;
       await teardown();
-      throw import_core3.OneloError.userRevoked();
+      throw import_core5.OneloError.userRevoked();
     }
     if (j["error"] === "app_revoked") {
       if (epoch === this.signOutEpoch) this.isRevoked = true;
       await teardown();
-      throw import_core3.OneloError.revoked();
+      throw import_core5.OneloError.revoked();
     }
     if (status !== 200) {
       if (epoch !== this.signOutEpoch) return null;
@@ -2797,14 +3307,14 @@ var _OneloAuth = class _OneloAuth {
       if (reason === "banned") {
         this.isUserRevoked = true;
         await teardown();
-        throw import_core3.OneloError.userRevoked();
+        throw import_core5.OneloError.userRevoked();
       }
       await teardown();
-      if (reason === "no_plan_available") throw import_core3.OneloError.noActivePlan();
-      throw import_core3.OneloError.sessionEnded();
+      if (reason === "no_plan_available") throw import_core5.OneloError.noActivePlan();
+      throw import_core5.OneloError.sessionEnded();
     }
     if (epoch !== this.signOutEpoch) return null;
-    const session = (0, import_core3.mapSession)(j);
+    const session = (0, import_core5.mapSession)(j);
     await this.saveSession(session);
     return session;
   }
@@ -2847,7 +3357,7 @@ var _OneloAuth = class _OneloAuth {
   async _verifySession(accessToken) {
     const epoch = this.signOutEpoch;
     try {
-      const { status, json } = await (0, import_core3.httpGet)(
+      const { status, json } = await (0, import_core5.httpGet)(
         `${this.apiUrl}/api/sdk/auth/verify`,
         await this._secHeaders({ Authorization: `Bearer ${accessToken}` })
       );
@@ -2925,7 +3435,7 @@ var _OneloAuth = class _OneloAuth {
     const session = await this.getSession();
     if (!session) return "none";
     try {
-      const { status, json } = await (0, import_core3.httpGet)(
+      const { status, json } = await (0, import_core5.httpGet)(
         `${this.apiUrl}/api/sdk/auth/user`,
         await this._secHeaders({
           Authorization: `Bearer ${session.accessToken}`,
@@ -2935,7 +3445,7 @@ var _OneloAuth = class _OneloAuth {
       if (status !== 200) return session.user.entitlement;
       const body = json;
       const next = body["entitlement"] === "active" ? "active" : "none";
-      const nextUser = (0, import_core3.mergeAccessAnswer)({ ...session.user, entitlement: next }, body);
+      const nextUser = (0, import_core5.mergeAccessAnswer)({ ...session.user, entitlement: next }, body);
       const changed = next !== session.user.entitlement || nextUser.allowedIn !== session.user.allowedIn || nextUser.emailVerified !== session.user.emailVerified || nextUser.accessReason !== session.user.accessReason;
       if (changed && epoch === this.signOutEpoch) {
         await this.saveSession({ ...session, user: nextUser });
@@ -3046,10 +3556,10 @@ var _OneloAuth = class _OneloAuth {
    *  cleared it meanwhile), or null. */
   async _storedSession() {
     const [accessToken, refreshToken, expiresAtStr, userJson] = await Promise.all([
-      this.storage.get(import_core3.TOKEN_KEYS.ACCESS_TOKEN),
-      this.storage.get(import_core3.TOKEN_KEYS.REFRESH_TOKEN),
-      this.storage.get(import_core3.TOKEN_KEYS.EXPIRES_AT),
-      this.storage.get(import_core3.TOKEN_KEYS.USER_JSON)
+      this.storage.get(import_core5.TOKEN_KEYS.ACCESS_TOKEN),
+      this.storage.get(import_core5.TOKEN_KEYS.REFRESH_TOKEN),
+      this.storage.get(import_core5.TOKEN_KEYS.EXPIRES_AT),
+      this.storage.get(import_core5.TOKEN_KEYS.USER_JSON)
     ]);
     if (!accessToken || !refreshToken || !userJson) return null;
     try {
@@ -3081,10 +3591,10 @@ var _OneloAuth = class _OneloAuth {
     this.refreshRetryAttempt = 0;
     this.refreshBackoffUntil = 0;
     await Promise.all([
-      this.storage.set(import_core3.TOKEN_KEYS.ACCESS_TOKEN, session.accessToken),
-      this.storage.set(import_core3.TOKEN_KEYS.REFRESH_TOKEN, session.refreshToken),
-      this.storage.set(import_core3.TOKEN_KEYS.EXPIRES_AT, String(session.expiresAt)),
-      this.storage.set(import_core3.TOKEN_KEYS.USER_JSON, JSON.stringify(session.user))
+      this.storage.set(import_core5.TOKEN_KEYS.ACCESS_TOKEN, session.accessToken),
+      this.storage.set(import_core5.TOKEN_KEYS.REFRESH_TOKEN, session.refreshToken),
+      this.storage.set(import_core5.TOKEN_KEYS.EXPIRES_AT, String(session.expiresAt)),
+      this.storage.set(import_core5.TOKEN_KEYS.USER_JSON, JSON.stringify(session.user))
     ]);
     this.isUserRevoked = false;
     this.notifyListeners(session);
@@ -3100,7 +3610,7 @@ var _OneloAuth = class _OneloAuth {
   // ── Magic link & password reset ─────────────────────────────────────────────
   async sendMagicLink(email) {
     await this.initPromise;
-    const { status } = await (0, import_core3.httpPost)(
+    const { status } = await (0, import_core5.httpPost)(
       `${this.apiUrl}/api/sdk/auth/magic-link`,
       {
         email,
@@ -3108,7 +3618,7 @@ var _OneloAuth = class _OneloAuth {
       },
       await this._secHeaders()
     );
-    if (status !== 200) throw import_core3.OneloError.server(`sendMagicLink failed: HTTP ${status}`);
+    if (status !== 200) throw import_core5.OneloError.server(`sendMagicLink failed: HTTP ${status}`);
   }
   /**
    * Send the signed-in user a fresh Email Verification link (#819).
@@ -3126,11 +3636,11 @@ var _OneloAuth = class _OneloAuth {
   async resendVerificationEmail(options = {}) {
     await this.initPromise;
     const session = await this.getSession();
-    if (!session) throw import_core3.OneloError.notAuthenticated();
-    return (0, import_core3.resendVerificationEmail)({
+    if (!session) throw import_core5.OneloError.notAuthenticated();
+    return (0, import_core5.resendVerificationEmail)({
       apiUrl: this.apiUrl,
       publishableKey: this.publishableKey,
-      post: import_core3.httpPost,
+      post: import_core5.httpPost,
       accessToken: session.accessToken,
       headers: await this._secHeaders(),
       redirectTo: options.redirectTo
@@ -3144,10 +3654,10 @@ var _OneloAuth = class _OneloAuth {
    */
   async confirmEmail(token) {
     await this.initPromise;
-    await (0, import_core3.confirmEmail)({
+    await (0, import_core5.confirmEmail)({
       apiUrl: this.apiUrl,
       publishableKey: this.publishableKey,
-      post: import_core3.httpPost,
+      post: import_core5.httpPost,
       token,
       headers: await this._secHeaders()
     });
@@ -3161,12 +3671,12 @@ var _OneloAuth = class _OneloAuth {
   }
   async sendPasswordReset(email) {
     await this.initPromise;
-    const { status } = await (0, import_core3.httpPost)(
+    const { status } = await (0, import_core5.httpPost)(
       `${this.apiUrl}/api/sdk/auth/reset-password/request`,
       { email, publishableKey: this.publishableKey },
       await this._secHeaders()
     );
-    if (status !== 200) throw import_core3.OneloError.server(`sendPasswordReset failed: HTTP ${status}`);
+    if (status !== 200) throw import_core5.OneloError.server(`sendPasswordReset failed: HTTP ${status}`);
   }
   /**
    * Complete a hosted-auth flow that finished OUTSIDE this app's own UI — a
@@ -3258,7 +3768,7 @@ _OneloAuth.REFRESH_RETRY_MAX_MS = 6e4;
 var OneloAuth = _OneloAuth;
 
 // src/features/features.ts
-var import_core4 = __toESM(require_dist());
+var import_core6 = __toESM(require_dist());
 
 // src/core/user-token.ts
 var INVALID_USER_TOKEN = "invalid_user_token";
@@ -3423,22 +3933,23 @@ var FeatureState = class {
   get isComingSoon() {
     return this.status === "coming_soon";
   }
-  /** Promo/lock badge (parity with Swift): New/Beta/Coming Soon, 🔒 for greyed
-   *  (locked — never hide it), and "Available in <plan>" for upsell. */
+  /** Promo/lock badge (parity with Swift): New/Beta/Coming soon, 🔒 for greyed
+   *  (locked — never hide it), and "Available in <plan>" for upsell. In the App
+   *  User's Page Language (#1076); the plan name is shown as written. */
   get badgeLabel() {
     switch (this.status) {
       case "new":
-        return "New";
+        return oneloText("badgeNew");
       case "beta":
-        return "Beta";
+        return oneloText("badgeBeta");
       case "coming_soon":
-        return "Coming Soon";
+        return oneloText("badgeComingSoon");
       case "greyed":
         return "\u{1F512}";
       case "upsell":
-        if (this.requiredPlanLabel) return `Available in ${this.requiredPlanLabel}`;
-        if (this.requiredPlan) return `Available in ${this.requiredPlan}`;
-        return "Upgrade";
+        if (this.requiredPlanLabel) return oneloText("badgeAvailableIn", { plan: this.requiredPlanLabel });
+        if (this.requiredPlan) return oneloText("badgeAvailableIn", { plan: this.requiredPlan });
+        return oneloText("badgeUpgrade");
       default:
         return null;
     }
@@ -3711,7 +4222,7 @@ var OneloFeatures = class {
       const headers = await sdkHeaders2(this.bundleId);
       const res = await sendWithUserToken(
         this.userToken,
-        ({ token }) => (0, import_core4.httpPost)(
+        ({ token }) => (0, import_core6.httpPost)(
           `${this.apiUrl}/api/sdk/features/module-token`,
           { publishableKey: this.publishableKey, userId, slug },
           { ...headers, ...bearerHeader(token) }
@@ -3804,7 +4315,7 @@ var OneloFeatures = class {
     try {
       const { sdkHeaders: sdkHeaders2 } = await Promise.resolve().then(() => (init_sdk_headers(), sdk_headers_exports));
       const headers = await sdkHeaders2(this.bundleId);
-      await sendWithUserToken(this.userToken, ({ token, anonymous }) => (0, import_core4.httpPost)(`${this.apiUrl}/api/sdk/features/batch-ping`, {
+      await sendWithUserToken(this.userToken, ({ token, anonymous }) => (0, import_core6.httpPost)(`${this.apiUrl}/api/sdk/features/batch-ping`, {
         publishableKey: this.publishableKey,
         features: names,
         ...userId && !anonymous ? { userId } : {},
@@ -3826,7 +4337,7 @@ var OneloFeatures = class {
           path: "/api/sdk/features/resolve",
           body: JSON.stringify(body)
         });
-        return (0, import_core4.httpPost)(`${this.apiUrl}/api/sdk/features/resolve`, body, { ...headers, ...bearerHeader(token) });
+        return (0, import_core6.httpPost)(`${this.apiUrl}/api/sdk/features/resolve`, body, { ...headers, ...bearerHeader(token) });
       }, () => this._warnUserTokenRefused(), userId === null);
       if (status !== 200) {
         const { maybeSelfHealFromError: maybeSelfHealFromError2 } = await Promise.resolve().then(() => (init_attest(), attest_exports));
@@ -3883,7 +4394,7 @@ If your app is intentionally anonymous, pass suppressIdentifyWarning: true in On
       const headers = await sdkHeaders2(this.bundleId);
       const { status, json } = await sendWithUserToken(this.userToken, ({ token, anonymous }) => {
         const query = params.toString() + (userId && !anonymous ? `&userId=${encodeURIComponent(userId)}` : "");
-        return (0, import_core4.httpGet)(
+        return (0, import_core6.httpGet)(
           `${this.apiUrl}/api/sdk/features/poll?${query}`,
           { ...headers, "X-Publishable-Key": this.publishableKey, ...bearerHeader(token) }
         );
@@ -4085,7 +4596,7 @@ function scrubMeta(meta) {
 }
 
 // src/monitor/monitor.ts
-var import_core5 = __toESM(require_dist());
+var import_core7 = __toESM(require_dist());
 var SDK_NAME = "@onelo/react-native";
 var MAX_BUFFER_SIZE = 200;
 var MAX_FLAGS = 100;
@@ -4452,7 +4963,7 @@ var OneloMonitor = class {
               false,
               void 0,
               message,
-              { ...this._withError(void 0, stack, errorType), origin: (0, import_core5.classifyErrorOrigin)(err) },
+              { ...this._withError(void 0, stack, errorType), origin: (0, import_core7.classifyErrorOrigin)(err) },
               "global_error"
             );
           } catch {
@@ -4482,8 +4993,8 @@ var OneloMonitor = class {
     try {
       const ErrorUtils = globalThis?.ErrorUtils;
       if (ErrorUtils?.setGlobalHandler) {
-        const current = ErrorUtils.getGlobalHandler?.();
-        if (current === _installedGlobalHandler) {
+        const current2 = ErrorUtils.getGlobalHandler?.();
+        if (current2 === _installedGlobalHandler) {
           ErrorUtils.setGlobalHandler(_previousGlobalHandler ?? (() => {
           }));
         }
@@ -4497,9 +5008,9 @@ var OneloMonitor = class {
 };
 
 // src/feedback/feedback.ts
-var import_core6 = __toESM(require_dist());
+var import_core8 = __toESM(require_dist());
 var OneloFeedback = class {
-  constructor(apiUrl, publishableKey, getActiveFeatures, bundleId, brand = new import_core6.BrandSource(), userToken) {
+  constructor(apiUrl, publishableKey, getActiveFeatures, bundleId, brand = new import_core8.BrandSource(), userToken) {
     this.apiUrl = apiUrl;
     this.publishableKey = publishableKey;
     this.getActiveFeatures = getActiveFeatures;
@@ -4635,12 +5146,13 @@ var OneloForms = class {
 };
 
 // src/waitlist/waitlist.ts
-var import_core7 = __toESM(require_dist());
+var import_core9 = __toESM(require_dist());
 var OneloWaitlist = class {
-  constructor(apiUrl, publishableKey, bundleId) {
+  constructor(apiUrl, publishableKey, bundleId, language) {
     this.apiUrl = apiUrl;
     this.publishableKey = publishableKey;
     this.bundleId = bundleId;
+    this.language = language;
   }
   async join(slug, email, options) {
     try {
@@ -4649,7 +5161,8 @@ var OneloWaitlist = class {
       const body = {
         publishableKey: this.publishableKey,
         email,
-        ...(0, import_core7.waitlistConsentField)(options)
+        ...(0, import_core9.waitlistConsentField)(options),
+        ...(0, import_core9.waitlistLanguageField)({ ...options, language: options?.language ?? this.language })
       };
       if (slug !== void 0) body.slug = slug;
       const bodyStr = JSON.stringify(body);
@@ -4779,7 +5292,7 @@ function affiliatePost(apiUrl, bundleId) {
 init_storage();
 
 // src/customer-portal/customer-portal.ts
-var import_core8 = __toESM(require_dist());
+var import_core10 = __toESM(require_dist());
 init_sdk_headers();
 var SDK_VERSION4 = require_package().version;
 var CALLBACK_SCHEME3 = "onelorn";
@@ -4808,7 +5321,7 @@ var OneloCustomerPortal = class {
    *   account revoked, session compromised) so `auth.isUserRevoked` is set.
    *   Parity with Swift `portalRevokeEvents` + guard #9.
    */
-  constructor(apiUrl, publishableKey, bundleId, getAccessToken, signOut, onRevoked, brand = new import_core8.BrandSource(), callbackScheme = CALLBACK_SCHEME3, onClosed) {
+  constructor(apiUrl, publishableKey, bundleId, getAccessToken, signOut, onRevoked, brand = new import_core10.BrandSource(), callbackScheme = CALLBACK_SCHEME3, onClosed) {
     this._modalVisible = false;
     this._modalUrl = "";
     this._modalResolve = null;
@@ -4868,26 +5381,26 @@ var OneloCustomerPortal = class {
       const hostedUrl = await this.initiate();
       return { type: "onelo:renewed", request_id: requestId, hosted_url: hostedUrl };
     } catch (e) {
-      const reason = e instanceof import_core8.OneloError && e.code === "not_authenticated" ? "not_authenticated" : "renew_failed";
+      const reason = e instanceof import_core10.OneloError && e.code === "not_authenticated" ? "not_authenticated" : "renew_failed";
       return { type: "onelo:renew_failed", request_id: requestId, reason };
     }
   }
   /** GET portal-initiate with the user's access token → the hosted URL. */
   async initiate() {
     const token = await this.getAccessToken();
-    if (!token) throw new import_core8.OneloError("not_authenticated", "Sign in before opening the customer portal");
+    if (!token) throw new import_core10.OneloError("not_authenticated", "Sign in before opening the customer portal");
     const url = `${this.apiUrl}/api/sdk/paywall/portal-initiate?key=${encodeURIComponent(this.publishableKey)}&callback_scheme=${encodeURIComponent(this.callbackScheme)}`;
-    const { status, json } = await (0, import_core8.httpGet)(url, {
+    const { status, json } = await (0, import_core10.httpGet)(url, {
       ...await sdkHeaders(this.bundleId),
       "X-SDK-Version": SDK_VERSION4,
       Authorization: `Bearer ${token}`
     });
-    if (status === 401) throw new import_core8.OneloError("not_authenticated", "The session can no longer open the customer portal");
-    if (status !== 200) throw import_core8.OneloError.server("Failed to initiate customer portal");
+    if (status === 401) throw new import_core10.OneloError("not_authenticated", "The session can no longer open the customer portal");
+    if (status !== 200) throw import_core10.OneloError.server("Failed to initiate customer portal");
     const j = json;
     this.brand.adopt(j);
     const hostedUrl = j["hosted_url"];
-    if (!hostedUrl) throw import_core8.OneloError.server("Invalid portal-initiate response");
+    if (!hostedUrl) throw import_core10.OneloError.server("Invalid portal-initiate response");
     return hostedUrl;
   }
   presentModal(hostedUrl) {
@@ -4944,7 +5457,7 @@ var OneloCustomerPortal = class {
 };
 
 // src/consent/consent.ts
-var import_core9 = __toESM(require_dist());
+var import_core11 = __toESM(require_dist());
 init_sdk_headers();
 function _mapRequirement(j) {
   const versionId = j["version_id"];
@@ -4966,7 +5479,7 @@ function _mapRequirement(j) {
   };
 }
 var OneloConsent = class {
-  constructor(apiUrl, publishableKey, auth, bundleId, autoPresent = true) {
+  constructor(apiUrl, publishableKey, auth, bundleId, autoPresent = true, language) {
     this._modalVisible = false;
     this._modalUrl = "";
     this._modalResolve = null;
@@ -4986,6 +5499,7 @@ var OneloConsent = class {
     this.auth = auth;
     this.bundleId = bundleId;
     this.autoPresent = autoPresent;
+    this.language = language;
   }
   /** Current consent revision — bumped on each `legal.consent_required` push
    *  (parity with Swift @Published consentRevision). */
@@ -5034,7 +5548,8 @@ var OneloConsent = class {
     const session = await this.auth.getSession();
     if (!session) return [];
     try {
-      const { status, json } = await (0, import_core9.httpGet)(`${this.apiUrl}/v1/sdk/consent/required`, {
+      const url = `${this.apiUrl}/v1/sdk/consent/required?lang=${encodeURIComponent(requestLanguage(this.language))}`;
+      const { status, json } = await (0, import_core11.httpGet)(url, {
         ...await sdkHeaders(this.bundleId, this.publishableKey),
         Authorization: `Bearer ${session.accessToken}`
       });
@@ -5052,8 +5567,8 @@ var OneloConsent = class {
    */
   async acceptConsent(versionId) {
     const session = await this.auth.getSession();
-    if (!session) throw import_core9.OneloError.notAuthenticated();
-    const { status } = await (0, import_core9.httpPost)(
+    if (!session) throw import_core11.OneloError.notAuthenticated();
+    const { status } = await (0, import_core11.httpPost)(
       `${this.apiUrl}/v1/sdk/consent/accept`,
       // snake_case `document_version_id` — the backend ConsentActionIn model.
       { document_version_id: versionId },
@@ -5062,8 +5577,8 @@ var OneloConsent = class {
         Authorization: `Bearer ${session.accessToken}`
       }
     );
-    if (status === 401) throw import_core9.OneloError.notAuthenticated();
-    if (status < 200 || status >= 300) throw import_core9.OneloError.server(`Failed to record consent: HTTP ${status}`);
+    if (status === 401) throw import_core11.OneloError.notAuthenticated();
+    if (status < 200 || status >= 300) throw import_core11.OneloError.server(`Failed to record consent: HTTP ${status}`);
   }
   // ── Gate presentation ────────────────────────────────────────────────────────
   /**
@@ -5142,7 +5657,7 @@ var OneloConsent = class {
 };
 
 // src/store/store.ts
-var import_core10 = __toESM(require_dist());
+var import_core12 = __toESM(require_dist());
 init_sdk_headers();
 var SDK_VERSION5 = require_package().version;
 var CALLBACK_SCHEME4 = "onelorn";
@@ -5153,7 +5668,7 @@ var OneloStore = class {
    *   auth-state listeners fire). Delegates to the auth module's hosted-callback
    *   exchange. Required for `open()` to complete a purchase.
    */
-  constructor(apiUrl, publishableKey, bundleId, getAccessToken, exchangeCode, brand = new import_core10.BrandSource(), callbackScheme = CALLBACK_SCHEME4, getSession = async () => null, upgradeHost) {
+  constructor(apiUrl, publishableKey, bundleId, getAccessToken, exchangeCode, brand = new import_core12.BrandSource(), callbackScheme = CALLBACK_SCHEME4, getSession = async () => null, upgradeHost, language) {
     /** Told when the store ended in a purchase or a plan switch (#659). Set by
      *  `Onelo` to its plan-change refresher. */
     this.onPlanChange = null;
@@ -5171,6 +5686,7 @@ var OneloStore = class {
     this.callbackScheme = callbackScheme;
     this.getSession = getSession;
     this.upgradeHost = upgradeHost;
+    this.language = language;
   }
   setPlanChangeHandler(fn) {
     this.onPlanChange = fn;
@@ -5186,25 +5702,29 @@ var OneloStore = class {
    * cold-start omits it. Mirrors Swift `initiateStoreFlow(lang:)`. Use for a custom
    * presentation; `open()` wraps it.
    *
+   * @param lang  The App's language for the store. Omitted, the `language` from
+   *   the config is sent, else the device language (#1039, #1076); the backend
+   *   picks the Page Language within the App Languages.
+   *
    * @throws OneloError('server_error') on `store_not_configured` (409) /
    *   `paywall_not_enabled` (403) — DO NOT open a WebView in that case — or any
    *   other non-200. `OneloError('invalid_publishable_key')` on 401.
    */
-  async initiateStoreFlow(lang = "en") {
+  async initiateStoreFlow(lang) {
     const token = await this.getAccessToken();
-    const url = `${this.apiUrl}/api/sdk/paywall/store-initiate?key=${encodeURIComponent(this.publishableKey)}&callback_scheme=${encodeURIComponent(this.callbackScheme)}&lang=${encodeURIComponent(lang)}`;
-    const { status, json } = await (0, import_core10.httpGet)(
+    const url = `${this.apiUrl}/api/sdk/paywall/store-initiate?key=${encodeURIComponent(this.publishableKey)}&callback_scheme=${encodeURIComponent(this.callbackScheme)}&lang=${encodeURIComponent(requestLanguage(this.language, lang))}`;
+    const { status, json } = await (0, import_core12.httpGet)(
       url,
       await this._secHeaders(token ? { Authorization: `Bearer ${token}` } : {})
     );
-    if (status === 401) throw import_core10.OneloError.invalidKey("Store rejected the publishable key");
+    if (status === 401) throw import_core12.OneloError.invalidKey("Store rejected the publishable key");
     if (status !== 200) {
-      const code = (0, import_core10.extractErrorCode)(json);
-      throw import_core10.OneloError.server(`Failed to initiate store flow: HTTP ${status}${code ? ` (${code})` : ""}`);
+      const code = (0, import_core12.extractErrorCode)(json);
+      throw import_core12.OneloError.server(`Failed to initiate store flow: HTTP ${status}${code ? ` (${code})` : ""}`);
     }
     this.brand.adopt(json);
     const storeUrl = json["store_url"];
-    if (!storeUrl) throw import_core10.OneloError.server("Invalid store-initiate response: missing store_url");
+    if (!storeUrl) throw import_core12.OneloError.server("Invalid store-initiate response: missing store_url");
     return storeUrl;
   }
   /**
@@ -5215,7 +5735,7 @@ var OneloStore = class {
    *
    * Requires `<StoreModal onelo={onelo} />` mounted near your app root.
    */
-  async open(lang = "en") {
+  async open(lang) {
     const hostedUrl = await this.initiateStoreFlow(lang);
     return new Promise((resolve, reject) => {
       this._modalUrl = hostedUrl;
@@ -5244,7 +5764,7 @@ var OneloStore = class {
           return;
         }
         if (!this.exchangeCode) {
-          reject(import_core10.OneloError.server("Store exchange not wired: missing exchangeCode dependency"));
+          reject(import_core12.OneloError.server("Store exchange not wired: missing exchangeCode dependency"));
           return;
         }
         try {
@@ -5271,23 +5791,25 @@ var OneloStore = class {
    * `<CustomerPortalModal onelo={onelo} />` mounted — without one the URL opens
    * in the system browser (`Linking.openURL`) and a warning is logged.
    *
+   * @param lang  The App's language for the page. Omitted, the `language` from
+   *   the config is sent, else the device language (#1039, #1076).
    * @throws OneloError('not_authenticated') when signed out (401) or
    *   `OneloError('server_error')` on `plan_not_purchasable` (404) /
    *   `callback_scheme_required` (400) / any other non-200.
    */
-  async openUpgrade(plan, lang = "en") {
+  async openUpgrade(plan, lang) {
     const token = await this.getAccessToken();
-    if (!token) throw import_core10.OneloError.notAuthenticated();
-    const url = `${this.apiUrl}/api/sdk/paywall/upgrade-initiate?key=${encodeURIComponent(this.publishableKey)}&plan=${encodeURIComponent(plan)}&callback_scheme=${encodeURIComponent(this.callbackScheme)}&lang=${encodeURIComponent(lang)}`;
-    const { status, json } = await (0, import_core10.httpGet)(url, await this._secHeaders({ Authorization: `Bearer ${token}` }));
-    if (status === 401) throw import_core10.OneloError.notAuthenticated();
+    if (!token) throw import_core12.OneloError.notAuthenticated();
+    const url = `${this.apiUrl}/api/sdk/paywall/upgrade-initiate?key=${encodeURIComponent(this.publishableKey)}&plan=${encodeURIComponent(plan)}&callback_scheme=${encodeURIComponent(this.callbackScheme)}&lang=${encodeURIComponent(requestLanguage(this.language, lang))}`;
+    const { status, json } = await (0, import_core12.httpGet)(url, await this._secHeaders({ Authorization: `Bearer ${token}` }));
+    if (status === 401) throw import_core12.OneloError.notAuthenticated();
     if (status !== 200) {
-      const code = (0, import_core10.extractErrorCode)(json);
-      throw import_core10.OneloError.server(`Failed to initiate upgrade: HTTP ${status}${code ? ` (${code})` : ""}`);
+      const code = (0, import_core12.extractErrorCode)(json);
+      throw import_core12.OneloError.server(`Failed to initiate upgrade: HTTP ${status}${code ? ` (${code})` : ""}`);
     }
     this.brand.adopt(json);
     const upgradeUrl = json["upgrade_url"];
-    if (!upgradeUrl) throw import_core10.OneloError.server("Invalid upgrade-initiate response: missing upgrade_url");
+    if (!upgradeUrl) throw import_core12.OneloError.server("Invalid upgrade-initiate response: missing upgrade_url");
     if (this.upgradeHost?.hasModalHost) {
       await this.upgradeHost.presentUrl(upgradeUrl);
       return;
@@ -5818,7 +6340,7 @@ var Onelo = class {
     });
     this.feedback = new OneloFeedback(config.apiUrl, config.publishableKey, () => this.features.getActiveFeatures(), config.bundleId, this.auth.brand, userToken);
     this.forms = new OneloForms(config.apiUrl, config.publishableKey, config.bundleId);
-    this.waitlist = new OneloWaitlist(config.apiUrl, config.publishableKey, config.bundleId);
+    this.waitlist = new OneloWaitlist(config.apiUrl, config.publishableKey, config.bundleId, config.language);
     this.affiliates = new OneloAffiliates(
       config.publishableKey,
       new KeychainStorage(),
@@ -5844,7 +6366,7 @@ var Onelo = class {
     );
     this.autoPresentConsent = config.autoPresentConsentGate ?? true;
     this.autoLifecycleRefresh = config.autoLifecycleRefresh ?? true;
-    this.consent = new OneloConsent(config.apiUrl, config.publishableKey, this.auth, config.bundleId, this.autoPresentConsent);
+    this.consent = new OneloConsent(config.apiUrl, config.publishableKey, this.auth, config.bundleId, this.autoPresentConsent, config.language);
     this.store = new OneloStore(
       config.apiUrl,
       config.publishableKey,
@@ -5855,7 +6377,8 @@ var Onelo = class {
       // #681: the one brand-token model
       this.auth.callbackScheme,
       () => this.auth.getSession(),
-      this.customerPortal
+      this.customerPortal,
+      config.language
     );
     this.eventStream = new OneloEventStream(config.apiUrl, config.publishableKey, SDK_VERSION6, config.bundleId, userToken);
     this.eventStream.featureEnvironment = featureEnvironment;
@@ -5977,7 +6500,7 @@ var Onelo = class {
    * Thin delegate to {@link OneloStore.openUpgrade} for cross-platform parity with
    * Swift `Onelo.openUpgrade(forPlan:)` / Android / Flutter `onelo.openUpgrade`.
    */
-  async openUpgrade(plan, lang = "en") {
+  async openUpgrade(plan, lang) {
     return this.store.openUpgrade(plan, lang);
   }
   /** Release background timers. Call when the SDK instance is no longer needed. */
@@ -5995,7 +6518,6 @@ var Onelo = class {
 
 // src/auth/OneloAuthGate.tsx
 var import_react4 = __toESM(require("react"));
-var import_core11 = __toESM(require_dist());
 
 // src/auth/hooks.ts
 var import_react3 = require("react");
@@ -6036,9 +6558,8 @@ async function resolveGateState(auth) {
 
 // src/auth/OneloAuthGate.tsx
 function errorMessage(e) {
-  if (e instanceof import_core11.OneloError) return e.message;
-  if (e instanceof Error) return e.message;
-  return void 0;
+  if (e == null) return void 0;
+  return appUserMessage(e, "OneloAuthGate");
 }
 function OneloAuthGate({ onelo, children, fallback }) {
   const RN = require("react-native");
@@ -6136,7 +6657,7 @@ function OneloAuthGate({ onelo, children, fallback }) {
     import_react4.default.createElement(
       TouchableOpacity,
       { style: styles.retryButton, onPress: handleRetry },
-      import_react4.default.createElement(Text, { style: styles.retryText }, "Sign In")
+      import_react4.default.createElement(Text, { style: styles.retryText }, oneloText("signIn"))
     )
   ) : fallback ?? // #26 part B — auth-shaped loading skeleton (was a bare spinner), matching
   // the hosted page's own skeleton so the transition has no jump. social-aware.
@@ -6202,7 +6723,7 @@ function sameOrigin(a, b) {
 }
 
 // src/feedback/FeedbackModal.tsx
-var import_core12 = __toESM(require_dist());
+var import_core13 = __toESM(require_dist());
 var RELAY_JS = `
 (function() {
   window.addEventListener('message', function(e) {
@@ -6313,7 +6834,7 @@ function FeedbackModal({ feedback }) {
             onPress: () => feedback.close(),
             style: styles.closeBtn,
             accessibilityRole: "button",
-            accessibilityLabel: "Close feedback",
+            accessibilityLabel: oneloText("closeFeedback"),
             hitSlop: { top: 8, bottom: 8, left: 8, right: 8 }
           },
           import_react5.default.createElement(Text, { style: styles.closeIcon, allowFontScaling: false }, "\u2715")
@@ -6322,7 +6843,7 @@ function FeedbackModal({ feedback }) {
       // Always render WebView: shows skeleton HTML until real URL loads
       import_react5.default.createElement(WebView, {
         ref: webviewRef,
-        source: url ? { uri: url } : { html: (0, import_core12.feedbackSkeletonHtml)(t) },
+        source: url ? { uri: url } : { html: (0, import_core13.feedbackSkeletonHtml)(t) },
         onMessage: handleMessage,
         // #44 — a load error reveals the native fail-safe ✕ immediately (no grace
         // wait) so the user is never trapped with no way out on a failed hosted page.
@@ -6336,12 +6857,12 @@ function FeedbackModal({ feedback }) {
 }
 
 // src/index.ts
-var import_core15 = __toESM(require_dist());
 var import_core16 = __toESM(require_dist());
+var import_core17 = __toESM(require_dist());
 
 // src/customer-portal/customer-portal-modal.tsx
 var import_react6 = __toESM(require("react"));
-var import_core13 = __toESM(require_dist());
+var import_core14 = __toESM(require_dist());
 function usePortalModalState(portal) {
   const [state, setState] = (0, import_react6.useState)(() => portal.getModalState());
   (0, import_react6.useEffect)(() => {
@@ -6578,16 +7099,16 @@ function CustomerPortalModalView({ visible, hostedUrl, callbackScheme, apiUrl, o
           onPress: goBack,
           style: styles.headerBtn,
           accessibilityRole: "button",
-          accessibilityLabel: "Go back",
+          accessibilityLabel: oneloText("goBack"),
           hitSlop: { top: 8, bottom: 8, left: 8, right: 8 }
-        }, import_react6.default.createElement(Text, { style: styles.backText, allowFontScaling: false }, "\u2039 Back")) : import_react6.default.createElement(View, { style: styles.headerBtn }),
+        }, import_react6.default.createElement(Text, { style: styles.backText, allowFontScaling: false }, oneloText("backButton"))) : import_react6.default.createElement(View, { style: styles.headerBtn }),
         // #40 Phase 2 — native ✕ is a fail-safe: shown only pre-ready (grace/error),
         // hidden once the hosted page's canonical ✕ takes over. Spacer holds its slot.
         showNativeClose ? import_react6.default.createElement(TouchableOpacity, {
           onPress: handleCancel,
           style: styles.headerBtn,
           accessibilityRole: "button",
-          accessibilityLabel: "Close customer portal",
+          accessibilityLabel: oneloText("closeCustomerPortal"),
           hitSlop: { top: 8, bottom: 8, left: 8, right: 8 }
         }, import_react6.default.createElement(Text, { style: styles.doneText, allowFontScaling: false }, "\u2715")) : import_react6.default.createElement(View, { style: styles.headerBtn })
       ),
@@ -6620,7 +7141,7 @@ function CustomerPortalModalView({ visible, hostedUrl, callbackScheme, apiUrl, o
         View,
         { style: styles.skeletonOverlay, pointerEvents: "none" },
         import_react6.default.createElement(WebView, {
-          source: { html: (0, import_core13.portalSkeletonHtml)(t) },
+          source: { html: (0, import_core14.portalSkeletonHtml)(t) },
           style: styles.webview,
           backgroundColor: bg,
           scrollEnabled: false,
@@ -6633,12 +7154,12 @@ function CustomerPortalModalView({ visible, hostedUrl, callbackScheme, apiUrl, o
         import_react6.default.createElement(
           TouchableOpacity,
           { style: styles.retryButton, onPress: handleRetry },
-          import_react6.default.createElement(Text, { style: styles.retryText }, "Manage Subscription")
+          import_react6.default.createElement(Text, { style: styles.retryText }, oneloText("manageSubscription"))
         ),
         import_react6.default.createElement(
           TouchableOpacity,
           { style: styles.cancelButton, onPress: handleCancel },
-          import_react6.default.createElement(Text, { style: styles.cancelText }, "Cancel")
+          import_react6.default.createElement(Text, { style: styles.cancelText }, oneloText("cancel"))
         )
       )
     )
@@ -6647,13 +7168,13 @@ function CustomerPortalModalView({ visible, hostedUrl, callbackScheme, apiUrl, o
 
 // src/store/store-modal.tsx
 var import_react7 = __toESM(require("react"));
-var import_core14 = __toESM(require_dist());
+var import_core15 = __toESM(require_dist());
 var storeSkeletonHtml = (t) => `<!DOCTYPE html><html><head>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 body{background:${t.page_bg};font-family:${t.body_font};overflow:hidden}
-${(0, import_core14.skeletonCss)(t)}
+${(0, import_core15.skeletonCss)(t)}
 .wrap{width:100%;max-width:896px;margin:0 auto;padding:48px 24px;display:flex;flex-direction:column;align-items:center}
 .head{width:100%;display:flex;flex-direction:column;align-items:center;margin-bottom:32px}
 .logo{width:64px;height:64px;border-radius:${t.card_radius}px;margin-bottom:14px;border:1.5px solid ${t.border}}
@@ -6899,14 +7420,14 @@ function StoreModalView({ visible, hostedUrl, callbackScheme, apiUrl, onResult, 
           onPress: goBack,
           style: styles.headerBtn,
           accessibilityRole: "button",
-          accessibilityLabel: "Go back",
+          accessibilityLabel: oneloText("goBack"),
           hitSlop: { top: 8, bottom: 8, left: 8, right: 8 }
-        }, import_react7.default.createElement(Text, { style: styles.backText, allowFontScaling: false }, "\u2039 Back")) : import_react7.default.createElement(View, { style: styles.headerBtn }),
+        }, import_react7.default.createElement(Text, { style: styles.backText, allowFontScaling: false }, oneloText("backButton"))) : import_react7.default.createElement(View, { style: styles.headerBtn }),
         import_react7.default.createElement(TouchableOpacity, {
           onPress: handleCancel,
           style: styles.headerBtn,
           accessibilityRole: "button",
-          accessibilityLabel: "Close checkout",
+          accessibilityLabel: oneloText("closeCheckout"),
           hitSlop: { top: 8, bottom: 8, left: 8, right: 8 }
         }, import_react7.default.createElement(Text, { style: styles.closeText, allowFontScaling: false }, "\u2715"))
       ),
@@ -6953,12 +7474,12 @@ function StoreModalView({ visible, hostedUrl, callbackScheme, apiUrl, onResult, 
         import_react7.default.createElement(
           TouchableOpacity,
           { style: styles.retryButton, onPress: handleRetry },
-          import_react7.default.createElement(Text, { style: styles.retryText }, "Retry")
+          import_react7.default.createElement(Text, { style: styles.retryText }, oneloText("retry"))
         ),
         import_react7.default.createElement(
           TouchableOpacity,
           { style: styles.cancelButton, onPress: handleCancel },
-          import_react7.default.createElement(Text, { style: styles.cancelText }, "Cancel")
+          import_react7.default.createElement(Text, { style: styles.cancelText }, oneloText("cancel"))
         )
       )
     )
@@ -7086,7 +7607,7 @@ function ConsentGateModalView({ visible, hostedUrl, onResult, tokens, background
         import_react8.default.createElement(
           TouchableOpacity,
           { style: styles.retryButton, onPress: handleRetry },
-          import_react8.default.createElement(Text, { style: styles.retryText }, "Retry")
+          import_react8.default.createElement(Text, { style: styles.retryText }, oneloText("retry"))
         )
       )
     )

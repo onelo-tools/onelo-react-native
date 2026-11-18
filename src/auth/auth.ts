@@ -1,7 +1,7 @@
 import {
   httpGet, httpPost, checkHostedFlowRequired,
   mapSession, mergeAccessAnswer, resendVerificationEmail as postResendVerification, confirmEmail as postConfirmEmail, type ResendVerificationResult, TOKEN_KEYS, isSessionEndError, BrandSource, brandTokensFromResponse, NEUTRAL_BRAND_TOKENS, type BrandTokens,
-  type OneloConfig, type OneloSession, type OneloUser, type OneloEntitlement, OneloError, type ResolvedSDKConfig,
+  type OneloSession, type OneloUser, type OneloEntitlement, OneloError, type ResolvedSDKConfig,
   configLanguageParam, signUpConsentFields, signupMarketingConsentFromConfig, NO_SIGNUP_MARKETING_CONSENT,
   type SignUpOptions, type SignupMarketingConsent,
 } from '@onelo/core'
@@ -19,6 +19,11 @@ export type FlowDecision =
 import type { PlanChange } from '../core/plan-change'
 import { generateCodeVerifier, generateCodeChallenge } from '../core/pkce'
 import { KeychainStorage } from '../core/storage'
+import {
+  PAGE_LANGUAGE_STORAGE_KEY, acceptLanguage, adoptPageLanguage, currentPageLanguage, requestLanguage,
+} from '../core/page-language'
+import { withAppUserText } from '../core/texts'
+import type { OneloConfig } from '../onelo'
 import { sdkHeaders, getNativeBundleId } from '../sdk-headers'
 import { maybeSelfHealFromError } from '../attest'
 import type { OneloEventStream } from '../core/event-stream'
@@ -52,6 +57,9 @@ export class OneloAuth {
   /** Deep-link callback scheme (config.callbackScheme, default 'onelorn'). Sent to
    *  the backend on initiate/flow-init and used by AuthModal to catch the return. */
   private readonly _callbackScheme: string
+  /** #1076 — the App's language (`config.language`), or undefined for the
+   *  device language. The default `lang` of every Page Language request. */
+  private readonly _language?: string
   private pkceVerifier: string | null = null
   /**
    * PKCE verifier of the latest hosted flow (#542). Its challenge goes to
@@ -143,6 +151,7 @@ export class OneloAuth {
     this.publishableKey = config.publishableKey
     this.bundleId = config.bundleId
     this._callbackScheme = config.callbackScheme || CALLBACK_SCHEME
+    this._language = config.language
     this.storage = new KeychainStorage()
     // #18 DX: X-Bundle-Id auto-derives from the native module on both platforms
     // (iOS `Bundle.main.bundleIdentifier`, Android `Context.getPackageName()`),
@@ -225,16 +234,37 @@ export class OneloAuth {
   }
 
   private async initialize(): Promise<void> {
+    // #1076 — the Page Language the last launch was answered, so the SDK's own
+    // texts (a retry screen when this launch's config fails) are in it. Read in
+    // parallel with the config request; this launch's answer always wins.
+    let answered = false
+    const restoreLanguage = Promise.resolve()
+      .then(() => this.storage.get(PAGE_LANGUAGE_STORAGE_KEY))
+      .then((kept) => { if (!answered) adoptPageLanguage(kept) })
+      .catch(() => {})
     try {
       const verifier = generateCodeVerifier()
       this.pkceVerifier = verifier
       const challenge = generateCodeChallenge(verifier)
-      // #818: `lang` puts the sign-up Marketing Consent text in the device language.
-      const url = `${this.apiUrl}/api/sdk/config?key=${encodeURIComponent(this.publishableKey)}&code_challenge=${encodeURIComponent(challenge)}${configLanguageParam()}`
-      const { status, json } = await httpGet(url, await this._secHeaders())
+      // #818: `lang` puts the sign-up Marketing Consent text in this language.
+      // #1076: the App's language, else the device language; the device
+      // languages ride as Accept-Language, the backend's next choice before
+      // the App's default. It answers `page_language`.
+      const url = `${this.apiUrl}/api/sdk/config?key=${encodeURIComponent(this.publishableKey)}&code_challenge=${encodeURIComponent(challenge)}${configLanguageParam(this.requestLanguage())}`
+      const headers = await this._secHeaders()
+      const accept = acceptLanguage()
+      if (accept) headers['Accept-Language'] = accept
+      const { status, json } = await httpGet(url, headers)
       if (status === 401 || status === 404) throw OneloError.invalidKey('Server rejected the key')
       if (status !== 200) throw OneloError.server(`Config request failed: HTTP ${status}`)
       const j = json as Record<string, unknown>
+      // #1076 — the Page Language the SDK's own texts are drawn in (Python
+      // chose it). Absent (an older backend) keeps the current one.
+      const lang = adoptPageLanguage(j['page_language'])
+      if (lang) {
+        answered = true
+        void this.storage.set(PAGE_LANGUAGE_STORAGE_KEY, lang).catch(() => {})
+      }
       // #681: `brand_tokens`, or the shape the legacy colours imply.
       const brandTokens = brandTokensFromResponse(j) ?? NEUTRAL_BRAND_TOKENS
       this.brand.set(brandTokens)
@@ -287,7 +317,25 @@ export class OneloAuth {
       if (e instanceof OneloError && e.code === 'invalid_publishable_key') {
         this.isRevoked = true
       }
+      // No answer this launch: the retry screen speaks the kept language.
+      await restoreLanguage
     }
+  }
+
+  /** #1076 — the App User's Page Language (ADR-0043) the SDK's own texts are
+   *  drawn in ('Sign In', 'Cancel', 'Close feedback', the feature badges, the
+   *  retry screen): `config.language` when it is one of the App Languages,
+   *  else the device language when it is one, else the App's default — chosen
+   *  by the backend in `/api/sdk/config` and kept for the next launch. `'en'`
+   *  until the first answer. The same language as the Hosted Pages. */
+  get pageLanguage(): string {
+    return currentPageLanguage()
+  }
+
+  /** The language a Page Language request sends: `lang` passed for this call,
+   *  else the App's `config.language`, else the device language. */
+  requestLanguage(lang?: string): string {
+    return requestLanguage(this._language, lang)
   }
 
   async whenReady(): Promise<void> {
@@ -394,10 +442,10 @@ export class OneloAuth {
       // backend does not spend the link on a failed exchange.
       const detail = (json as Record<string, unknown> | null)?.['detail']
       if (detail === 'code_verifier required' || detail === 'PKCE verification failed') {
-        throw OneloError.server(
+        throw withAppUserText(OneloError.server(
           'This sign-in link belongs to a different sign-in on this device. ' +
           'Open the sign-in again and request a new link.',
-        )
+        ), 'linkOtherSignIn')
       }
       throw OneloError.server(`Hosted callback failed: ${typeof detail === 'string' ? detail : `HTTP ${status}`}`)
     }
@@ -452,6 +500,10 @@ export class OneloAuth {
    * dedicated code for (mirrors the JS SDK). Public so a Round 2 content-gate /
    * accessory WebView can reuse the same centralised decision. Parity with Swift
    * `resolveFlow` and JS `resolveFlow`.
+   *
+   * @param lang  The App's language for the sign-in page. Omitted, the
+   *   `language` from the config is sent, else the device language (#1039,
+   *   #1076); the backend picks the Page Language.
    */
   async resolveFlow(lang?: string): Promise<FlowDecision> {
     const { status, json } = await this._flowInit(lang)
@@ -470,7 +522,8 @@ export class OneloAuth {
     const headers: Record<string, string> = await this._secHeaders()
     // Same Bearer pattern as GET /api/sdk/auth/user (revalidateEntitlement).
     if (existing?.accessToken) headers['Authorization'] = `Bearer ${existing.accessToken}`
-    const langParam = lang ? `&lang=${encodeURIComponent(lang)}` : ''
+    // #1039/#1076: the call's language, else the App's, else the device's.
+    const langParam = `&lang=${encodeURIComponent(this.requestLanguage(lang))}`
     const challenge = await this._beginFlowPkce()
     const { status, json } = await httpGet(
       `${this.apiUrl}/api/sdk/flow/init?key=${encodeURIComponent(this.publishableKey)}&callback_scheme=${this._callbackScheme}&code_challenge=${encodeURIComponent(challenge)}${langParam}`,
@@ -512,7 +565,8 @@ export class OneloAuth {
       // has no dedicated OneloError code here, so it maps to server_error (JS parity).
       const detail = j['detail']
       const reason = typeof detail === 'string' ? detail : (j['error'] as string | undefined) ?? `HTTP ${status}`
-      throw OneloError.server(`Failed to resolve auth flow: ${reason}`)
+      const error = OneloError.server(`Failed to resolve auth flow: ${reason}`)
+      throw reason === 'store_not_configured' ? withAppUserText(error, 'storeNotConfiguredContactSupport') : error
     }
     if (j['action'] === 'authorized') return { action: 'authorized' }
     if (j['action'] === 'present' && typeof j['url'] === 'string') {

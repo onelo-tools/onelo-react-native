@@ -112,6 +112,10 @@ Each surface also ships a ready-made component and a state hook if you'd rather 
 
 `onelo.features.ready(timeoutMs)` resolves once the server has confirmed the feature snapshot for the current user. At launch that is the user whose session was restored; after a sign-in, sign-out or user switch it is the new user, because `ready()` resets on every identity change. Show gated UI (main screen, navigation, menus) only after it resolves, and await it again after each `onAuthStateChange`. It is bounded: after the timeout, `feature()` serves the snapshot saved on the device and `subscribe()` fires when the confirmed one arrives. The features snippet in the dashboard has a `useFeaturesReady()` hook that does this.
 
+### Language
+
+The SDK's own texts ("Sign In", "Cancel", "Close feedback", the feature badges such as "Coming soon" and "Available in Pro", the sign-in retry screen) and the hosted pages it opens use the App User's Page Language. That is the language you pass with `new Onelo({ ..., language: 'de' })` when it is one of your App Languages, otherwise the device language when it is one, otherwise your App's default. Onelo chooses it and translates its own texts into English, Polish, German, French, Spanish, Italian, Portuguese and Dutch. Your own content (app name, plan names, your texts) is shown as written. `onelo.auth.pageLanguage` tells you the language chosen. A `lang` you pass to a single call, such as `onelo.store.open('pl')`, wins for that page. Branch on `OneloError.code`, never on its message.
+
 ## Device attestation
 
 The SDK proves requests come from a genuine, unmodified build of your app — **App Attest** on iOS and **Play Integrity** on Android. It is automatic: there is no API to call, and it only runs when your Onelo app is configured to require it.
